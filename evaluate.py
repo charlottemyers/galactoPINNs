@@ -43,15 +43,12 @@ def apply_model_time(model, params, tx_scaled):
         return {"u_pred": u_pred, "a_pred": a_pred}
 
 
-
-
 def evaluate_performance(
     model,
     trained_state_params,
     raw_datadict,
     num_test,
     return_analytic_weights=False,
-    lf_trainable_model=None,
 ):
     true_pot = raw_datadict["u_val"][:num_test]
     true_acc = raw_datadict["a_val"][:num_test]
