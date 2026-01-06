@@ -321,8 +321,8 @@ def generate_full_galaxy(masses="default", scales="default", alpha_bar="default"
             units="galactic")
     if include_LMC:
         lmc_pot = gp.NFWPotential(m=1e11, r_s=5, units="galactic")
-        lmc_center = jnp.array([50.0, 0.0, 0.0]) 
+        lmc_center = jnp.array([50.0, 0.0, 0.0])
         lmc_pot_centered = gp.TranslatedPotential(lmc_pot, translation=lmc_center)
         return base + lmc_pot_centered
-    else: 
+    else:
         return base
