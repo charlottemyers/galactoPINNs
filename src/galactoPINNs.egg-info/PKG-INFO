@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: galactoPINNs
+Version: 0.1.0
+Summary: Physics-informed neural networks for modeling galactic gravitational potentials.
+Home-page: https://github.com/charlottemyers/galactoPINNs
+Author: Charlotte Myers
+License: MIT
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.7
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.7
+Description-Content-Type: text/markdown
+Requires-Dist: numpy
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Provides-Extra: bnn
+Requires-Dist: numpyro; extra == "bnn"

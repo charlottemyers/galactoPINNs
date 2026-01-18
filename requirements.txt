@@ -1,0 +1,10 @@
+numpy
+jax
+flax
+numpyro
+astropy
+equinox
+jaxtyping
+xmmutablemap
+unxt
+galax
