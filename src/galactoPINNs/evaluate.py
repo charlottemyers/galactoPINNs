@@ -1,49 +1,14 @@
-
 import jax.numpy as jnp
 import numpy as np
-from unxt import unitsystems
 import jax.random as jr
 
-from dataclasses import KW_ONLY
-from typing import Any, final
-from jaxtyping import Array, Float
-from galax.potential._src.base import default_constants
-from galax.potential._src.base_single import AbstractPotential
-import equinox as eqx
-from xmmutablemap import ImmutableMap
-import unxt as u
-from unxt.quantity import AbstractQuantity
+from .inference import apply_model, apply_model_time
 
-def apply_model(model, params, x, return_analytic_weights=False):
-    predictions = model.apply({"params": params}, x)
-    u_pred = predictions["potential"]
-    a_pred = predictions["acceleration"]
-
-    if return_analytic_weights:
-        analytic_weights = (predictions["outputs"]["h"], predictions["outputs"]["g"])
-    else:
-        analytic_weights = None
-    if "outputs" in predictions:
-        outputs = predictions["outputs"]
-    else:
-        outputs = None
-    return {
-        "u_pred": u_pred,
-        "a_pred": a_pred,
-        "analytic_weights": analytic_weights,
-        "outputs": outputs,
-    }
-
-
-def apply_model_time(model, params, tx_scaled):
-    predictions = model.apply({"params": params}, tx_scaled)
-    u_pred = predictions["potential"]
-    a_pred = predictions["acceleration"]
-
-    if "outputs" in predictions:
-        return {"u_pred": u_pred, "a_pred": a_pred, "outputs": predictions["outputs"]}
-    else:
-        return {"u_pred": u_pred, "a_pred": a_pred}
+__all__ = [
+    "evaluate_performance",
+    "evaluate_performance_node",
+    "bnn_performance",
+]
 
 
 def evaluate_performance(
@@ -51,12 +16,62 @@ def evaluate_performance(
     trained_state_params,
     raw_datadict,
     num_test,
-    return_analytic_weights=False,
 ):
+    """
+    Evaluate a *static* model on a validation set and compute error metrics.
+
+    This function:
+    - transforms physical validation positions `x_val` to the model's scaled input space,
+    - runs `apply_model(...)` to obtain predicted potential and acceleration in *scaled* space,
+    - inverse-transforms predictions back to physical units,
+    - computes percent errors against truth,
+    - optionally compares against an analytic baseline potential/acceleration.
+
+    Parameters
+    ----------
+    model : flax.linen.Module (or compatible)
+        A trained (or partially trained) static model object with attribute `config`.
+        The model is expected to support `model.apply({"params": params}, x_scaled)` via `apply_model`.
+    trained_state_params : Any
+        Parameters tree (e.g., `TrainState.params`) used for `model.apply`.
+    raw_datadict : dict
+        Dictionary containing (at minimum) the following keys:
+        - "x_val": array-like, shape (N, 3), physical validation positions
+        - "u_val": array-like, shape (N,) or (N, 1), physical true potential
+        - "a_val": array-like, shape (N, 3), physical true acceleration
+        Additional keys may exist and are ignored here.
+    num_test : int
+        Number of validation samples to evaluate (uses the first `num_test` rows).
+
+    Required config keys (model.config)
+    -----------------------------------
+    - "x_transformer": must implement .transform(x_phys) -> x_scaled
+    - "u_transformer": must implement .inverse_transform(u_scaled) -> u_phys
+    - "a_transformer": must implement .inverse_transform(a_scaled) -> a_phys
+    Optional:
+    - "include_analytic" (bool): whether to compute analytic baseline errors (default True)
+    - "lf_analytic_function": analytic potential object with .potential(x, t=...) and .acceleration(x, t=...)
+
+    Returns
+    -------
+    results : dict
+        Keys are designed for downstream plotting/analysis. Common entries include:
+        - "r_eval": np.ndarray, shape (num_test,), radius of each evaluation point in physical space
+        - "x_val": physical positions used, shape (num_test, 3)
+        - "true_u", "predicted_u": physical potentials, shape (num_test,)
+        - "true_a", "predicted_a": physical accelerations, shape (num_test, 3)
+        - "pot_percent_error": percent potential error, shape (num_test,)
+        - "acc_percent_error": percent acceleration error, shape (num_test,)
+        If analytic baseline is enabled:
+        - "lf_potential": analytic baseline potential at t=0
+        - "lf_pot_error", "lf_acc_error": baseline percent errors
+        - "residual_pot": lf_potential - predicted_u
+        - "corrected_pot_percent_error": percent error after applying mean residual correction
+
+    """
     true_pot = raw_datadict["u_val"][:num_test]
     true_acc = raw_datadict["a_val"][:num_test]
 
-    print("here!", type(model))
     config = model.config
     r_eval = np.linalg.norm(raw_datadict["x_val"][:num_test], axis=1)
     scaled_x_val = config["x_transformer"].transform(raw_datadict["x_val"][:num_test])
@@ -98,12 +113,6 @@ def evaluate_performance(
             (corrected_potential - true_pot) / true_pot
         )
 
-        if return_analytic_weights:
-            analytic_weights = output["analytic_weights"]
-
-        else:
-            analytic_weights = None
-
     else:
         lf_analytic_potential = None
         lf_pot_error = None
@@ -111,7 +120,6 @@ def evaluate_performance(
         residual_pot = None
         corrected_potential = None
         corrected_pot_percent_error = None
-        analytic_weights = None
 
     return {
         "r_eval": r_eval,
@@ -127,7 +135,6 @@ def evaluate_performance(
         "lf_potential": lf_analytic_potential,
         "lf_pot_error": lf_pot_error,
         "lf_acc_error": lf_acc_error,
-        "analytic_weights": analytic_weights,
         "fiducial_acc": fiducial_acc,
         "fiducial_pot": fiducial_pot,
         "fiducial_pot_error": fiducial_pot_error,
@@ -137,8 +144,66 @@ def evaluate_performance(
 
 
 def evaluate_performance_node(
-    model, params, t_eval, raw_datadict, num_test, return_analytic_weights=False
+    model, params, t_eval, raw_datadict, num_test
 ):
+    """
+    Evaluate a *time-dependent* model at a single evaluation time.
+
+    This function expects the dataset to be organized by time keys:
+        raw_datadict["val"][t_eval] -> dict with keys {"x", "u", "a"}
+
+    It constructs a batched input array `tx_scaled` with columns [t_scaled, x_scaled]
+    and uses `apply_model_time(...)` to generate predictions.
+
+    Parameters
+    ----------
+    model : flax.linen.Module (or compatible)
+        A time-dependent model with attribute `config`. The model is expected to accept
+        a scaled input of shape (N, 1+3) = (N, 4): [t_scaled, x_scaled...].
+    params : Any
+        Parameters tree used for `model.apply`.
+    t_eval : float or int (or time key type)
+        The evaluation time. Used both to select `raw_datadict["val"][t_eval]` and to build
+        the time input feature.
+        Important: this must match the dictionary key exactly if keys are not floats.
+    raw_datadict : dict
+        Must contain `raw_datadict["val"]` mapping times -> per-time validation dict, where each
+        per-time dict contains:
+        - "x": shape (N, 3) physical positions
+        - "u": shape (N,) physical true potential at that time
+        - "a": shape (N, 3) physical true acceleration at that time
+    num_test : int
+        Number of validation samples to evaluate from that time slice.
+
+    Required config keys (model.config)
+    -----------------------------------
+    - "x_transformer": .transform / .inverse_transform
+    - "u_transformer": .transform / .inverse_transform
+    - "a_transformer": .transform / .inverse_transform
+    - "t_transformer": .transform / .inverse_transform
+    Optional:
+    - "include_analytic" (bool): whether to compute analytic baseline errors (default True)
+    - "lf_analytic_function": analytic potential object with .potential(x, t=...) and .acceleration(x, t=...)
+
+    Returns
+    -------
+    results : dict
+        Includes:
+        - "r_eval": radii of evaluation points, shape (num_test,)
+        - "true_u", "predicted_u": physical potentials, shape (num_test,)
+        - "true_a", "predicted_a": physical accelerations, shape (num_test, 3)
+        - "pot_percent_error", "acc_percent_error": percent errors, shape (num_test,)
+        - "true_a_norm", "predicted_a_norm": norms of acceleration vectors, shape (num_test, 1)
+        If analytic baseline is enabled:
+        - "lf_potential": analytic baseline potential at t_eval
+        - "lf_analytic_0": analytic baseline potential at t=0 (same x)
+        - "lf_pot_error": baseline potential percent error at t_eval
+        - "lf0_pot_error": baseline potential percent error at t=0
+        - "lf_acc_error": baseline acceleration percent error at t_eval
+        - "lf_acc_norm": norm of baseline analytic acceleration, shape (num_test,)
+        - "residual_pot", "corrected_potential", "corrected_pot_percent_error"
+
+    """
     val_data = raw_datadict["val"][t_eval]
     x_val = val_data["x"][:num_test]
 
@@ -232,59 +297,50 @@ def evaluate_performance_node(
 
 
 
-@final
-class ModelPotential(AbstractPotential):
-    """A potential whose gradient is learned by a neural network."""
+def bnn_performance(predictive, x_test, config,  rng_key=None):
+    """
+    Summarize Bayesian posterior predictive outputs for potential and acceleration.
+    This function is designed for NumPyro-style `Predictive` callables that return
+    posterior samples for:
+      - "potential": shape (S, N, ...) in scaled space
+      - "acceleration": shape (S, N, 3, ...) in scaled space
+    where S is the number of posterior samples.
 
-    #model: Any = eqx.field(static=True)
-    apply_fn: Any = eqx.field(static=True)
-    params: Any = eqx.field(static=True)
-    config: dict = eqx.field(static=True)
+    It:
+    - scales `x_test` using `config["x_transformer"]`,
+    - runs the predictive sampler,
+    - inverse-transforms outputs back to physical space,
+    - returns posterior mean/std and the raw samples.
 
-    _: KW_ONLY
-    units: u.AbstractUnitSystem = eqx.field(converter=u.unitsystem, static=True)
-    constants: ImmutableMap[str, AbstractQuantity] = eqx.field(
-        default=default_constants, converter=ImmutableMap
-    )
+    Parameters
+    ----------
+    predictive : callable
+        A callable like `numpyro.infer.Predictive(...)` with signature:
+            predictive(rng_key, x_scaled) -> dict
+        Expected to contain keys "potential" and "acceleration".
+    x_test : array-like, shape (N, 3)
+        Physical test positions (not scaled).
+    config : dict
+        Must contain:
+        - "x_transformer": .transform
+        - "u_transformer": .inverse_transform
+        - "a_transformer": .inverse_transform
+    rng_key : jax.random.PRNGKey, optional
+        RNG key used for the predictive call. If None, uses `jr.PRNGKey(0)`.
 
+    Returns
+    -------
+    summary : dict
+        - "u_mean": posterior mean potential in physical units, shape (N,)
+        - "a_mean": posterior mean acceleration in physical units, shape (N, 3)
+        - "u_std": posterior std potential in physical units, shape (N,)
+        - "a_std": posterior std acceleration in physical units, shape (N, 3)
+        - "u_samples": posterior samples of potential in physical units, shape (S, N, ...)
+        - "a_samples": posterior samples of acceleration in physical units, shape (S, N, 3, ...)
+    """
+    if rng_key is None:
+        rng_key = jr.PRNGKey(0)
 
-    def _acceleration(self, q, t):
-        x = jnp.asarray(getattr(q, "value", q)).astype(jnp.float32)
-        batched = x.ndim == 2
-        x_batched = jnp.reshape(x, (1, 3)) if not batched else x
-
-        x_trans = self.config["x_transformer"].transform(x_batched)
-        a_pred = self.apply_fn({"params": self.params}, x_trans)["acceleration"]
-        a_out = self.config["a_transformer"].inverse_transform(a_pred)
-
-        return jnp.squeeze(a_out, axis=0) if not batched else a_out
-
-    def _potential(self, q, t):
-        x = jnp.asarray(getattr(q, "value", q)).astype(jnp.float32)
-        batched = x.ndim == 2
-        x_batched = jnp.reshape(x, (1, 3)) if not batched else x
-
-        x_trans = self.config["x_transformer"].transform(x_batched)
-        u_pred = self.apply_fn({"params": self.params}, x_trans)["potential"]
-        u_out = self.config["u_transformer"].inverse_transform(u_pred)
-
-        # Return shape (N,) if batched, or () if single
-        return jnp.squeeze(u_out, axis=0) if not batched else jnp.ravel(u_out)
-
-    def _gradient(self, q, t):
-        return -self._acceleration(q, t)
-
-
-def make_galax_potential(model, params):
-    learned_potential = ModelPotential(
-    apply_fn = model,
-    params   = params,
-    config   = model.config,
-    units    = unitsystems.galactic)
-    return learned_potential
-
-
-def bnn_performance(predictive, x_test, config):
     x_test_scaled = config["x_transformer"].transform(x_test)
     pred = predictive(jr.PRNGKey(2), x_test_scaled)
 

@@ -2,8 +2,8 @@
 
 <!-- [![PyPI version](https://badge.fury.io/py/galactoPINNs.svg)](https://badge.fury.io/py/galactoPINNs) -->
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-![CI](https://github.com/<user>/GalactoPINNs/actions/workflows/ci.yml/badge.svg)
-![Python](https://img.shields.io/badge/python-3.7+-blue.svg)
+<!-- ![CI](https://github.com/<user>/GalactoPINNs/actions/workflows/ci.yml/badge.svg) -->
+![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
 
 Physics-informed neural networks for modeling galactic gravitational potentials.
 

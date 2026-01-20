@@ -4,8 +4,31 @@ from flax import linen as nn
 from collections.abc import Callable
 from typing import Any, Dict, Tuple
 
+__all__ = [
+    "SmoothMLP",
+    "CartesianToModifiedSphericalLayer",
+    "ScaleNNPotentialLayer",
+    "TrainableGalaxPotential",
+    "AnalyticModelLayer",
+    "AnalyticModelLayerTime",
+    "FuseModelsLayer",
+    "FuseandBoundary",
+]
+
 
 class SmoothMLP(nn.Module):
+    """A simple Multi-Layer Perceptron (MLP) with smooth activation functions.
+    This module creates a stack of dense layers, each followed by a specified
+    activation function. It is designed to approximate a smooth scalar field.
+
+    Attributes:
+        width (int): The number of neurons in each hidden layer.
+        depth (int): The number of hidden layers.
+        act (str | Callable): The activation function. Can be a string
+            name ('softplus', 'gelu', 'tanh') or a callable function.
+        gelu_approximate (bool): Whether to use the approximate form of the
+            GELU activation function. Only used if `act` is 'gelu'.
+    """
     width: int = 128
     depth: int = 4
     act: str | Callable[[jnp.ndarray], jnp.ndarray] = "softplus"
@@ -41,6 +64,22 @@ class SmoothMLP(nn.Module):
 
 
 class CartesianToModifiedSphericalLayer(nn.Module):
+    """Converts Cartesian coordinates to modified spherical coordinates.
+
+    This layer transforms 3D Cartesian coordinates (x, y, z) into a 5D
+    representation consisting of a clipped radius, a clipped inverse radius,
+    and the Cartesian unit vector.
+
+    The output vector is `[r_i, r_e, s, t, u]`, where:
+    - `r_i` is the radius clipped to a maximum value.
+    - `r_e` is the inverse radius, also clipped.
+    - `(s, t, u)` is the Cartesian unit vector (x/r, y/r, z/r).
+
+    Attributes:
+        clip (float): The maximum value to which the radius and inverse
+            radius are clipped. This helps stabilize the inputs to subsequent
+            layers.
+    """
     clip: float = 1.0
 
     @nn.compact
@@ -68,30 +107,19 @@ class CartesianToModifiedSphericalLayer(nn.Module):
         return cart2sph(X_cart)
 
 
-class CartesianToModifiedSphericalLayer_alt(nn.Module):
-    @nn.compact
-    def __call__(self, X_cart):
-        def modified_radial_coords_alt(r):
-            r_i = jnp.where(r <= 1.0, r, 1.0)
-            r_e = jnp.where(r <= 1.0, 1.0, 1.0 / r)
-            return r_i, r_e
-
-        def cart2sph(X_cart):
-            if X_cart.ndim == 1:
-                r = jnp.linalg.norm(X_cart, keepdims=True)
-                r_i, r_e = modified_radial_coords_alt(r)
-                stu = X_cart / r
-                return jnp.concatenate([r_i, r_e, stu])
-            else:
-                r = jnp.linalg.norm(X_cart, axis=1, keepdims=True)
-                r_i, r_e = modified_radial_coords_alt(r)
-                stu = X_cart / r
-                return jnp.concatenate([r_i, r_e, stu], axis=1)
-
-        return cart2sph(X_cart)
-
-
 class ScaleNNPotentialLayer(nn.Module):
+    """Scale NN proxy potential using an analytic radial prefactor.
+
+    Required config keys:
+      - x_transformer: object with .transform(...)
+      - r_s: float (physical scale radius)
+      - scale: one of {"one","power","nfw","hernquist","disk"}
+
+    Optional config keys (by scale):
+      - power: float (for scale="power")
+      - translation: float (for scale="nfw")
+      - a_disk: float (for scale="disk")
+    """
     config: dict
 
     def modified_radial_coords(r, clip):
@@ -134,9 +162,6 @@ class ScaleNNPotentialLayer(nn.Module):
                 r_scaled + translation
             )
 
-        if scale == "bar":
-            scale_external = 1 / r_scaled
-
         if scale == "hernquist":
             r_s_scaled = x_transformer.transform(jnp.array([[r_s, 0, 0]]))[:, 0]
             r_s_scaled = jnp.linalg.norm(r_s_scaled)
@@ -168,12 +193,25 @@ class ScaleNNPotentialLayer(nn.Module):
         return scaled[:, 0] if scaled.ndim > 1 else scaled
 
 
-################
-# ANALYTIC LAYERS
-################
-
-
 class TrainableGalaxPotential(nn.Module):
+    """A Flax module that wraps a `galax` potential to make its parameters trainable.
+
+    This layer takes a `galax` potential class and allows a specified subset of
+    its initialization parameters to be treated as trainable parameters within a
+    Flax model. It handles the creation of these parameters and computes the
+    potential at given positions.
+
+    For mass-like parameters ('m', 'm_tot'), it trains their base-10 logarithm
+    to ensure positivity and improve stability.
+
+    Attributes:
+        PotClass (Any): The `galax` potential class to be wrapped (e.g.,
+            `galax.potential.MiyamotoNagaiPotential`).
+        init_kwargs (Dict[str, float]): A dictionary of initial values for the
+            potential's parameters.
+        trainable (Tuple[str]): A tuple of strings specifying which keys from
+            `init_kwargs` should be made trainable.
+    """
     PotClass: Any
     init_kwargs: Dict[str, float]
     trainable: Tuple[str]
@@ -196,6 +234,27 @@ class TrainableGalaxPotential(nn.Module):
 
 
 class AnalyticModelLayer(nn.Module):
+    """A Flax layer that computes the potential of a pre-defined analytic model.
+
+    This layer serves as a wrapper for an analytic potential function (e.g., from
+    the `galax` library). It takes physical coordinates as input, evaluates the
+    potential using the provided function, and then transforms the output to a
+    scaled, dimensionless representation suitable for use within the neural
+    network architecture.
+    It handles the necessary coordinate and potential unit transformations based on
+    transformers provided in its configuration.
+
+    Attributes:
+        config (dict): A dictionary containing configuration for the layer,
+            requiring the following keys:
+            - 'x_transformer': An object with an `inverse_transform` method to
+              convert scaled coordinates back to physical units.
+            - 'u_transformer': An object with a `transform` method to convert
+              a physical potential to a scaled, dimensionless value.
+            - 'lf_analytic_function': The analytic potential object itself, which
+              must have a `.potential(positions, t)` method.
+            - 'time' (optional): The time at which to evaluate the potential.
+    """
     config: dict
 
     def H(self, x, r_smooth, k_smooth):
@@ -219,6 +278,21 @@ class AnalyticModelLayer(nn.Module):
 
 
 class AnalyticModelLayerTime(nn.Module):
+    """A Flax layer for a time-dependent analytic potential.
+
+    This layer is designed to work with analytic potentials that vary with time.
+    It accepts a concatenated input of time and Cartesian coordinates, splits them,
+    and transforms them to their physical units before evaluation.
+
+    Attributes:
+        config (dict): A dictionary containing configuration for the layer,
+            requiring the following keys:
+            - 't_transformer': An object with an `inverse_transform` method for time.
+            - 'x_transformer': An object with an `inverse_transform` method for position.
+            - 'u_transformer': An object with a `transform` method for the potential.
+            - 'lf_analytic_function': The time-dependent analytic potential object,
+              which must have a `.potential(positions, t)` method.
+    """
     config: dict
 
     def __call__(self, tx_cart):
@@ -234,24 +308,48 @@ class AnalyticModelLayerTime(nn.Module):
         x_phys = x_transformer.inverse_transform(x_cart)
         analytic_function = self.config["lf_analytic_function"]
 
-        # Call potential for each position at corresponding time using vmap
         def potential_fn(pos, t):
             return analytic_function.potential(pos, t)  # .ustrip("kpc2/Myr2")
-
         dimensional_potential = jax.vmap(potential_fn)(x_phys, t_phys)
 
         return u_transformer.transform(dimensional_potential)
 
 
-###############
-
-
 class FuseModelsLayer(nn.Module):
+    """A simple layer that fuses a neural network and an analytic potential by addition.
+
+    This layer implements the most basic form of a hybrid model, where the total
+    potential is the linear sum of a known analytic component and a flexible
+    neural network component.
+    """
     def __call__(self, nn_potential, analytic_potential):
         fused_output = nn_potential + analytic_potential
         return fused_output
 
 class FuseandBoundary(nn.Module):
+    """Fuses a neural network and an analytic potential with a smooth transition.
+    This layer implements a sophisticated blending of a neural network potential (`u_nn`)
+    and an analytic potential (`u_analytic`). It ensures that the model smoothly
+    transitions to the analytic form at large radii, effectively enforcing a
+    physical boundary condition (e.g., Keplerian fall-off).
+
+    The fusion is controlled by a radial blending function, `h(r)`, which
+    transitions from 0 at small radii to a saturation value  at
+    large radii. A complementary function `g(r) = 1 - h(r)` is also defined.
+    The blending function `h(r)` can be either a `tanh` sigmoid or a radial
+    power law, controlled by the configuration.
+
+    Attributes:
+        config (dict): A dictionary containing configuration for the layer.
+            - 'x_transformer': Coordinate transformer.
+            - 'r_trans' (float, optional): Transition radius for the tanh blend.
+            - 'k_smooth' (float, optional): Steepness of the tanh transition.
+            - 'train_k' (bool, optional): Whether to make `k_smooth` a trainable parameter.
+            - 'radial_power' (float, optional): If specified, uses a power-law blend instead of tanh.
+            - 'r_smooth' (float, optional): Smoothing radius for the power-law blend.
+            - 'saturation' (float, optional): The value `h(r)` approaches at large radii.
+    """
+
     config: dict
 
     def setup(self):
@@ -286,8 +384,6 @@ class FuseandBoundary(nn.Module):
             r = jnp.linalg.norm(dimensional_positions)
         else:
             r = jnp.linalg.norm(dimensional_positions, axis=1)
-
-        #######
 
         if self.config.get("radial_power", None) is not None:
             power = self.config["radial_power"]
@@ -301,55 +397,3 @@ class FuseandBoundary(nn.Module):
         # Blend nn output and analytic function
         u_model = g * u_nn + u_analytic
         return {"fused_potential": u_model, "h": h, "g": g}
-
-
-
-
-class BoundaryConditionLayer(nn.Module):
-    config: dict
-
-    def setup(self):
-        self.log_k = self.config.get(
-            "k_smooth", 1.0
-        )
-        self.r_trans = self.config.get(
-            "r_trans", 200
-        )
-
-    def H(self, x, r_smooth, k_smooth, saturation=1.0):
-        """Smoothing function using tanh transition."""
-        return 0.5 * saturation * (1 + jnp.tanh(k_smooth * (x - r_smooth)))
-
-    def radial_power_law(self, r, r_smooth, pow, saturation):
-        """Radial power law function."""
-        return saturation * jnp.power(r / (r + r_smooth), pow)
-
-    def __call__(self, positions, u_nn, u_analytic):
-        x_transformer = self.config["x_transformer"]
-        dimensional_positions = x_transformer.inverse_transform(positions)
-        saturation = self.config.get("saturation", 1.0)
-
-        if self.config.get("train_k", False):
-            min_k = self.config.get("min_k", 0.01)
-            k_smooth = jnp.maximum(min_k, jnp.exp(self.log_k))
-        else:
-            k_smooth = self.config.get("k_smooth", 0.5)
-
-        r_trans = self.r_trans
-
-        if positions.ndim == 1:
-            r = jnp.linalg.norm(dimensional_positions)
-        else:
-            r = jnp.linalg.norm(dimensional_positions, axis=1)
-        if self.config.get("radial_power", None) is not None:
-            power = self.config["radial_power"]
-            r_smooth = self.config.get("r_smooth", 150.0)
-            h = self.radial_power_law(r, r_smooth, power, saturation=saturation)
-        else:
-            h = self.H(r, r_trans, k_smooth, saturation=saturation)
-
-        g = 1.0 - h
-
-        # Blend nn output and analytic function
-        u_model = g * u_nn + h * u_analytic
-        return u_model

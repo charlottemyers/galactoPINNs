@@ -2,12 +2,11 @@ README.md
 pyproject.toml
 setup.cfg
 src/galactoPINNs/__init__.py
-src/galactoPINNs/bayesian_model.py
 src/galactoPINNs/data.py
 src/galactoPINNs/evaluate.py
+src/galactoPINNs/inference.py
 src/galactoPINNs/layers.py
-src/galactoPINNs/node_model.py
-src/galactoPINNs/static_model.py
+src/galactoPINNs/model_potential.py
 src/galactoPINNs/train.py
 src/galactoPINNs.egg-info/PKG-INFO
 src/galactoPINNs.egg-info/SOURCES.txt

@@ -7,7 +7,18 @@ import jax.random as jr
 from typing import Literal
 
 
-@partial(jax.jit, static_argnames=("target"))
+__all__ = [
+    "train_step_static",
+    "train_step_node",
+    "train_model_static",
+    "train_model_state_node",
+    "train_model_state_trainable_analytic",
+    "alternate_training",
+]
+
+
+
+@partial(jax.jit, static_argnames=("target",))
 def train_step_static(
     state: TrainState,
     x,
@@ -19,12 +30,35 @@ def train_step_static(
     lambda_E: float = 5.0,
     std_weight: float = 10.0,
 ):
+    """Performs a single training step for a static potential model.
+
+    This JIT-compiled function computes the loss, calculates gradients, and updates
+    the model's parameters contained within the `TrainState`. The loss can be
+    configured to be based on acceleration accuracy, orbit energy conservation,
+    or a mixture of both.
+
+    Args:
+        state (TrainState): The current training state, containing parameters and optimizer.
+        x (jax.numpy.ndarray): A batch of positions for acceleration training.
+        a_true (jax.numpy.ndarray): The corresponding true accelerations.
+        target (str): The loss target. Can be 'acceleration', 'orbit_energy', or 'mixed'.
+        lambda_rel (float): Weighting factor for the relative error in acceleration loss.
+        orbit_q (jax.numpy.ndarray, optional): A batch of orbit positions over time.
+        orbit_p (jax.numpy.ndarray, optional): A batch of orbit momenta over time.
+        lambda_E (float): Weighting factor for the orbit energy loss component.
+        std_weight (float): Weighting for the standard deviation of energy within an orbit.
+
+    Returns:
+        Tuple[TrainState, jax.numpy.ndarray]:
+            - The updated `TrainState`.
+            - The scalar loss value for this step.
+    """
     def acc_loss_fn(params, lambda_rel):
         a_pred = state.apply_fn({"params": params}, x)["acceleration"]
         diff = a_pred - a_true
         diff_norm = jnp.linalg.norm(diff, axis=1, keepdims=True)
         a_true_norm = jnp.linalg.norm(a_true, axis=1, keepdims=True)
-        return jnp.mean(diff_norm + lambda_rel * (diff_norm / a_true_norm))
+        return jnp.mean(diff_norm + lambda_rel * (diff_norm / (a_true_norm + 1e-8)))
 
     def orbit_energy(params, orbit_q_scaled, orbit_p_scaled):
         """
@@ -78,6 +112,22 @@ def train_step_static(
 
 @jax.jit
 def train_step_node(state, tx_cart, a_true, lambda_rel=1.0):
+    """Performs a single training step for a time-dependent model.
+
+    This JIT-compiled function computes an acceleration-based loss, calculates
+    gradients, and updates the model's parameters for a time-dependent model.
+
+    Args:
+        state (TrainState): The current training state.
+        tx_cart (jax.numpy.ndarray): A batch of concatenated time and position vectors.
+        a_true (jax.numpy.ndarray): The corresponding true accelerations.
+        lambda_rel (float): Weighting factor for the relative error in the loss.
+
+    Returns:
+        Tuple[TrainState, jax.numpy.ndarray]:
+            - The updated `TrainState`.
+            - The scalar loss value for this step.
+    """
     def loss_fn(params):
         outputs = state.apply_fn({"params": params}, tx_cart)
         a_pred = outputs["acceleration"]
@@ -85,7 +135,7 @@ def train_step_node(state, tx_cart, a_true, lambda_rel=1.0):
         diff = a_pred - a_true
         diff_norm = jnp.linalg.norm(diff, axis=1, keepdims=True)
         a_true_norm = jnp.linalg.norm(a_true, axis=1, keepdims=True)
-        return jnp.mean(diff_norm + lambda_rel * (diff_norm / a_true_norm))
+        return jnp.mean(diff_norm + lambda_rel * (diff_norm / (a_true_norm + 1e-8)))
 
     loss, grads = jax.value_and_grad(loss_fn)(state.params)
 
@@ -112,6 +162,35 @@ def train_model_static(
     std_weight = 10.0,
     train_dict = None
 ):
+    """Trains a static model over a specified number of epochs.
+
+    This function controls the training of a static model by repeatedly
+    calling `train_step_static`. It can handle different training targets
+    sequentially if a `train_dict` is provided.
+
+    Args:
+        model (flax.linen.Module): The model to be trained.
+        optimizer (optax.GradientTransformation): The optimizer.
+        x_train (jax.numpy.ndarray): Training positions.
+        a_train (jax.numpy.ndarray): Training accelerations.
+        num_epochs (int): The total number of epochs to train for.
+        mode (str): A mode string passed to the training step (not used in current step).
+        target (str): The default loss target if `train_dict` is not provided.
+        lap_true (jax.numpy.ndarray, optional): True Laplacian values (not used in current step).
+        log_every (int): The interval at which to log training progress.
+        lambda_rel (float): Weighting for relative error in acceleration loss.
+        init_state (TrainState, optional): An initial training state to start from.
+        orbit_q (jax.numpy.ndarray, optional): scaled orbit positions for energy conservation loss.
+        orbit_p (jax.numpy.ndarray, optional): scaled orbit momenta for energy conservation loss.
+        lambda_E (float): Weighting for the orbit energy loss.
+        std_weight (float): Weighting for the energy standard deviation loss.
+        train_dict (Dict[str, int], optional): A dictionary mapping training targets
+            to the number of epochs for each, allowing for a staged training schedule.
+
+    Returns:
+        Dict[str, Any]: A dictionary containing the final `TrainState`, a list of
+                        epochs completed, and a list of final losses for each stage.
+    """
     epochs = []
     losses = []
     if init_state is None:
@@ -132,9 +211,7 @@ def train_model_static(
                 state,
                 x_train,
                 a_train,
-                mode=mode,
                 target=target,
-                lap_true=lap_true,
                 lambda_rel=lambda_rel,
                 orbit_q=orbit_q,
                 orbit_p=orbit_p,
@@ -152,6 +229,21 @@ def train_model_static(
 def train_model_state_node(
     initial_state, x_train, a_train, num_epochs, log_every=1000
 ):
+    """Trains a time-dependent model from an initial state.
+    This function controls the training of a time-dependent model by
+    repeatedly calling `train_step_node`.
+
+    Args:
+        initial_state (TrainState): The initial training state to start from.
+        x_train (jax.numpy.ndarray): Training data (concatenated time and position).
+        a_train (jax.numpy.ndarray): Training accelerations.
+        num_epochs (int): The number of epochs to train for.
+        log_every (int): The interval at which to log training progress.
+
+    Returns:
+        Dict[str, Any]: A dictionary containing the final `TrainState`, a list of
+                        epochs, and a list of losses over time.
+    """
     epochs = []
     losses = []
 
@@ -170,14 +262,28 @@ def train_model_state_node(
 def train_model_state_trainable_analytic(
     init_state, train_step, x_train, a_train, num_epochs, radial_weight=False, log_every=1000
 ):
-    ######
-    ### train model with a trainable analytic layer
-    ######
+    """Trains a model with a trainable analytic component.
+
+    This function runs a training loop and specifically tracks the history of
+    parameters within the 'trainable_analytic_layer' layers.
+
+    Args:
+        init_state (TrainState): The initial training state.
+        train_step (Callable): The function to execute for a single training step.
+        x_train (jax.numpy.ndarray): Training positions.
+        a_train (jax.numpy.ndarray): Training accelerations.
+        num_epochs (int): The number of epochs to train for.
+        radial_weight (bool): Whether the train_step uses radial weighting.
+        log_every (int): The interval at which to log training progress.
+
+    Returns:
+        Dict[str, Any]: A dictionary containing the final state, losses, and
+                        histories of the fusing and analytic parameters.
+    """
 
     epochs = []
     losses = []
     analytic_params_history = []
-    fusing_params_history = []
 
     state = init_state
     for epoch in range(num_epochs):
@@ -185,17 +291,14 @@ def train_model_state_trainable_analytic(
         if epoch % log_every == 0:
             print(f"Epoch {epoch + 1}, Loss: {loss:.6f}")
         analytic_params = state.params["trainable_analytic_layer"]
-        fusing_params = state.params["FuseandBoundary_0"]
         analytic_params_history.append(analytic_params)
-        fusing_params_history.append(fusing_params)
 
         epochs.append(epoch)
-        losses.append(loss)
+        losses.append(float(loss))
     return {
         "state": state,
         "epochs": epochs,
         "losses": losses,
-        "fusing_params_history": fusing_params_history,
         "analytic_params_history": analytic_params_history,
     }
 
@@ -213,9 +316,31 @@ def alternate_training(
     tx_2,
     burn_in=0,
 ):
-    #####
-    ## function for alternating training between analytic and NN parts of the model
-    #####
+    """Alternates training between two parameter groups of a model.
+
+    This function implements a two-stage training cycle that alternates between
+    training two different parts of a model, configured with two different
+    optimizers (`tx_1` and `tx_2`). It is  used to alternate between
+    training an analytic component and a neural network component.
+
+    Args:
+        train_step (Callable): The function for a single training step.
+        x_train (jax.numpy.ndarray): Training positions.
+        a_train (jax.numpy.ndarray): Training accelerations.
+        model (flax.linen.Module): The model to be trained.
+        num_epochs_stage1 (int): Number of epochs for the first stage of a cycle.
+        num_epochs_stage2 (int): Number of epochs for the second stage of a cycle.
+        cycles (int): The number of times to repeat the two-stage cycle.
+        param_list (List[str]): A list of parameter names from the analytic layer
+            to track during training.
+        tx_1 (optax.GradientTransformation): Optimizer for the first stage.
+        tx_2 (optax.GradientTransformation): Optimizer for the second stage.
+        burn_in (int): Extra epochs to add to the very first stage 1 training.
+
+    Returns:
+        Dict[str, Any]: A dictionary containing the final `TrainState`, a history
+                        of losses and tracked parameters, and the model itself.
+    """
 
     history = {
         "losses": [],
@@ -224,32 +349,26 @@ def alternate_training(
     for param in param_list:
         history[f"{param}"] = []
 
+    stage2_output_state = None  # Initialize to handle the first cycle
     for cycle in range(cycles):
         if cycle == 0:
             params = model.init(jr.PRNGKey(0), x_train[:1])["params"]
         else:
             params = stage2_output_state.params
 
+        # === Stage 1: train analytic (NN frozen) ===
         stage1_input_state = TrainState.create(
             apply_fn=model.apply, params=params, tx=tx_1
         )
 
-        if cycle == 0:
-            output1 = train_model_state_trainable_analytic(
-                stage1_input_state,
-                train_step,
-                x_train,
-                a_train,
-                num_epochs_stage1 + burn_in,
-            )
-        else:
-            output1 = train_model_state_trainable_analytic(
-                stage1_input_state,
-                train_step,
-                x_train,
-                a_train,
-                num_epochs_stage1,
-            )
+        epochs_s1 = num_epochs_stage1 + burn_in if cycle == 0 else num_epochs_stage1
+        output1 = train_model_state_trainable_analytic(
+            stage1_input_state,
+            train_step,
+            x_train,
+            a_train,
+            epochs_s1,
+        )
 
         stage1_output_state = output1["state"]
 

@@ -4,7 +4,7 @@ from flax import linen as nn
 from astropy import constants as const
 import numpy as np
 
-from .layers import (
+from ..layers import (
     CartesianToModifiedSphericalLayer,
     AnalyticModelLayer,
     ScaleNNPotentialLayer,
@@ -16,6 +16,37 @@ from .layers import (
 
 
 class StaticModel(nn.Module):
+    """A Flax module for a static gravitational potential model.
+
+    This class defines a flexible model for a gravitational potential, which can
+    be a pure neural network, a known analytic potential, or a hybrid of the two.
+    It computes the potential and its derivatives (acceleration, Laplacian)
+    and is designed to be highly configurable through a dictionary.
+
+    The model can enforce physical boundary conditions by smoothly transitioning
+    to an analytic form at large radii.
+
+    Attributes:
+        config (dict): A dictionary containing the configuration for the model's
+            architecture and behavior. Key options include:
+            - "enforce_bc" (bool): If True, use the `FuseandBoundary` layer to
+              enforce the analytic potential as a boundary condition.
+            - "include_analytic" (bool): If True, add the analytic potential
+              to the NN potential.
+            - "trainable" (bool): If True, use a `TrainableGalaxPotential` layer
+              for the analytic component.
+            - "analytic_only" (bool): If True, the model output is solely the
+              analytic potential.
+            - "x_transformer", "u_transformer", "a_transformer": Objects for
+              transforming coordinates and potential between physical and scaled units.
+            - "depth", "width", "activation": Hyperparameters for the `SmoothMLP`.
+            - Configuration for sub-layers like `FuseandBoundary` (`r_trans`,
+              `k_smooth`, etc.).
+        depth (int): The number of hidden layers in the `SmoothMLP`.
+        trainable_analytic_layer (TrainableGalaxPotential, optional): An instance
+            of a trainable analytic potential layer, passed if `config['trainable']` is True.
+
+    """
     config: dict
     depth: int = 4
     trainable_analytic_layer: TrainableGalaxPotential = None
@@ -75,6 +106,10 @@ class StaticModel(nn.Module):
     def __call__(self, cart_x, mode="full"):
         outputs = {}
         if self.trainable_analytic_layer is not None:
+            # stub parameter ensures that the `trainable_analytic_layer` is
+            # correctly registered within the Flax parameter structure, even if it
+            # contains no trainable parameters itself. This prevents the layer
+            # from being pruned during model initialization.
             _stub = self.param("_stub", lambda rng: jnp.array(0.0))
 
         cart_to_sph_layer = CartesianToModifiedSphericalLayer(
@@ -117,20 +152,7 @@ class StaticModel(nn.Module):
             fused_potential = fuse_layer(scaled_potential, analytic_potential)
         outputs["fuse_models"] = fused_potential
 
-        fuse_and_bound = FuseandBoundary(config=self.config)(
-            cart_x, scaled_potential, analytic_potential
-        )
-        fuse_and_bound_potential = fuse_and_bound["fused_potential"]
-
-        outputs["h"] = fuse_and_bound["h"]
-        outputs["g"] = fuse_and_bound["g"]
-
-        if self.config["enforce_bc"]:
-            boundary_potential = fuse_and_bound_potential
-            outputs["enforce_bc"] = boundary_potential
-            potential = boundary_potential
-
-        elif self.config["include_analytic"]:
+        if self.config["include_analytic"]:
             potential = fused_potential
         else:
             potential = scaled_potential

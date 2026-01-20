@@ -3,12 +3,5 @@ def test_import_package():
 
 
 def test_import_modules():
-    from galactoPINNs import (
-        bayesian_model,
-        data,
-        evaluate,
-        layers,
-        node_model,
-        static_model,
-        train,
-    )
+    from galactoPINNs import data, evaluate, layers, train
+    from galactoPINNs.models import bayesian_model, node_model, static_model
