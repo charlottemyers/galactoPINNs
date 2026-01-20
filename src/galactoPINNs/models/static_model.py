@@ -118,7 +118,7 @@ class StaticModel(nn.Module):
 
         scale_layer = ScaleNNPotentialLayer(config=self.config)
         fuse_layer = FuseModelsLayer()
-        analytic_layer = AnalyticModelLayer(config=self.config)
+        analytic_layer = AnalyticModelLayer(config=self.config, mode = "static")
 
         if self.config.get("convert_to_spherical", True):
             x = cart_to_sph_layer(cart_x)

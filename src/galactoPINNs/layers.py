@@ -234,85 +234,61 @@ class TrainableGalaxPotential(nn.Module):
 
 
 class AnalyticModelLayer(nn.Module):
-    """A Flax layer that computes the potential of a pre-defined analytic model.
+    """
+    Unified analytic potential wrapper.
 
-    This layer serves as a wrapper for an analytic potential function (e.g., from
-    the `galax` library). It takes physical coordinates as input, evaluates the
-    potential using the provided function, and then transforms the output to a
-    scaled, dimensionless representation suitable for use within the neural
-    network architecture.
-    It handles the necessary coordinate and potential unit transformations based on
-    transformers provided in its configuration.
-
-    Attributes:
-        config (dict): A dictionary containing configuration for the layer,
-            requiring the following keys:
-            - 'x_transformer': An object with an `inverse_transform` method to
-              convert scaled coordinates back to physical units.
-            - 'u_transformer': An object with a `transform` method to convert
-              a physical potential to a scaled, dimensionless value.
-            - 'lf_analytic_function': The analytic potential object itself, which
-              must have a `.potential(positions, t)` method.
-            - 'time' (optional): The time at which to evaluate the potential.
+    Modes:
+      - mode="static": inputs are x_cart (3,) or (N,3). Time is taken from config["time"] (default 0).
+      - mode="time":   inputs are tx_cart (4,) or (N,4) with [t, x, y, z]. Time is taken from input and
+                       inverse-transformed with config["t_transformer"].
     """
     config: dict
+    mode: str = "static"  # "static" or "time"
 
-    def H(self, x, r_smooth, k_smooth):
-        return 0.5 + 0.5 * jnp.tanh(k_smooth * (x - r_smooth))
-
-    def __call__(self, x_phys):
-        if x_phys.ndim == 1:
-            x_phys = x_phys[None, :]  # Shape (1, N)
+    def __call__(self, inp):
+        # Ensure batched
+        if inp.ndim == 1:
+            inp = inp[None, :]
 
         x_transformer = self.config["x_transformer"]
         u_transformer = self.config["u_transformer"]
+        analytic = self.config["lf_analytic_function"]
 
-        positions = x_transformer.inverse_transform(x_phys)  # physical positions (kpc)
+        if self.mode == "static":
+            # inp: (N,3) in scaled coords
+            x_cart = inp
+            positions = x_transformer.inverse_transform(x_cart)  # physical positions
+            t = self.config.get("time", 0.0)
 
-        lf_analytic_function = self.config["lf_analytic_function"]
-        time = self.config.get("time", 0)
-        dimensional_potential = lf_analytic_function.potential(positions, t=time)
+            # Evaluate potential.
+            def pot_one(pos):
+                return analytic.potential(pos, t=t)
+            try:
+                dimensional_potential = analytic.potential(positions, t=t)
+            except Exception:
+                dimensional_potential = jax.vmap(pot_one)(positions)
 
-        transformed_potential = u_transformer.transform(dimensional_potential)
-        return transformed_potential
+            return u_transformer.transform(dimensional_potential)
 
+        elif self.mode == "time":
+            # inp: (N,4) = [t, x, y, z] in scaled coords
+            t_scaled = inp[:, 0]
+            x_cart   = inp[:, 1:4]
 
-class AnalyticModelLayerTime(nn.Module):
-    """A Flax layer for a time-dependent analytic potential.
+            t_transformer = self.config["t_transformer"]
+            t_phys = t_transformer.inverse_transform(t_scaled)  # (N,)
 
-    This layer is designed to work with analytic potentials that vary with time.
-    It accepts a concatenated input of time and Cartesian coordinates, splits them,
-    and transforms them to their physical units before evaluation.
+            positions = x_transformer.inverse_transform(x_cart)  # (N,3)
 
-    Attributes:
-        config (dict): A dictionary containing configuration for the layer,
-            requiring the following keys:
-            - 't_transformer': An object with an `inverse_transform` method for time.
-            - 'x_transformer': An object with an `inverse_transform` method for position.
-            - 'u_transformer': An object with a `transform` method for the potential.
-            - 'lf_analytic_function': The time-dependent analytic potential object,
-              which must have a `.potential(positions, t)` method.
-    """
-    config: dict
+            # Evaluate per sample: potential(pos_i, t_i)
+            def pot_one(pos, t):
+                return analytic.potential(pos, t=t)
 
-    def __call__(self, tx_cart):
-        if tx_cart.ndim == 1:
-            tx_cart = tx_cart[None, :]
+            dimensional_potential = jax.vmap(pot_one)(positions, t_phys)
+            return u_transformer.transform(dimensional_potential)
 
-        x_cart = tx_cart[:, 1:4]
-        t_phys = self.config["t_transformer"].inverse_transform(tx_cart[:, 0])
-
-        x_transformer = self.config["x_transformer"]
-        u_transformer = self.config["u_transformer"]
-
-        x_phys = x_transformer.inverse_transform(x_cart)
-        analytic_function = self.config["lf_analytic_function"]
-
-        def potential_fn(pos, t):
-            return analytic_function.potential(pos, t)  # .ustrip("kpc2/Myr2")
-        dimensional_potential = jax.vmap(potential_fn)(x_phys, t_phys)
-
-        return u_transformer.transform(dimensional_potential)
+        else:
+            raise ValueError(f"Unknown mode={self.mode!r}. Use 'static' or 'time'.")
 
 
 class FuseModelsLayer(nn.Module):

@@ -11,7 +11,7 @@ from ..layers import (
     CartesianToModifiedSphericalLayer,
     ScaleNNPotentialLayer,
     FuseModelsLayer,
-    AnalyticModelLayerTime,
+    AnalyticModelLayer,
     SmoothMLP,
 )
 
@@ -385,7 +385,7 @@ class NODEModel(nn.Module):
         cart_to_sph_layer = CartesianToModifiedSphericalLayer(clip=self.config.get("clip", 1.0))
         scale_layer = ScaleNNPotentialLayer(config=self.config)
         fuse_layer = FuseModelsLayer()
-        analytic_layer = AnalyticModelLayerTime(config=self.config)
+        analytic_layer = AnalyticModelLayer(config=self.config, mode = "time")
 
         tx_cart = jnp.atleast_2d(tx_cart)
 
