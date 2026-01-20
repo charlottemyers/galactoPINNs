@@ -246,14 +246,13 @@ def generate_static_datadict_sphere(
     -----
     - Positions are returned as unitless floats interpreted as kpc.
     - Accelerations/potentials are returned in Galax "galactic" units (typically kpc/Myr^2 and kpc^2/Myr^2)
-      because we strip `.value` from the underlying Quantity objects.
 
     Parameters
     ----------
     galax_potential
         A Galax potential instance with .acceleration and .potential methods.
     N_samples_train, N_samples_test
-        Number of train/val samples (not counting any added points).
+        Number of train/val samples.
     r_max_train, r_max_test
         Max radius for sampling train/val positions.
     eval_sample_mode
@@ -270,11 +269,9 @@ def generate_static_datadict_sphere(
     def _evaluate(samples: np.ndarray, t: float = 0.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         x, y, z = samples.T
         pos = cx.CartesianPos3D(x=x * au.kpc, y=y * au.kpc, z=z * au.kpc)
-
         t_q = Quantity(t, au.Myr)
         acc = galax_potential.acceleration(pos, t=t_q)
         pot = galax_potential.potential(pos, t=t_q).value
-
         a = np.stack([acc.x.value, acc.y.value, acc.z.value], axis=1)
         return samples, a, pot
 
@@ -440,12 +437,9 @@ def generate_time_dep_datadict_sphere(
 class UniformScaler:
     """
     Simple affine scaler for NumPy arrays.
-
     Two modes:
     1) Min-max scaling to a feature_range (default [-1, 1]).
     2) Fixed scaling by a constant `scaler` (multiplicative), with zero offset.
-
-    This is intentionally lightweight (no sklearn dependency).
     """
 
     def __init__(self, feature_range: Tuple[float, float] = (-1.0, 1.0)):
@@ -549,11 +543,6 @@ class Transformer:
     where scale = max(|x - mean|) per feature.
 
     This is similar to sklearn's MaxAbsScaler on centered data.
-
-    Notes
-    -----
-    - Uses NumPy arrays internally, but returns NumPy arrays that are compatible with JAX.
-    - Adds epsilon when scale is zero to avoid division by zero.
     """
 
     def __init__(self, eps: float = 1e-12):

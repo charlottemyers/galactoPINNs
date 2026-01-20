@@ -25,7 +25,6 @@ __all__ = [
 
 
 
-
 """
 A primer on shape conventions
 -----------------
@@ -289,7 +288,7 @@ class NODEModel(nn.Module):
           - "integration_mode" (optional): {"gl3", "diffrax_batch", "diffrax_per_point"}
           - "include_analytic" (bool)
           - plus transformer and analytic-function keys used by ScaleNNPotentialLayer
-            and AnalyticModelLayerTime.
+            and AnalyticModelLayer.
     depth : int
         Kept for backwards-compatibility; primary depths are taken from config.
 

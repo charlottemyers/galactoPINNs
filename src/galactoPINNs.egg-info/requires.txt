@@ -1,7 +1,0 @@
-numpy
-
-[bnn]
-numpyro
-
-[dev]
-pytest

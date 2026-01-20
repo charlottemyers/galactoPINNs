@@ -254,13 +254,6 @@ def evaluate_performance_node(
         corrected_pot_percent_error = 100 * jnp.abs(
             (corrected_potential - true_pot) / true_pot
         )
-
-        if return_analytic_weights:
-            analytic_weights = output["analytic_weights"]
-
-        else:
-            analytic_weights = None
-
     else:
         lf_analytic_potential = None
         lf_pot_error = None
@@ -268,7 +261,6 @@ def evaluate_performance_node(
         residual_pot = None
         corrected_potential = None
         corrected_pot_percent_error = None
-        analytic_weights = None
         lf_analytic_acc_norm = None
         lf0_pot_error = None
         lf_analytic_0 = None
@@ -292,7 +284,6 @@ def evaluate_performance_node(
         "lf_acc_error": lf_acc_error,
         "lf0_pot_error": lf0_pot_error,
         "lf_analytic_0": lf_analytic_0,
-        "analytic_weights": analytic_weights,
     }
 
 
