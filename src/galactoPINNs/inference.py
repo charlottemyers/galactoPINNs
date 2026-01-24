@@ -1,7 +1,7 @@
-__all__ = [
+__all__ = (
     "apply_model",
     "apply_model_time",
-]
+)
 
 
 def apply_model(model, params, x_scaled):

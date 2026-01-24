@@ -7,14 +7,14 @@ import jax.random as jr
 from typing import Literal
 
 
-__all__ = [
+__all__ = (
     "train_step_static",
     "train_step_node",
     "train_model_static",
     "train_model_state_node",
     "train_model_state_trainable_analytic",
     "alternate_training",
-]
+)
 
 
 

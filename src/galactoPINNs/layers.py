@@ -3,17 +3,18 @@ import jax.numpy as jnp
 from flax import linen as nn
 from collections.abc import Callable
 from typing import Any, Dict, Tuple
+Array = jnp.ndarray
+ActFn = Callable[[Array], Array]
 
-__all__ = [
+__all__ = (
     "SmoothMLP",
     "CartesianToModifiedSphericalLayer",
     "ScaleNNPotentialLayer",
     "TrainableGalaxPotential",
     "AnalyticModelLayer",
-    "AnalyticModelLayerTime",
     "FuseModelsLayer",
     "FuseandBoundary",
-]
+)
 
 
 class SmoothMLP(nn.Module):
@@ -30,33 +31,29 @@ class SmoothMLP(nn.Module):
             GELU activation function. Only used if `act` is 'gelu'.
     """
     width: int = 128
-    depth: int = 4
-    act: str | Callable[[jnp.ndarray], jnp.ndarray] = "softplus"
+    depth: int = 3
+    act: ActFn = jax.nn.gelu          # callable only; default GELU
     gelu_approximate: bool = False
 
-    def _resolve_activation(self) -> Callable[[jnp.ndarray], jnp.ndarray]:
-        if callable(self.act):
-            return self.act
-
-        key = str(self.act).lower()
-        if key == "softplus":
-            return jax.nn.softplus
-        elif key == "gelu":
-            def _gelu(x):
-                return jax.nn.gelu(x, approximate=self.gelu_approximate)
-
-            return _gelu
-        elif key == "tanh":
-            return jnp.tanh
-        else:
-            raise ValueError(
-                f"Unknown activation '{self.act}'. "
-                "Use 'softplus', 'gelu', 'tanh', or pass a callable."
+    def _activation(self) -> ActFn:
+        # Enforce "callable only"
+        if not callable(self.act):
+            raise TypeError(
+                f"`act` must be a callable activation function (e.g., jax.nn.softplus). "
+                f"Got: {type(self.act)!r}"
             )
 
+        if self.act is jax.nn.gelu:
+            def _gelu(x: Array) -> Array:
+                return jax.nn.gelu(x, approximate=self.gelu_approximate)
+            return _gelu
+
+        # Generic callable activation
+        return self.act
+
     @nn.compact
-    def __call__(self, x):
-        act_fn = self._resolve_activation()
+    def __call__(self, x: Array) -> Array:
+        act_fn = self._activation()
         for _ in range(self.depth):
             x = act_fn(nn.Dense(self.width)(x))
         x = nn.Dense(1)(x)  # scalar potential
@@ -84,27 +81,23 @@ class CartesianToModifiedSphericalLayer(nn.Module):
 
     @nn.compact
     def __call__(self, X_cart):
-        def modified_radial_coords(r, clip):
-            r_inv = jnp.divide(1.0, r)
+        clip = jnp.asarray(self.clip, dtype=X_cart.dtype)
+
+        @jax.jit
+        def cart2sph_one(x3):
+            r = jnp.linalg.norm(x3)
+            r_safe = jnp.maximum(r, jnp.finfo(x3.dtype).tiny)
+
+            r_inv = 1.0 / r_safe
             r_i = jnp.clip(r, 0.0, clip)
             r_e = jnp.clip(r_inv, 0.0, clip)
-            return r_i, r_e
 
-        def cart2sph(X_cart):
-            if X_cart.ndim == 1:
-                r = jnp.linalg.norm(X_cart, keepdims=True)
-                r_i, r_e = modified_radial_coords(r, self.clip)
-                stu = jnp.divide(X_cart, r)
-                spheres = jnp.concatenate([r_i, r_e, stu])
-                return spheres
+            stu = x3 / r_safe
+            return jnp.concatenate([jnp.array([r_i, r_e], dtype=x3.dtype), stu], axis=0)  # (5,)
 
-            r = jnp.linalg.norm(X_cart, axis=1, keepdims=True)
-            r_i, r_e = modified_radial_coords(r, self.clip)
-            stu = jnp.divide(X_cart, r)
-            spheres = jnp.concatenate([r_i, r_e, stu], axis=1)
-            return spheres
-
-        return cart2sph(X_cart)
+        X2 = jnp.atleast_2d(X_cart)               # (N, 3)
+        Y2 = jax.vmap(cart2sph_one)(X2)                    # (N, 5)
+        return jnp.squeeze(Y2, axis=0) if (X_cart.ndim == 1) else Y2
 
 
 class ScaleNNPotentialLayer(nn.Module):

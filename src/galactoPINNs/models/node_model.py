@@ -1,6 +1,3 @@
-
-
-from __future__ import annotations
 from typing import Callable, Literal
 import jax
 import jax.numpy as jnp
@@ -15,13 +12,13 @@ from ..layers import (
     SmoothMLP,
 )
 
-__all__ = [
+__all__ = (
     "compute_delta_phi_per_point",
     "compute_delta_phi_batch",
     "compute_delta_phi_per_point_gl3",
     "compute_delta_phi_per_point_gl3panels",
     "NODEModel",
-]
+)
 
 
 
@@ -282,7 +279,7 @@ class NODEModel(nn.Module):
     config : dict
         Configuration dict used by layers and integration routing.
         Expected keys include:
-          - "activation" (optional): activation for MLPs
+          - "activation" (callable, i.e. jax.nn.tanh): activation for MLPs
           - "delta_phi_depth", "delta_phi_width" (optional)
           - "initial_correction_depth", "initial_correction_width" (optional)
           - "integration_mode" (optional): {"gl3", "diffrax_batch", "diffrax_per_point"}
@@ -302,21 +299,31 @@ class NODEModel(nn.Module):
     depth: int = 4
 
     def setup(self):
-        act = self.config.get("activation", "softplus")
+        act = self.config.get("activation", None)
+        gelu_approx = self.config.get("gelu_approximate", False)
 
-        # Network defining d(delta_phi)/dt = f(t, x)
+        if act is not None and not callable(act):
+            raise TypeError(
+                f"config['activation'] must be a callable (e.g. jax.nn.softplus), "
+                f"got {type(act)!r}"
+            )
+
+        mlp_common = dict(gelu_approximate=gelu_approx)
+        if act is not None:
+            mlp_common["act"] = act
+
         self.delta_phi_net = SmoothMLP(
             depth=self.config.get("delta_phi_depth", 4),
             width=self.config.get("delta_phi_width", 128),
-            act=act,
+            **mlp_common,
         )
 
-        # Network defining spatial correction at t0.
         self.initial_correction_net = SmoothMLP(
             depth=self.config.get("initial_correction_depth", 4),
             width=self.config.get("initial_correction_width", 128),
-            act=act,
+            **mlp_common,
         )
+
 
     def compute_potential(self, tx_cart: jnp.ndarray) -> jnp.ndarray:
         """

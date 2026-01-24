@@ -4,11 +4,11 @@ import jax.random as jr
 
 from .inference import apply_model, apply_model_time
 
-__all__ = [
+__all__ = (
     "evaluate_performance",
     "evaluate_performance_node",
     "bnn_performance",
-]
+)
 
 
 def evaluate_performance(

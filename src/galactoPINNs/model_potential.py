@@ -9,10 +9,10 @@ from xmmutablemap import ImmutableMap
 import unxt as u
 from unxt.quantity import AbstractQuantity
 
-__all__ = [
+__all__ = (
     "ModelPotential",
     "make_galax_potential",
-]
+)
 
 @final
 class ModelPotential(AbstractPotential):
@@ -109,7 +109,7 @@ Provide "potential" and "acceleration" keys.
 
 def make_galax_potential(model, params, *, units=unitsystems.galactic):
     """
-    Convenience factory to wrap a trained model as a Galax `AbstractPotential`.
+    Wrap a trained model as a Galax `AbstractPotential`.
 
     Parameters
     ----------
@@ -125,8 +125,8 @@ def make_galax_potential(model, params, *, units=unitsystems.galactic):
     pot : ModelPotential
         A Galax-compatible potential.
     """
-    apply_fn = model.apply if hasattr(model, "apply") else model
-    config = model.config if hasattr(model, "config") else None
+    apply_fn = model.apply
+    config = model.config #if hasattr(model, "config") else None
     if config is None:
         raise ValueError("make_galax_potential requires `model` to have a `.config` attribute.")
 

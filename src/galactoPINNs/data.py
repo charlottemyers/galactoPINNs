@@ -1,33 +1,31 @@
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Dict, Iterable, Literal, Optional, Sequence, Tuple, Union
 
 import numpy as np
-import astropy.units as au
 import coordinax as cx
 import galax.potential as gp
 from galax.potential import density
-from unxt import Quantity
+import unxt as u
+import jax.numpy as jnp
 
 
-__all__ = [
+__all__ = (
     # sampling
     "biased_sphere_samples",
     "rejection_sample_sphere",
     "rejection_sample_time_sphere",
     # datasets
-    "generate_static_datadict_sphere",
-    "generate_time_dep_datadict_sphere",
+    "generate_static_datadict",
+    "generate_time_dep_datadict",
     # analytic potential factory
     # scaling utilities
     "UniformScaler",
     "Transformer",
-    "scale_by_non_dim_potential",
-    "scale_by_non_dim_potential_time_by_dict",
+    "scale_data",
+    "scale_data_time",
     # misc
     "acc_cart_to_cyl_like",
-]
+)
 
 
 # -------------------------
@@ -86,9 +84,9 @@ def _estimate_density_upper_bound(
     mask = R <= R_max
 
     pos_grid = cx.CartesianPos3D(
-        x=X[mask].ravel() * au.kpc,
-        y=Y[mask].ravel() * au.kpc,
-        z=Z[mask].ravel() * au.kpc,
+        x = u.Quantity(X[mask].ravel(), "kpc"),
+        y = u.Quantity(Y[mask].ravel(), "kpc"),
+        z = u.Quantity(Z[mask].ravel(), "kpc"),
     )
     rho_grid = density(galax_pot, pos_grid, t=t).value
     rho_max = float(np.max(rho_grid))
@@ -168,7 +166,7 @@ def rejection_sample_sphere(
         if x.size == 0:
             continue
 
-        pos = cx.CartesianPos3D(x=x * au.kpc, y=y * au.kpc, z=z * au.kpc)
+        pos = cx.CartesianPos3D(x = u.Quantity(x, "kpc"), y = u.Quantity(y, "kpc"), z = u.Quantity(z, "kpc"))
         rho = density(galax_pot, pos, t=t).value
 
         # ---- accept/reject ----
@@ -224,7 +222,7 @@ def rejection_sample_time_sphere(
 # Dataset generation
 # -------------------------
 
-def generate_static_datadict_sphere(
+def generate_static_datadict(
     galax_potential,
     N_samples_train: int,
     N_samples_test: int,
@@ -268,8 +266,8 @@ def generate_static_datadict_sphere(
     """
     def _evaluate(samples: np.ndarray, t: float = 0.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         x, y, z = samples.T
-        pos = cx.CartesianPos3D(x=x * au.kpc, y=y * au.kpc, z=z * au.kpc)
-        t_q = Quantity(t, au.Myr)
+        pos = cx.CartesianPos3D(x = u.Quantity(x, "kpc"), y = u.Quantity(y, "kpc"), z = u.Quantity(z, "kpc"))
+        t_q = u.Quantity(t, "Myr")
         acc = galax_potential.acceleration(pos, t=t_q)
         pot = galax_potential.potential(pos, t=t_q).value
         a = np.stack([acc.x.value, acc.y.value, acc.z.value], axis=1)
@@ -336,7 +334,7 @@ def generate_static_datadict_sphere(
     }
 
 
-def generate_time_dep_datadict_sphere(
+def generate_time_dep_datadict(
     galax_potential,
     times_train: Sequence,
     times_test: Sequence,
@@ -382,9 +380,8 @@ def generate_time_dep_datadict_sphere(
     def _get_data(t_myr: float, N_samples: int, R_max: float):
         samples = rejection_sample_time_sphere(galax_potential, t_myr, N_samples=N_samples, R_max=R_max)
         x, y, z = samples.T
-        pos = cx.CartesianPos3D(x=x * au.kpc, y=y * au.kpc, z=z * au.kpc)
-
-        t_array = Quantity(np.full(len(samples), t_myr), au.Myr)
+        pos = cx.CartesianPos3D(x = u.Quantity(x, "kpc"), y = u.Quantity(y, "kpc"), z = u.Quantity(z, "kpc"))
+        t_array = u.Quantity(np.full(len(samples), t_myr), "Myr")
 
         acc = galax_potential.acceleration(pos, t_array)
         pot = galax_potential.potential(pos, t_array).ustrip("kpc2/Myr2")
@@ -435,103 +432,62 @@ def generate_time_dep_datadict_sphere(
 # -------------------------
 
 class UniformScaler:
-    """
-    Simple affine scaler for NumPy arrays.
-    Two modes:
-    1) Min-max scaling to a feature_range (default [-1, 1]).
-    2) Fixed scaling by a constant `scaler` (multiplicative), with zero offset.
-    """
-
-    def __init__(self, feature_range: Tuple[float, float] = (-1.0, 1.0)):
+    def __init__(self, feature_range=(-1, 1)):
+        """Scale the variable by the min and max of the range or by a constant scaler"""
         self.feature_range = feature_range
-        self.scaler: Optional[float] = None
+        pass
 
-        # Learned parameters (min-max mode)
-        self.scale_: Optional[float] = None
-        self.min_: Optional[float] = None
-
-        # Diagnostics
-        self.data_min_: Optional[float] = None
-        self.data_max_: Optional[float] = None
-        self.data_range_: Optional[float] = None
-
-    def fit(self, data: np.ndarray, *, scaler: Optional[float] = None) -> "UniformScaler":
-        """
-        Fit scaler parameters from data.
-
-        Parameters
-        ----------
-        data
-            Data used to compute min/max if scaler is None.
-        scaler
-            If provided, activates constant scaling mode (x -> x * scaler).
-
-        Returns
-        -------
-        self
-        """
-        data = np.asarray(data)
-
+    def fit(self, data, scaler=None):
         self.scaler = scaler
-        data_max = float(np.max(data))
-        data_min = float(np.min(data))
-        data_range = data_max - data_min
 
+        data_max = jnp.max(data)
+        data_min = jnp.min(data)
+
+        data_range = data_max - data_min
+        self.scale_ = (self.feature_range[1] - self.feature_range[0]) / data_range
+        self.min_ = self.feature_range[0] - data_min * self.scale_
         self.data_min_ = data_min
         self.data_max_ = data_max
         self.data_range_ = data_range
 
-        if scaler is not None:
-            # constant scaling mode
-            self.scale_ = float(scaler)
-            self.min_ = 0.0
-            return self
+    def fit_transform(self, data, scaler=None):
+        self.scaler = scaler
+        data_max = jnp.max(data)
+        data_min = jnp.min(data)
 
-        if data_range == 0:
-            # Degenerate case: data constant. Map everything to midpoint of feature range.
-            lo, hi = self.feature_range
-            self.scale_ = 0.0
-            self.min_ = 0.5 * (lo + hi)
-            return self
+        data_range = data_max - data_min
+        self.scale_ = (self.feature_range[1] - self.feature_range[0]) / data_range
+        self.min_ = self.feature_range[0] - data_min * self.scale_
+        self.data_min_ = data_min
+        self.data_max_ = data_max
+        self.data_range_ = data_range
 
-        lo, hi = self.feature_range
-        self.scale_ = (hi - lo) / data_range
-        self.min_ = lo - data_min * self.scale_
-        return self
-
-    def fit_transform(self, data: np.ndarray, *, scaler: Optional[float] = None) -> np.ndarray:
-        """Fit then transform."""
-        self.fit(data, scaler=scaler)
-        return self.transform(data)
-
-    def transform(self, data: np.ndarray) -> np.ndarray:
-        """
-        Transform data using fitted parameters.
-        """
-        if self.scale_ is None or self.min_ is None:
-            raise RuntimeError("UniformScaler must be fit before calling transform().")
-
-        data = np.asarray(data)
         if self.scaler is not None:
-            return data * self.scaler
-        if self.scale_ == 0.0:
-            return np.zeros_like(data) + self.min_
-        return data * self.scale_ + self.min_
+            X = data * self.scaler
+            self.scale_ = self.scaler
+            self.min_ = 0.0
+        else:
+            X = data * self.scale_ + self.min_
+        return X
 
-    def inverse_transform(self, data: np.ndarray) -> np.ndarray:
-        """
-        Invert the transform.
-        """
-        if self.scale_ is None or self.min_ is None:
-            raise RuntimeError("UniformScaler must be fit before calling inverse_transform().")
+    def transform(self, data):
+        if not hasattr(self, "scaler"):
+            self.scaler = None
 
-        data = np.asarray(data)
+        if self.scaler is not None:
+            X = data * self.scaler
+        else:
+            X = data * self.scale_ + self.min_
+        return X
+
+    def inverse_transform(self, data):
+        if not hasattr(self, "scaler"):
+            self.scaler = None
         if self.scaler is not None:
             return data / self.scaler
-        if self.scale_ == 0.0:
-            # all data mapped to constant; inverse is undefined -> return constant original min
-            return np.zeros_like(data) + (self.data_min_ if self.data_min_ is not None else 0.0)
-        return (data - self.min_) / self.scale_
+        else:
+            return (data - self.min_) / self.scale_
+
 
 
 class Transformer:
@@ -546,42 +502,41 @@ class Transformer:
     """
 
     def __init__(self, eps: float = 1e-12):
-        self.mean: Optional[np.ndarray] = None
-        self.scale: Optional[np.ndarray] = None
-        self.eps = float(eps)
+        self.mean: Optional[jnp.ndarray] = None
+        self.scale: Optional[jnp.ndarray] = None
 
-    def fit(self, data: np.ndarray) -> "Transformer":
+    def fit(self, data: jnp.ndarray) -> "Transformer":
         """Fit mean and scale from data."""
-        data = np.asarray(data)
+        data = jnp.asarray(data)
         if data.ndim == 1:
             data = data[:, None]
 
-        mean = np.mean(data, axis=0)
-        scale = np.max(np.abs(data - mean), axis=0)
-        scale = np.maximum(scale, self.eps)
+        mean = jnp.mean(data, axis=0)
+        scale = jnp.max(jnp.abs(data - mean), axis=0)
+        scale = jnp.maximum(scale, self.eps)
 
         self.mean = mean
         self.scale = scale
         return self
 
-    def transform(self, data: np.ndarray) -> np.ndarray:
+    def transform(self, data: jnp.ndarray) -> jnp.ndarray:
         """Apply scaling."""
         if self.mean is None or self.scale is None:
             raise RuntimeError("Transformer must be fit before calling transform().")
 
-        data = np.asarray(data)
+        data = jnp.asarray(data)
         is_1d = (data.ndim == 1)
         if is_1d:
             data = data[:, None]
         out = (data - self.mean) / self.scale
         return out.squeeze() if is_1d else out
 
-    def inverse_transform(self, data: np.ndarray) -> np.ndarray:
+    def inverse_transform(self, data: jnp.ndarray) -> jnp.ndarray:
         """Invert scaling."""
         if self.mean is None or self.scale is None:
             raise RuntimeError("Transformer must be fit before calling inverse_transform().")
 
-        data = np.asarray(data)
+        data = jnp.asarray(data)
         is_1d = (data.ndim == 1)
         if is_1d:
             data = data[:, None]
@@ -589,10 +544,10 @@ class Transformer:
         return out.squeeze() if is_1d else out
 
 
-def scale_by_non_dim_potential(
-    data_dict: Dict[str, np.ndarray],
+def scale_data(
+    data_dict: Dict[str, jnp.ndarray],
     config: dict,
-) -> Tuple[Dict[str, np.ndarray], Dict[str, UniformScaler]]:
+) -> Tuple[Dict[str, jnp.ndarray], Dict[str, UniformScaler]]:
     """
     Non-dimensionalize position/acceleration/potential using scale radius r_s and
     an empirically chosen potential scale u_star.
@@ -621,9 +576,9 @@ def scale_by_non_dim_potential(
     if config.get("include_analytic", False):
         lf_potential = config["lf_analytic_function"]
         pos = cx.CartesianPos3D(
-            x=data_dict["x_train"][:, 0] * au.kpc,
-            y=data_dict["x_train"][:, 1] * au.kpc,
-            z=data_dict["x_train"][:, 2] * au.kpc,
+            x = u.Quantity(data_dict["x_train"][:, 0], "kpc"),
+            y = u.Quantity(data_dict["x_train"][:, 1], "kpc"),
+            z = u.Quantity(data_dict["x_train"][:, 2], "kpc"),
         )
         u_analytic = lf_potential.potential(pos, 0).ustrip("kpc2/Myr2")
         u_residual = data_dict["u_train"] - u_analytic
@@ -634,7 +589,7 @@ def scale_by_non_dim_potential(
     if u_star <= 0:
         raise ValueError("Computed u_star must be positive.")
 
-    t_star = np.sqrt(r_s**2 / u_star)
+    t_star = jnp.sqrt(r_s**2 / u_star)
     a_star = r_s / (t_star**2)
     x_star = r_s
 
@@ -646,12 +601,12 @@ def scale_by_non_dim_potential(
     x_train = x_transformer.transform(data_dict["x_train"])
     a_train = a_transformer.transform(data_dict["a_train"])
     u_train = u_transformer.transform(data_dict["u_train"])
-    r_train = np.linalg.norm(x_train, axis=1)
+    r_train = jnp.linalg.norm(x_train, axis=1)
 
     x_val = x_transformer.transform(data_dict["x_val"])
     a_val = a_transformer.transform(data_dict["a_val"])
     u_val = u_transformer.transform(data_dict["u_val"])
-    r_val = np.linalg.norm(x_val, axis=1)
+    r_val = jnp.linalg.norm(x_val, axis=1)
 
     scaled = {
         "x_train": x_train,
@@ -667,7 +622,7 @@ def scale_by_non_dim_potential(
     return scaled, transformers
 
 
-def scale_by_non_dim_potential_time_by_dict(
+def scale_data_time(
     data_dict: Dict[str, Dict[float, Dict[str, np.ndarray]]],
     config: dict,
 ) -> Tuple[Dict[str, Dict[float, Dict[str, np.ndarray]]], Dict[str, UniformScaler]]:
@@ -714,11 +669,11 @@ def scale_by_non_dim_potential_time_by_dict(
     if config.get("include_analytic", False):
         lf_analytic = config["lf_analytic_function"]
         pos = cx.CartesianPos3D(
-            x=x_concat[:, 0] * au.kpc,
-            y=x_concat[:, 1] * au.kpc,
-            z=x_concat[:, 2] * au.kpc,
+            x = u.Quantity(x_concat[:, 0], "kpc"),
+            y = u.Quantity(x_concat[:, 1], "kpc"),
+            z = u.Quantity(x_concat[:, 2], "kpc"),
         )
-        t_quant = Quantity(t_concat, au.Myr)
+        t_quant = u.Quantity(t_concat, "Myr")
         u_analytic = lf_analytic.potential(pos, t_quant).ustrip("kpc2/Myr2")
         u_resid = u_concat - u_analytic
         u_star = float(np.max(np.abs(u_resid)))
@@ -777,3 +732,28 @@ def acc_cart_to_cyl_like(a: np.ndarray) -> np.ndarray:
     a_z = a[:, 2]
     a_mag = np.linalg.norm(a, axis=1)
     return np.stack([a_rho, a_phi, a_z, a_mag], axis=1)
+
+def generate_xz_plane_grid(xmin, xmax, zmin, zmax, num_x=50, num_z=50, y=0.0):
+    x = np.linspace(xmin, xmax, num_x)
+    z = np.linspace(zmin, zmax, num_z)
+    xx, zz = np.meshgrid(x, z)
+    yy = np.full_like(xx, y)
+    points = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3)
+    return points
+
+def generate_xy_plane_grid(xmin, xmax, ymin, ymax, num_x=50, num_y=50, z=0.0):
+    x = np.linspace(xmin, xmax, num_x)
+    y = np.linspace(ymin, ymax, num_y)
+    xx, yy = np.meshgrid(x, y)
+    zz = np.full_like(xx, z)
+    points = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3)
+    return points
+
+
+def generate_yz_plane_grid(ymin, ymax, zmin, zmax, num_y=50, num_z=50, x=0.0):
+    y = np.linspace(ymin, ymax, num_y)
+    z = np.linspace(zmin, zmax, num_z)
+    yy, zz = np.meshgrid(y, z)
+    xx = np.full_like(zz, x)
+    points = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3)
+    return points

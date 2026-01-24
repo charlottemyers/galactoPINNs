@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from typing import Any, Callable, Mapping, Optional
 
 import jax.random as jr
@@ -12,11 +10,11 @@ from numpyro.optim import Adam
 
 from .static_model import StaticModel
 
-__all__ = [
+__all__ = (
     "model_svi",
     "make_svi",
     "run_window",
-]
+)
 
 
 def model_svi(

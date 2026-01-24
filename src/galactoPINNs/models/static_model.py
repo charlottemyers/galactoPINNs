@@ -1,8 +1,6 @@
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from astropy import constants as const
-import numpy as np
 
 from ..layers import (
     CartesianToModifiedSphericalLayer,
@@ -10,7 +8,6 @@ from ..layers import (
     ScaleNNPotentialLayer,
     FuseModelsLayer,
     SmoothMLP,
-    FuseandBoundary,
     TrainableGalaxPotential
 )
 
@@ -84,23 +81,6 @@ class StaticModel(nn.Module):
 
         return laplacian
 
-    def compute_mass(self):
-        G_val = const.G.to("kpc^3/Msun/Myr^2").value  # physical G
-        eval_pts = self.config["eval_pts"]
-
-        R_scaled = jnp.linalg.norm(eval_pts, axis=1, keepdims=True)  # shape (n_dirs, 1)
-        R_phys = self.config["x_transformer"].inverse_transform(
-            R_scaled)  # physical radius
-        dirs = eval_pts / R_scaled  # normalize directions
-
-        acc = self.compute_acceleration(eval_pts)
-        acc_phys = self.config["a_transformer"].inverse_transform(acc)
-        a_r = jnp.sum(acc_phys * dirs, axis=1)
-
-        flux = 4.0 * jnp.pi * (R_phys**2) * jnp.mean(a_r)
-        pred_mass = -flux / (4 * np.pi * G_val)
-
-        return pred_mass
 
     @nn.compact
     def __call__(self, cart_x, mode="full"):
@@ -127,10 +107,18 @@ class StaticModel(nn.Module):
 
         depth = self.config.get("depth", 4)
         width = self.config.get("width", 128)
-        act = self.config.get("activation", "softplus")
-        u_nn = SmoothMLP(width=width, depth=depth, act=act)(x)
-        outputs["u_nn"] = u_nn
+        act = self.config.get("activation", None)
+        gelu_approx = self.config.get("gelu_approximate", False)
 
+        if self.config.get("nn_off", False):
+            u_nn = 0.0
+        else:
+            mlp_kwargs = dict(width=width, depth=depth, gelu_approximate=gelu_approx)
+            if act is not None:
+                mlp_kwargs["act"] = act  # must be callable; SmoothMLP will enforce
+            u_nn = SmoothMLP(**mlp_kwargs)(x)
+
+        outputs["u_nn"] = u_nn
 
         # Fuse models (combine analytic and NN outputs)
         if self.config.get("trainable", False):
