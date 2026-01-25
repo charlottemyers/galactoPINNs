@@ -1,9 +1,10 @@
+import jax
 import jax.numpy as jnp
-import numpy as np
 import jax.random as jr
+from typing import Any, Dict, Mapping, Union, Callable, Optional
+from .inference import apply_model
 
-from .inference import apply_model, apply_model_time
-
+Array = jax.Array
 __all__ = (
     "evaluate_performance",
     "evaluate_performance_node",
@@ -12,34 +13,33 @@ __all__ = (
 
 
 def evaluate_performance(
-    model,
-    trained_state_params,
-    raw_datadict,
-    num_test,
-):
+    model: Any,
+    trained_state_params: Any,
+    raw_datadict: Mapping[str, Any],
+    num_test: int,
+) -> Dict[str, Any]:
     """
-    Evaluate a *static* model on a validation set and compute error metrics.
+    Evaluate a static model on a validation set and compute error metrics.
 
     This function:
     - transforms physical validation positions `x_val` to the model's scaled input space,
-    - runs `apply_model(...)` to obtain predicted potential and acceleration in *scaled* space,
+    - runs `apply_model(...)` to obtain predicted potential and acceleration in scaled space,
     - inverse-transforms predictions back to physical units,
     - computes percent errors against truth,
     - optionally compares against an analytic baseline potential/acceleration.
 
     Parameters
     ----------
-    model : flax.linen.Module (or compatible)
-        A trained (or partially trained) static model object with attribute `config`.
+    model : flax.linen.Module
+        A trained static model object with attribute `config`.
         The model is expected to support `model.apply({"params": params}, x_scaled)` via `apply_model`.
     trained_state_params : Any
         Parameters tree (e.g., `TrainState.params`) used for `model.apply`.
     raw_datadict : dict
-        Dictionary containing (at minimum) the following keys:
+        Dictionary containing (at min.) the following keys:
         - "x_val": array-like, shape (N, 3), physical validation positions
         - "u_val": array-like, shape (N,) or (N, 1), physical true potential
         - "a_val": array-like, shape (N, 3), physical true acceleration
-        Additional keys may exist and are ignored here.
     num_test : int
         Number of validation samples to evaluate (uses the first `num_test` rows).
 
@@ -50,12 +50,12 @@ def evaluate_performance(
     - "a_transformer": must implement .inverse_transform(a_scaled) -> a_phys
     Optional:
     - "include_analytic" (bool): whether to compute analytic baseline errors (default True)
-    - "lf_analytic_function": analytic potential object with .potential(x, t=...) and .acceleration(x, t=...)
+    - "ab_potential": analytic potential object with .potential(x, t=...) and .acceleration(x, t=...)
 
     Returns
     -------
     results : dict
-        Keys are designed for downstream plotting/analysis. Common entries include:
+        Keys are designed for downstream plotting/analysis. Entries include:
         - "r_eval": np.ndarray, shape (num_test,), radius of each evaluation point in physical space
         - "x_val": physical positions used, shape (num_test, 3)
         - "true_u", "predicted_u": physical potentials, shape (num_test,)
@@ -63,9 +63,9 @@ def evaluate_performance(
         - "pot_percent_error": percent potential error, shape (num_test,)
         - "acc_percent_error": percent acceleration error, shape (num_test,)
         If analytic baseline is enabled:
-        - "lf_potential": analytic baseline potential at t=0
-        - "lf_pot_error", "lf_acc_error": baseline percent errors
-        - "residual_pot": lf_potential - predicted_u
+        - "analytic_baseline": analytic baseline potential at t=0
+        - "ab_pot_error", "ab_acc_error": baseline percent errors
+        - "residual_pot": ab_potential - predicted_u
         - "corrected_pot_percent_error": percent error after applying mean residual correction
 
     """
@@ -73,7 +73,7 @@ def evaluate_performance(
     true_acc = raw_datadict["a_val"][:num_test]
 
     config = model.config
-    r_eval = np.linalg.norm(raw_datadict["x_val"][:num_test], axis=1)
+    r_eval = jnp.linalg.norm(raw_datadict["x_val"][:num_test], axis=1)
     scaled_x_val = config["x_transformer"].transform(raw_datadict["x_val"][:num_test])
     output = apply_model(model, trained_state_params, scaled_x_val)
     predicted_pot = config["u_transformer"].inverse_transform(output["u_pred"])
@@ -83,7 +83,7 @@ def evaluate_performance(
         * jnp.linalg.norm(predicted_acc - true_acc, axis=1)
         / jnp.linalg.norm(true_acc, axis=1)
     )
-    pot_percent_error = 100 * np.abs((true_pot - predicted_pot) / true_pot)
+    pot_percent_error = 100 * jnp.abs((true_pot - predicted_pot) / true_pot)
 
     fiducial_acc = None
     fiducial_pot = None
@@ -91,22 +91,22 @@ def evaluate_performance(
     fiducial_pot_error = None
 
     if config.get("include_analytic", True):
-        lf_analytic = config["lf_analytic_function"]
-        lf_analytic_potential = lf_analytic.potential(
+        analytic_baseline = config["ab_potential"]
+        analytic_baseline_potential = analytic_baseline.potential(
             raw_datadict["x_val"][:num_test], t=0
         )
-        lf_analytic_acc = lf_analytic.acceleration(
+        analytic_baseline_acc = analytic_baseline.acceleration(
             raw_datadict["x_val"][:num_test], t=0
         )
 
-        lf_pot_error = 100 * np.abs((lf_analytic_potential - true_pot) / true_pot)
-        lf_acc_error = (
+        ab_pot_error = 100 * jnp.abs((analytic_baseline_potential - true_pot) / true_pot)
+        ab_acc_error = (
             100
-            * jnp.linalg.norm(lf_analytic_acc - true_acc, axis=1)
+            * jnp.linalg.norm(analytic_baseline_acc - true_acc, axis=1)
             / jnp.linalg.norm(true_acc, axis=1)
         )
 
-        residual_pot = lf_analytic_potential - predicted_pot
+        residual_pot = analytic_baseline_potential - predicted_pot
         average_residual_pot = jnp.mean(residual_pot)
         corrected_potential = predicted_pot + average_residual_pot
         corrected_pot_percent_error = 100 * jnp.abs(
@@ -114,9 +114,9 @@ def evaluate_performance(
         )
 
     else:
-        lf_analytic_potential = None
-        lf_pot_error = None
-        lf_acc_error = None
+        analytic_baseline_potential = None
+        ab_pot_error = None
+        ab_acc_error = None
         residual_pot = None
         corrected_potential = None
         corrected_pot_percent_error = None
@@ -132,28 +132,32 @@ def evaluate_performance(
         "pot_percent_error": pot_percent_error,
         "residual_pot": residual_pot,
         "corrected_pot_percent_error": corrected_pot_percent_error,
-        "lf_potential": lf_analytic_potential,
-        "lf_pot_error": lf_pot_error,
-        "lf_acc_error": lf_acc_error,
+        "analytic_baseline": analytic_baseline_potential,
+        "ab_pot_error": ab_pot_error,
+        "ab_acc_error": ab_acc_error,
         "fiducial_acc": fiducial_acc,
         "fiducial_pot": fiducial_pot,
         "fiducial_pot_error": fiducial_pot_error,
         "fiducial_acc_error": fiducial_acc_error,
-        "avg_percent_error": np.mean(acc_percent_error),
+        "avg_percent_error": jnp.mean(acc_percent_error),
     }
 
 
 def evaluate_performance_node(
-    model, params, t_eval, raw_datadict, num_test
-):
+    model: Any,
+    params: Any,
+    t_eval: Union[float, int, Any],
+    raw_datadict: Mapping[str, Any],
+    num_test: int,
+) -> Dict[str, Any]:
     """
-    Evaluate a *time-dependent* model at a single evaluation time.
+    Evaluate a time-dependent model at a single evaluation time.
 
     This function expects the dataset to be organized by time keys:
         raw_datadict["val"][t_eval] -> dict with keys {"x", "u", "a"}
 
     It constructs a batched input array `tx_scaled` with columns [t_scaled, x_scaled]
-    and uses `apply_model_time(...)` to generate predictions.
+    and uses `apply_model(...)` to generate predictions.
 
     Parameters
     ----------
@@ -183,7 +187,7 @@ def evaluate_performance_node(
     - "t_transformer": .transform / .inverse_transform
     Optional:
     - "include_analytic" (bool): whether to compute analytic baseline errors (default True)
-    - "lf_analytic_function": analytic potential object with .potential(x, t=...) and .acceleration(x, t=...)
+    - "ab_potential": analytic potential object with .potential(x, t=...) and .acceleration(x, t=...)
 
     Returns
     -------
@@ -195,12 +199,12 @@ def evaluate_performance_node(
         - "pot_percent_error", "acc_percent_error": percent errors, shape (num_test,)
         - "true_a_norm", "predicted_a_norm": norms of acceleration vectors, shape (num_test, 1)
         If analytic baseline is enabled:
-        - "lf_potential": analytic baseline potential at t_eval
-        - "lf_analytic_0": analytic baseline potential at t=0 (same x)
-        - "lf_pot_error": baseline potential percent error at t_eval
-        - "lf0_pot_error": baseline potential percent error at t=0
-        - "lf_acc_error": baseline acceleration percent error at t_eval
-        - "lf_acc_norm": norm of baseline analytic acceleration, shape (num_test,)
+        - "analytic_baseline": analytic baseline potential at t_eval
+        - "analytic_baseline_0": analytic baseline potential at t=0 (same x)
+        - "ab_pot_error": baseline potential percent error at t_eval
+        - "ab0_pot_error": baseline potential percent error at t=0
+        - "ab_acc_error": baseline acceleration percent error at t_eval
+        - "ab_acc_norm": norm of baseline analytic acceleration, shape (num_test,)
         - "residual_pot", "corrected_potential", "corrected_pot_percent_error"
 
     """
@@ -208,7 +212,7 @@ def evaluate_performance_node(
     x_val = val_data["x"][:num_test]
 
     config = model.config
-    r_eval = np.linalg.norm(x_val, axis=1)
+    r_eval = jnp.linalg.norm(x_val, axis=1)
 
     true_pot = val_data["u"][:num_test]
     true_acc = val_data["a"][:num_test]
@@ -219,7 +223,7 @@ def evaluate_performance_node(
     )
     tx_scaled = jnp.concatenate([t_scaled, x_scaled], axis=1)
 
-    output = apply_model_time(model, params, tx_scaled)
+    output = apply_model(model, params, tx_scaled)
 
     predicted_pot = config["u_transformer"].inverse_transform(output["u_pred"])
     predicted_acc = config["a_transformer"].inverse_transform(output["a_pred"])
@@ -232,38 +236,38 @@ def evaluate_performance_node(
         * jnp.linalg.norm(predicted_acc - true_acc, axis=1)
         / jnp.linalg.norm(true_acc, axis=1)
     )
-    pot_percent_error = 100 * np.abs((true_pot - predicted_pot) / true_pot)
+    pot_percent_error = 100 * jnp.abs((true_pot - predicted_pot) / true_pot)
 
     if config.get("include_analytic", True):
-        lf_analytic = config["lf_analytic_function"]
-        lf_analytic_potential = lf_analytic.potential(x_val, t=t_eval)
-        lf_analytic_acc = lf_analytic.acceleration(x_val, t=t_eval)
-        lf_analytic_0 = lf_analytic.potential(x_val, t=0)
-        lf_analytic_acc_norm = jnp.linalg.norm(lf_analytic_acc, axis=1)
-        lf_pot_error = 100 * np.abs((lf_analytic_potential - true_pot) / true_pot)
-        lf0_pot_error = 100 * np.abs((lf_analytic_0 - true_pot) / true_pot)
-        lf_acc_error = (
+        analytic_baseline = config["ab_potential"]
+        analytic_baseline_potential = analytic_baseline.potential(x_val, t=t_eval)
+        analytic_baseline_acc = analytic_baseline.acceleration(x_val, t=t_eval)
+        analytic_baseline_0 = analytic_baseline.potential(x_val, t=0)
+        analytic_baseline_acc_norm = jnp.linalg.norm(analytic_baseline_acc, axis=1)
+        ab_pot_error = 100 * jnp.abs((analytic_baseline_potential - true_pot) / true_pot)
+        ab0_pot_error = 100 * jnp.abs((analytic_baseline_0 - true_pot) / true_pot)
+        ab_acc_error = (
             100
-            * jnp.linalg.norm(lf_analytic_acc - true_acc, axis=1)
+            * jnp.linalg.norm(analytic_baseline_acc - true_acc, axis=1)
             / jnp.linalg.norm(true_acc, axis=1)
         )
 
-        residual_pot = lf_analytic_potential - predicted_pot
+        residual_pot = analytic_baseline_potential - predicted_pot
         average_residual_pot = jnp.mean(residual_pot)
         corrected_potential = predicted_pot + average_residual_pot
         corrected_pot_percent_error = 100 * jnp.abs(
             (corrected_potential - true_pot) / true_pot
         )
     else:
-        lf_analytic_potential = None
-        lf_pot_error = None
-        lf_acc_error = None
+        analytic_baseline_potential = None
+        ab_pot_error = None
+        ab_acc_error = None
         residual_pot = None
         corrected_potential = None
         corrected_pot_percent_error = None
-        lf_analytic_acc_norm = None
-        lf0_pot_error = None
-        lf_analytic_0 = None
+        analytic_baseline_acc_norm = None
+        ab0_pot_error = None
+        analytic_baseline_0 = None
 
     return {
         "r_eval": r_eval,
@@ -278,17 +282,22 @@ def evaluate_performance_node(
         "residual_pot": residual_pot,
         "corrected_pot_percent_error": corrected_pot_percent_error,
         "corrected_potential": corrected_potential,
-        "lf_potential": lf_analytic_potential,
-        "lf_acc_norm": lf_analytic_acc_norm,
-        "lf_pot_error": lf_pot_error,
-        "lf_acc_error": lf_acc_error,
-        "lf0_pot_error": lf0_pot_error,
-        "lf_analytic_0": lf_analytic_0,
+        "analytic_baseline": analytic_baseline_potential,
+        "ab_acc_norm": analytic_baseline_acc_norm,
+        "ab_pot_error": ab_pot_error,
+        "ab_acc_error": ab_acc_error,
+        "ab0_pot_error": ab0_pot_error,
+        "analytic_baseline_0": analytic_baseline_0,
     }
 
 
 
-def bnn_performance(predictive, x_test, config,  rng_key=None):
+def bnn_performance(
+    predictive: Callable[[Array, Array], Mapping[str, Array]],
+    x_test: Array,
+    config: Mapping[str, Any],
+    rng_key: Optional[Array] = None,
+) -> Dict[str, Any]:
     """
     Summarize Bayesian posterior predictive outputs for potential and acceleration.
     This function is designed for NumPyro-style `Predictive` callables that return

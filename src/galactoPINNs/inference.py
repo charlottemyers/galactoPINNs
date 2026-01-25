@@ -1,67 +1,57 @@
+from typing import Any, Dict, Mapping, Protocol, TypedDict
+import jax
+
+Array = jax.Array
+Params = Any
+
+
 __all__ = (
     "apply_model",
-    "apply_model_time",
 )
 
 
-def apply_model(model, params, x_scaled):
+##### Protocols and types #####
+class _ModelLike(Protocol):
+    """Protocol for Flax-like modules exposing an `.apply(...)` method."""
+    def apply(self, variables: Mapping[str, Any], *args: Any, **kwargs: Any) -> Mapping[str, Any]: ...
+class ApplyModelOutput(TypedDict, total=False):
+    """Standardized return schema for model application helpers."""
+    u_pred: Array
+    a_pred: Array
+    outputs: Any
+
+##########
+
+
+def apply_model(model: _ModelLike, params: Params, x_scaled: Array) -> Dict[str, Any]:
     """
-    Apply a *static* model to scaled Cartesian inputs and return standardized outputs.
+    Apply a static or time-dependent model to scaled Cartesian inputs and return standardized outputs.
 
     Parameters
     ----------
-    model : flax.linen.Module
-        Model object with `.apply(...)`.
-    params : Any
-        Parameter pytree to pass to `model.apply`.
-    x_scaled : array-like
-        Scaled positions. Expected shape (N, 3) or (3,).
+    model
+        Flax-like model exposing ``model.apply(...)``. The apply call must return a mapping
+        containing (at minimum) keys ``"potential"`` and ``"acceleration"``.
+    params
+        Parameter pytree passed as ``{"params": params}`` into ``model.apply``.
+    x_scaled
+        Scaled Cartesian inputs. Expected shape ``(N, 3)`` for batch evaluation or ``(3,)``
+        for a single point.
+
     Returns
     -------
-    out : dict
-        - "u_pred": scaled predicted potential
-        - "a_pred": scaled predicted acceleration
-        - "outputs": auxiliary outputs dict if present, else None
+    out
+        Dictionary with standardized keys:
+        - ``"u_pred"``: scaled predicted potential (shape typically ``(N,)`` or ``(1,)``)
+        - ``"a_pred"``: scaled predicted acceleration (shape typically ``(N, 3)`` or ``(3,)``)
+        - ``"outputs"``: auxiliary output payload if present under ``predictions["outputs"]``,
+          otherwise ``None``.
     """
     predictions = model.apply({"params": params}, x_scaled)
 
+    # Required outputs
     u_pred = predictions["potential"]
     a_pred = predictions["acceleration"]
-
-    outputs = predictions.get("outputs", None)
-
-    return {
-        "u_pred": u_pred,
-        "a_pred": a_pred,
-        "outputs": outputs,
-    }
-
-
-def apply_model_time(model, params, tx_scaled):
-    """
-    Apply a *time-dependent* model to scaled (t, x) inputs and return standardized outputs.
-
-    Parameters
-    ----------
-    model : flax.linen.Module (or compatible)
-        Time-dependent model object with `.apply(...)`.
-    params : Any
-        Parameter pytree to pass to `model.apply`.
-    tx_scaled : array-like
-        Scaled inputs with time in the first column.
-        Expected shape (N, 4) = [t_scaled, x_scaled...], or (4,) for a single point.
-    Returns
-    -------
-    out : dict
-        - "u_pred": scaled predicted potential
-        - "a_pred": scaled predicted acceleration
-        - "outputs": auxiliary outputs dict if present, else None
-    """
-    predictions = model.apply({"params": params}, tx_scaled)
-
-    u_pred = predictions["potential"]
-    a_pred = predictions["acceleration"]
-
     outputs = predictions.get("outputs", None)
 
     return {

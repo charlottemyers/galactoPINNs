@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
+from typing import Any, Mapping, Optional, Literal, Dict, TypedDict, TypeAlias
 
 from ..layers import (
     CartesianToModifiedSphericalLayer,
@@ -12,23 +13,39 @@ from ..layers import (
 )
 
 
+# ----------------------------
+# Type aliases
+# ----------------------------
+
+Array = jax.Array
+PyTree: TypeAlias = Any
+Mode = Literal["full", "potential", "acceleration"]
+class StaticOutputs(TypedDict, total=False):
+    """Standardized outputs returned by StaticModel.__call__."""
+    potential: Array
+    acceleration: Array
+    laplacian: Array
+    outputs: Dict[str, Any]  # optional auxiliary dict to store intermediate outputs
+
+
+# ----------------------------
+# Static model
+# ----------------------------
+
 class StaticModel(nn.Module):
+    config: Mapping[str, Any]
+    trainable_analytic_layer: Optional["TrainableGalaxPotential"] = None
     """A Flax module for a static gravitational potential model.
 
     This class defines a flexible model for a gravitational potential, which can
     be a pure neural network, a known analytic potential, or a hybrid of the two.
-    It computes the potential and its derivatives (acceleration, Laplacian)
-    and is designed to be highly configurable through a dictionary.
-
-    The model can enforce physical boundary conditions by smoothly transitioning
-    to an analytic form at large radii.
+    It computes the potential and its derivatives, and is designed to be highly
+    configurable through a dictionary (config).
 
     Attributes:
         config (dict): A dictionary containing the configuration for the model's
             architecture and behavior. Key options include:
-            - "enforce_bc" (bool): If True, use the `FuseandBoundary` layer to
-              enforce the analytic potential as a boundary condition.
-            - "include_analytic" (bool): If True, add the analytic potential
+            - "include_analytic" (bool): If True, add the analytic baseline potential
               to the NN potential.
             - "trainable" (bool): If True, use a `TrainableGalaxPotential` layer
               for the analytic component.
@@ -44,21 +61,58 @@ class StaticModel(nn.Module):
             of a trainable analytic potential layer, passed if `config['trainable']` is True.
 
     """
-    config: dict
+    config: Mapping[str, Any]
     depth: int = 4
-    trainable_analytic_layer: TrainableGalaxPotential = None
+    trainable_analytic_layer: Optional["TrainableGalaxPotential"] = None
 
-    def setup(self):
-        self.log_lambda = self.config.get("init_log_lambda", 0.0)
 
-    def compute_potential(self, cart_x):
+    def setup(self) -> None:
+        self.trainable_layer = self.trainable_analytic_layer
+
+
+    def compute_potential(self, cart_x: Array) -> Array:
+        """
+        Evaluate the model potential at Cartesian position(s).
+
+        Parameters
+        ----------
+        cart_x
+            Input positions. Typically shape ``(3,)`` for a single point or
+            ``(N, 3)`` for a batch.
+
+        Returns
+        -------
+        potential
+            Potential values. Shape is ``(N,)``, or ``(N, 1)`` for batched input.
+        """
         potential = self.apply(
-            {"params": self.variables["params"]}, cart_x, mode="potential"
+            {"params": self.variables["params"]},
+            cart_x,
+            mode="potential",
         )["potential"]
         return potential
 
-    def compute_acceleration(self, cart_x):
-        def potential_fn(x):
+    def compute_acceleration(self, cart_x: Array) -> Array:
+        """
+        Compute acceleration as the negative gradient of the potential: ``a = -grad(Φ)``.
+
+        Parameters
+        ----------
+        cart_x
+            Batched Cartesian positions, shape ``(N, 3)``.
+
+        Returns
+        -------
+        acceleration
+            Batched accelerations, shape ``(N, 3)``.
+
+        Notes
+        -----
+        This method uses ``jax.grad`` on a scalar-valued potential function and
+        then vectorizes across the batch with ``jax.vmap``.
+        """
+        def potential_fn(x: Array) -> Array:
+            # Ensure scalar output for grad()
             pot = self.compute_potential(x).squeeze()
             return pot
 
@@ -66,31 +120,67 @@ class StaticModel(nn.Module):
         acceleration = -acceleration_fn(cart_x)
         return acceleration
 
-    def compute_laplacian(self, cart_x):
-        def potential_fn(x):
-            pot = self.compute_potential(x).squeeze()  # scalar output
+    def compute_laplacian(self, cart_x: Array) -> Array:
+        """
+        Compute the Laplacian of the potential.
+
+        Parameters
+        ----------
+        cart_x
+            Batched Cartesian positions, shape ``(N, 3)``.
+
+        Returns
+        -------
+        laplacian
+            Batched Laplacian values, shape ``(N,)``.
+
+        Notes
+        -----
+        This computes the full Hessian per point via ``jax.hessian`` and takes its
+        trace. This is substantially more expensive than gradients.
+        """
+        def potential_fn(x: Array) -> Array:
+            # Ensure scalar output for hessian()
+            pot = self.compute_potential(x).squeeze()
             return pot
 
-        def laplacian_single(x):
-            hess = jax.hessian(potential_fn)(x)
-            laplacian = jnp.trace(hess)
-            return laplacian
+        def laplacian_single(x: Array) -> Array:
+            hess = jax.hessian(potential_fn)(x)  # (3,3)
+            return jnp.trace(hess)
 
         laplacian_fn = jax.vmap(laplacian_single)
         laplacian = laplacian_fn(cart_x)
-
         return laplacian
 
 
     @nn.compact
-    def __call__(self, cart_x, mode="full"):
+    def __call__(self, cart_x: Array, mode: Mode = "full") -> StaticOutputs:
+        """
+        Forward pass for the static model.
+
+        Parameters
+        ----------
+        cart_x
+            Cartesian inputs. Typically shape (3,) for a single point or (N, 3) for a batch.
+            Assumed to be in the model's scaled coordinate space.
+        mode
+            Controls what is computed/returned:
+            - "full": return at least potential and acceleration (and any aux outputs).
+            - "potential": compute/return only the potential pathway.
+            - "acceleration": compute/return acceleration.
+
+        Returns
+        -------
+        outputs
+            A dict-like object containing keys "potential" and "acceleration".
+        """
         outputs = {}
         if self.trainable_analytic_layer is not None:
             # stub parameter ensures that the `trainable_analytic_layer` is
             # correctly registered within the Flax parameter structure, even if it
-            # contains no trainable parameters itself. This prevents the layer
-            # from being pruned during model initialization.
+            # contains no trainable parameters itself
             _stub = self.param("_stub", lambda rng: jnp.array(0.0))
+
 
         cart_to_sph_layer = CartesianToModifiedSphericalLayer(
             clip=self.config.get("clip", 1.0)
@@ -115,7 +205,7 @@ class StaticModel(nn.Module):
         else:
             mlp_kwargs = dict(width=width, depth=depth, gelu_approximate=gelu_approx)
             if act is not None:
-                mlp_kwargs["act"] = act  # must be callable; SmoothMLP will enforce
+                mlp_kwargs["act"] = act  # must be callable
             u_nn = SmoothMLP(**mlp_kwargs)(x)
 
         outputs["u_nn"] = u_nn

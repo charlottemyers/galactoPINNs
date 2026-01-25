@@ -21,17 +21,6 @@ __all__ = (
 )
 
 
-
-"""
-A primer on shape conventions
------------------
-- tx_cart: (N, 4) with columns [t, x, y, z] in *scaled* coordinates (per config transformers).
-- x_cart:  (N, 3) spatial part in scaled coordinates.
-- x_sph:   (N, D_sph) modified spherical features.
-- tx_sph:  (N, 1 + D_sph) concatenated [t, x_sph...]
-"""
-
-
 # ----------------------------
 # Delta-phi integration helpers
 # ----------------------------
@@ -76,13 +65,12 @@ def compute_delta_phi_per_point(
         def ode_fn(t, phi, _):
             # Replace the time coordinate in the row at evaluation time t.
             row_t = row.at[0].set(t)
-            # apply_fn returns dphi/dt; ensure shape (1, 1) compatible with y0.
             return apply_fn(row_t[None, :]).reshape(1, 1)
 
         term = dfx.ODETerm(ode_fn)
         solver = dfx.Heun()
 
-        # Provide an initial step guess; Diffrax adapts via PIDController.
+        # Provide an initial step guess.
         dt0 = (t1 - t0) / 20.0
 
         sol = dfx.diffeqsolve(
@@ -266,6 +254,7 @@ def compute_delta_phi_per_point_gl3panels(
     return jax.vmap(one)(tx_sph)
 
 
+
 # ----------------------------
 # NODE Model
 # ----------------------------
@@ -395,7 +384,7 @@ class NODEModel(nn.Module):
 
         tx_cart = jnp.atleast_2d(tx_cart)
 
-        # Split time and space
+        # Split time and space (as Einstein recoils)
         x_cart = tx_cart[:, 1:4]     # (N, 3)
         t = tx_cart[:, :1]           # (N, 1)
 

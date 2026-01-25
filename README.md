@@ -22,8 +22,8 @@ You can install the package directly from GitHub:
 pip install git+https://github.com/charlottemyers/galactoPINNs.git
 ```
 
-## Usage
-To start, simply provide a set of training positions and accelerations. These can be provided from an arbitrary source, or generated using a Galax potential:
+## Basic Usage
+Training data consists of positions and accelerations, which may be provided externally or generated from a known analytic potential (e.g. using galax):
 
 ```python
 from galactoPINNs.data import generate_static_datadict
@@ -40,7 +40,7 @@ raw_datadict = generate_static_datadict(
 
 ```
 
-Next, simply specify the training configuration based on the physics-informed priors you wish to include in the model. This includes features to radially scale the output, and include. Based on these choices, non-dimensionalize the training data:
+Specify the training configuration based on the physics-informed priors you wish to include in the model. This includes features to radially scale the output, and fuse with an analytic baseline potential. Based on these choices, non-dimensionalize the training data into scaled model space:
 
 ```python
 from galactoPINNs.data import scale_data
@@ -52,9 +52,10 @@ analytic_baseline_potential  = gp.NFWPotential(m= 5.4e11, r_s= halo_rs, units="g
 scale_config = {
     "r_s": halo_rs,
     "include_analytic": True,
-    "lf_analytic_function": analytic_baseline_potential
+    "ab_potential": analytic_baseline_potential
 }
 
+## non-dimensionalize the data
 scaled_data, transformers = scale_data(
     raw_datadict, scale_config
 )
@@ -64,7 +65,7 @@ train_config = {
     "a_transformer": transformers["a"],
     "u_transformer": transformers["u"],
     "r_s": halo_rs,
-    "lf_analytic_function": analytic_baseline_potential,
+    "ab_potential": analytic_baseline_potential,
     "include_analytic": True,
     "scale": "nfw",
     "depth": 6,
@@ -73,13 +74,14 @@ train_config = {
 ```
 
 
-Next, initialize the model based on your specified configuration, and train!
+Next, initialize the model based on your specified configuration, and train:
 
 
 ```python
 from galactoPINNs.models.static_model import StaticModel
 from galactoPINNs.train import train_model_static
 import optax
+import jax.random as jr
 
 net = StaticModel(train_config)
 x_train = scaled_data["x_train"]
@@ -87,21 +89,24 @@ a_train = scaled_data["a_train"]
 
 
 optimizer = optax.adam(1e-3)
-rng = jax.random.PRNGKey(0)
+rng = jr.PRNGKey(0)
 train_output = train_model_static(
         net, optimizer, x_train, a_train, num_epochs=10)
 
 ```
-You can use the evaluation features to evaluate the acceleration and potential predictions. You can also instantiate a Galax potential to represent the learned potential. Simply provide the trained parameters, and use the potential to generate acceleration and potential predictions, and integrate orbits!
+Use the provided evaluation features to assess the acceleration and potential predictions.
+You can also instantiate a Galax potential backed by the learned potential. Provide the trained parameters, and then use the model to generate acceleration/potential predictions and integrate orbits!
 
 ```python
 from galactoPINNs.model_potential import make_galax_potential
 import unxt as u
 import galax.dynamics as gd
+from galax.coordinates import PhaseSpacePosition
+import jax.numpy as np
 
 learned_potential = make_galax_potential(net, train_output["state"].params)
 
-# compute potential and accelerations
+# compute the predicted potential and acceleration
 test_points = raw_datadict["x_val"]
 learned_potential = learned_potential.potential(test_points, t=0)
 learned_acceleration = learned_potential.acceleration(test_points, t=0)
@@ -114,6 +119,5 @@ w0 = PhaseSpacePosition(
 ts = u.Quantity(jnp.linspace(0,  500.0, 500), "Myr")
 
 learned_orbit = gd.evaluate_orbit(learned_potential, w0, ts)
-
 
 ```

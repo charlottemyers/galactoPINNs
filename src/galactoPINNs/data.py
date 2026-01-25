@@ -1,38 +1,161 @@
-from dataclasses import dataclass
-from typing import Dict, Iterable, Literal, Optional, Sequence, Tuple, Union
-
-import numpy as np
 import coordinax as cx
-import galax.potential as gp
 from galax.potential import density
-import unxt as u
 import jax.numpy as jnp
-
+import jax.random as jr
+import unxt as u
+from typing import Dict, Literal, Optional, Sequence, Tuple, Union
+ArrayLike = Union[float, jnp.ndarray]
 
 __all__ = (
     # sampling
     "biased_sphere_samples",
     "rejection_sample_sphere",
-    "rejection_sample_time_sphere",
     # datasets
     "generate_static_datadict",
     "generate_time_dep_datadict",
-    # analytic potential factory
     # scaling utilities
     "UniformScaler",
     "Transformer",
     "scale_data",
     "scale_data_time",
-    # misc
+    # miscellaneous
     "acc_cart_to_cyl_like",
 )
+
 
 
 # -------------------------
 # Sampling utilities
 # -------------------------
 
-def biased_sphere_samples(N: int, r_min: float, r_max: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def sample_log_uniform_r(
+    key: jr.PRNGKey,
+    r_min: float,
+    r_max: float,
+    N: int,
+) -> jnp.ndarray:
+    """
+    Sample radii distributed log-uniformly on the interval [r_min, r_max].
+
+    This draws samples according to:
+        log(r) ~ Uniform(log(r_min), log(r_max))
+    which corresponds to a probability density proportional to 1 / r.
+
+    Parameters
+    ----------
+    key : jax.random.PRNGKey
+        JAX random key used for sampling.
+    r_min : float
+        Minimum radius. Must be strictly positive.
+    r_max : float
+        Maximum radius. Must satisfy r_max > r_min.
+    N : int
+        Number of samples to draw.
+
+    Returns
+    -------
+    r : jnp.ndarray, shape (N,)
+        Log-uniformly distributed radii.
+
+    Raises
+    ------
+    ValueError
+        If ``r_min <= 0``, ``r_max <= r_min``, or ``N <= 0``.
+
+    Examples
+    --------
+    >>> import jax.random as jr
+    >>> key = jr.PRNGKey(0)
+    >>> r = sample_log_uniform_r(key, 1.0, 100.0, 5)
+    >>> r.shape
+    (5,)
+    >>> jnp.all((r >= 1.0) & (r <= 100.0))
+    Array(True, dtype=bool)
+    """
+    if r_min <= 0:
+        raise ValueError("r_min must be strictly positive.")
+    if r_max <= r_min:
+        raise ValueError("r_max must be greater than r_min.")
+    if N <= 0:
+        raise ValueError("N must be positive.")
+
+    u = jr.uniform(
+        key,
+        shape=(N,),
+        minval=jnp.log(r_min),
+        maxval=jnp.log(r_max),
+    )
+    return jnp.exp(u)
+
+def sample_angles(
+    key: jr.PRNGKey,
+    N: int,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Sample angular coordinates corresponding to isotropic directions on the sphere.
+
+    Sampling convention is:
+        - theta ~ Uniform(0, 2π)
+        - cos(phi) ~ Uniform(-1, 1)
+
+    which produces an isotropic distribution of directions in 3D.
+
+    Parameters
+    ----------
+    key : jax.random.PRNGKey
+        JAX random key used for sampling.
+    N : int
+        Number of angular samples to draw.
+
+    Returns
+    -------
+    theta : jnp.ndarray, shape (N,)
+        Azimuthal angles in radians, in the range [0, 2π).
+    phi : jnp.ndarray, shape (N,)
+        Polar angles in radians, in the range [0, π].
+
+    Raises
+    ------
+    ValueError
+        If ``N <= 0``.
+
+    Examples
+    --------
+    >>> import jax.random as jr
+    >>> key = jr.PRNGKey(0)
+    >>> theta, phi = sample_angles(key, 10)
+    >>> theta.shape, phi.shape
+    ((10,), (10,))
+    >>> jnp.all((theta >= 0.0) & (theta <= 2.0 * jnp.pi))
+    Array(True, dtype=bool)
+    >>> jnp.all((phi >= 0.0) & (phi <= jnp.pi))
+    Array(True, dtype=bool)
+    """
+    if N <= 0:
+        raise ValueError("N must be positive.")
+
+    key_theta, key_phi = jr.split(key, 2)
+
+    theta = jr.uniform(
+        key_theta,
+        shape=(N,),
+        minval=0.0,
+        maxval=2.0 * jnp.pi,
+    )
+
+    # isotropic: cos(phi) uniform on [-1, 1]
+    cos_phi = jr.uniform(
+        key_phi,
+        shape=(N,),
+        minval=-1.0,
+        maxval=1.0,
+    )
+    phi = jnp.arccos(cos_phi)
+
+    return theta, phi
+
+
+def biased_sphere_samples(N: int, r_min: float, r_max: float) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
     Sample points in R^3 with radii distributed log-uniformly on [r_min, r_max]
     and isotropic angles.
@@ -54,14 +177,13 @@ def biased_sphere_samples(N: int, r_min: float, r_max: float) -> Tuple[np.ndarra
     if r_min <= 0 or r_max <= 0 or r_max <= r_min:
         raise ValueError("Require 0 < r_min < r_max.")
 
-    r = np.exp(np.random.uniform(np.log(r_min), np.log(r_max), N))
-    theta = np.random.uniform(0.0, 2.0 * np.pi, N)
-    # isotropic: cos(phi) uniform on [-1, 1]
-    phi = np.arccos(np.random.uniform(-1.0, 1.0, N))
+    key = jr.PRNGKey(0)
+    r = sample_log_uniform_r(key, r_min, r_max, N)
+    theta, phi = sample_angles(key, N)
 
-    x = r * np.sin(phi) * np.cos(theta)
-    y = r * np.sin(phi) * np.sin(theta)
-    z = r * np.cos(phi)
+    x = r * jnp.sin(phi) * jnp.cos(theta)
+    y = r * jnp.sin(phi) * jnp.sin(theta)
+    z = r * jnp.cos(phi)
     return x, y, z
 
 
@@ -76,11 +198,11 @@ def _estimate_density_upper_bound(
     Estimate an upper bound on density inside a ball of radius R_max by sampling
     a coarse 3D grid and taking max(density). This is used to define the rejection sampling envelope.
     """
-    x_test = np.linspace(-R_max, R_max, grid_n)
-    y_test = np.linspace(-R_max, R_max, grid_n)
-    z_test = np.linspace(-R_max, R_max, grid_n)
-    X, Y, Z = np.meshgrid(x_test, y_test, z_test, indexing="ij")
-    R = np.sqrt(X**2 + Y**2 + Z**2)
+    x_test = jnp.linspace(-R_max, R_max, grid_n)
+    y_test = jnp.linspace(-R_max, R_max, grid_n)
+    z_test = jnp.linspace(-R_max, R_max, grid_n)
+    X, Y, Z = jnp.meshgrid(x_test, y_test, z_test, indexing="ij")
+    R = jnp.sqrt(X**2 + Y**2 + Z**2)
     mask = R <= R_max
 
     pos_grid = cx.CartesianPos3D(
@@ -89,9 +211,9 @@ def _estimate_density_upper_bound(
         z = u.Quantity(Z[mask].ravel(), "kpc"),
     )
     rho_grid = density(galax_pot, pos_grid, t=t).value
-    rho_max = float(np.max(rho_grid))
+    rho_max = float(jnp.max(rho_grid))
 
-    # Always inflate; prevents acceptance probability > 1 when grid misses maxima.
+    # Inflate; prevents acceptance probability > 1 when grid misses maxima.
     return safety_factor * rho_max
 
 
@@ -106,7 +228,7 @@ def rejection_sample_sphere(
     log_proposal_pts: bool = False,
     grid_n: int = 20,
     safety_factor: float = 1.2,
-) -> np.ndarray:
+) -> jnp.ndarray:
     """
     Rejection sample points in a spherical shell R_min <= r <= R_max with acceptance
     probability proportional to the density at time t.
@@ -120,7 +242,7 @@ def rejection_sample_sphere(
     R_max
         Outer radius (kpc).
     batch_size
-        Proposal batch size per iteration. Larger is usually faster but higher memory.
+        Proposal batch size per iteration.
     t
         Time passed to `density(...)`.
     R_min
@@ -134,7 +256,7 @@ def rejection_sample_sphere(
     Returns
     -------
     samples
-        Array of shape (N_samples, 3) of accepted Cartesian positions in kpc units (unitless numbers).
+        Array of shape (N_samples, 3) of accepted Cartesian positions in kpc units.
     """
     if N_samples <= 0:
         raise ValueError("N_samples must be positive.")
@@ -147,23 +269,33 @@ def rejection_sample_sphere(
         galax_pot, R_max=R_max, t=t, grid_n=grid_n, safety_factor=safety_factor
     )
 
-    accepted_chunks: list[np.ndarray] = []
+    accepted_chunks: list[jnp.ndarray] = []
     accepted_total = 0
 
+    key = jr.PRNGKey(0)
     while accepted_total < N_samples:
+        # split key for this iteration
+        key, key_prop = jr.split(key)
+
         # ---- propose points ----
         if log_proposal_pts:
-            x, y, z = biased_sphere_samples(batch_size, max(R_min, 1e-6), R_max)
+            key_prop, key_bs = jr.split(key_prop)
+            x, y, z = biased_sphere_samples(
+                key_bs, batch_size, max(R_min, 1e-6), R_max
+            )
         else:
-            x = np.random.uniform(-R_max, R_max, batch_size)
-            y = np.random.uniform(-R_max, R_max, batch_size)
-            z = np.random.uniform(-R_max, R_max, batch_size)
+            key_prop, kx, ky, kz = jr.split(key_prop, 4)
 
-        r = np.sqrt(x**2 + y**2 + z**2)
+            x = jr.uniform(kx, (batch_size,), minval=-R_max, maxval=R_max)
+            y = jr.uniform(ky, (batch_size,), minval=-R_max, maxval=R_max)
+            z = jr.uniform(kz, (batch_size,), minval=-R_max, maxval=R_max)
+
+        r = jnp.sqrt(x**2 + y**2 + z**2)
         inside = (r <= R_max) & (r >= R_min)
+
         x, y, z = x[inside], y[inside], z[inside]
 
-        if x.size == 0:
+        if x.shape[0] == 0:
             continue
 
         pos = cx.CartesianPos3D(x = u.Quantity(x, "kpc"), y = u.Quantity(y, "kpc"), z = u.Quantity(z, "kpc"))
@@ -171,51 +303,16 @@ def rejection_sample_sphere(
 
         # ---- accept/reject ----
         # Ensure probability never exceeds 1.0 even if normalization is imperfect.
-        p = np.clip(rho / normalization, 0.0, 1.0)
-        accepted = np.random.uniform(0.0, 1.0, size=x.size) < p
+        p = jnp.clip(rho / normalization, 0.0, 1.0)
+        key, key_acc = jr.split(key)
+        u_all = jr.uniform(key_acc, shape=p.shape, minval=0.0, maxval=1.0)
+        accepted = u_all < p
 
-        new_samples = np.stack([x[accepted], y[accepted], z[accepted]], axis=1)
+        new_samples = jnp.stack([x[accepted], y[accepted], z[accepted]], axis=1)
         accepted_chunks.append(new_samples)
         accepted_total += new_samples.shape[0]
 
-    return np.vstack(accepted_chunks)[:N_samples]
-
-
-
-
-def rejection_sample_time_sphere(
-    galax_pot,
-    t: float,
-    N_samples: int,
-    R_max: float,
-    *,
-    batch_size: int = 10_000,
-) -> np.ndarray:
-    """
-    Backwards-compatible wrapper around `rejection_sample_sphere` with a time parameter.
-
-    Parameters
-    ----------
-    galax_pot : Galax potential
-    t : float
-        Time passed to density.
-    N_samples : int
-    R_max : float
-    batch_size : int
-
-    Returns
-    -------
-    samples : (N_samples, 3)
-    """
-    return rejection_sample_sphere(
-        galax_pot,
-        N_samples=N_samples,
-        R_max=R_max,
-        batch_size=batch_size,
-        t=t,
-        R_min=0.0,
-        log_proposal_pts=False,
-    )
+    return jnp.vstack(accepted_chunks)[:N_samples]
 
 
 # -------------------------
@@ -230,60 +327,115 @@ def generate_static_datadict(
     r_max_test: float,
     *,
     eval_sample_mode: Literal["rejection", "uniform", "log_uniform"] = "rejection",
-    add_pts_train: Optional[Union[np.ndarray, Sequence[np.ndarray]]] = None,
-    add_pts_test: Optional[Union[np.ndarray, Sequence[np.ndarray]]] = None,
+    add_pts_train: Optional[Union[jnp.ndarray, Sequence[jnp.ndarray]]] = None,
+    add_pts_test: Optional[Union[jnp.ndarray, Sequence[jnp.ndarray]]] = None,
     log_proposal_pts: bool = False,
-) -> Dict[str, np.ndarray]:
+) -> Dict[str, jnp.ndarray]:
     """
-    Generate a static dataset at t=0: positions, accelerations, potentials.
+    Generate a static (time-independent) training and validation dataset at t = 0.
 
-    Returns a dict compatible with the training and evaluation features:
-        x_train, a_train, u_train, r_train, x_val, a_val, u_val, r_val
+    This function samples 3D Cartesian positions within a spherical region,
+    evaluates a Galax potential at those positions, and returns positions,
+    accelerations, and potentials in a dictionary format compatible with
+    the static training and evaluation pipelines.
 
-    Notes
-    -----
-    - Positions are returned as unitless floats interpreted as kpc.
-    - Accelerations/potentials are returned in Galax "galactic" units (typically kpc/Myr^2 and kpc^2/Myr^2)
+    All returned arrays are unitless numeric arrays interpreted in physical
+    units as follows:
+      - positions: kpc
+      - accelerations: kpc / Myr²
+      - potential: kpc² / Myr²
 
     Parameters
     ----------
     galax_potential
-        A Galax potential instance with .acceleration and .potential methods.
-    N_samples_train, N_samples_test
-        Number of train/val samples.
-    r_max_train, r_max_test
-        Max radius for sampling train/val positions.
+        A Galax potential instance providing:
+          - `acceleration(pos, t=...)`
+          - `potential(pos, t=...)`
+        The potential is evaluated at t = 0 for all samples.
+
+    N_samples_train
+        Number of training samples to generate.
+
+    N_samples_test
+        Number of validation (test) samples to generate.
+
+    r_max_train
+        Maximum radius (kpc) for training samples.
+
+    r_max_test
+        Maximum radius (kpc) for validation samples.
+
     eval_sample_mode
-        How to sample validation points.
-    add_pts_train, add_pts_test
-        Optional additional points to append (single (3,) or (N,3), or list of such arrays).
+        Sampling strategy for validation points:
+          - `"rejection"`: density-weighted rejection sampling using
+            `rejection_sample_sphere` (default).
+          - `"uniform"`: uniform sampling in a cube `[-r_max, r_max]^3`.
+          - `"log_uniform"`: log-uniform sampling in radius with isotropic
+            angular distribution, biased toward small radii.
+
+    add_pts_train
+        Optional additional training points to append *after* sampling.
+        Allowed formats:
+          - a single array of shape (3,)
+          - an array of shape (N, 3)
+          - a list/tuple of such arrays
+
+    add_pts_test
+        Same as `add_pts_train`, but appended to the validation set.
+
     log_proposal_pts
-        If True, train sampling uses log-radius proposal in rejection sampler.
+        If True, the training rejection sampler proposes points with a
+        log-uniform radial distribution, improving coverage at small radii.
 
     Returns
     -------
-    data : dict[str, np.ndarray]
+    data : dict[str, jax.Array]
+        Dictionary containing:
+
+        Training data:
+          - `"x_train"` : (N_train, 3)
+              Cartesian positions.
+          - `"a_train"` : (N_train, 3)
+              Cartesian accelerations.
+          - `"u_train"` : (N_train,)
+              Scalar gravitational potential.
+          - `"r_train"` : (N_train,)
+              Radius `norm(x)`.
+
+        Validation data:
+          - `"x_val"`   : (N_val, 3)
+          - `"a_val"`   : (N_val, 3)
+          - `"u_val"`   : (N_val,)
+          - `"r_val"`   : (N_val,)
     """
-    def _evaluate(samples: np.ndarray, t: float = 0.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+
+
+    def _evaluate(samples: jnp.ndarray, t: float = 0.0) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         x, y, z = samples.T
-        pos = cx.CartesianPos3D(x = u.Quantity(x, "kpc"), y = u.Quantity(y, "kpc"), z = u.Quantity(z, "kpc"))
+        pos = cx.CartesianPos3D(
+            x=u.Quantity(x, "kpc"),
+            y=u.Quantity(y, "kpc"),
+            z=u.Quantity(z, "kpc"),
+        )
         t_q = u.Quantity(t, "Myr")
         acc = galax_potential.acceleration(pos, t=t_q)
-        pot = galax_potential.potential(pos, t=t_q).value
-        a = np.stack([acc.x.value, acc.y.value, acc.z.value], axis=1)
+        pot = galax_potential.potential(pos, t=t_q).value  # keep as unitless array
+        a = jnp.stack([acc.x.value, acc.y.value, acc.z.value], axis=1)
         return samples, a, pot
 
-    def _append_points(base: np.ndarray, extra) -> np.ndarray:
+    def _append_points(base: jnp.ndarray, extra) -> jnp.ndarray:
         if extra is None:
             return base
         if isinstance(extra, (list, tuple)):
             out = base
             for pt in extra:
-                out = np.vstack([out, np.atleast_2d(pt)])
+                out = jnp.vstack([out, jnp.atleast_2d(pt)])
             return out
-        return np.vstack([base, np.atleast_2d(extra)])
+        return jnp.vstack([base, jnp.atleast_2d(extra)])
 
-    # --- train positions ---
+    # -----------------
+    # Train positions
+    # -----------------
     x_train = rejection_sample_sphere(
         galax_potential,
         N_samples_train,
@@ -292,21 +444,39 @@ def generate_static_datadict(
     )
     x_train = _append_points(x_train, add_pts_train)
 
-    # --- val positions ---
+    # -----------------
+    # Val positions
+    # -----------------
     if eval_sample_mode == "rejection":
         x_val = rejection_sample_sphere(galax_potential, N_samples_test, r_max_test)
+
     elif eval_sample_mode == "uniform":
-        x_val = np.random.uniform(-r_max_test, r_max_test, size=(N_samples_test, 3))
+        key = jr.PRNGKey(0)
+        x_val = jr.uniform(key, shape=(N_samples_test, 3), minval=-r_max_test, maxval=r_max_test)
+
     elif eval_sample_mode == "log_uniform":
+        # Log-uniform in radius, isotropic angles (cos(phi) uniform in [-1,1]).
+        key = jr.PRNGKey(0)
+        key_r, key_th, key_cphi = jr.split(key, 3)
+
         log_r_min = 1.0
-        r_val = np.exp(np.random.uniform(np.log(log_r_min), np.log(r_max_test), N_samples_test))
-        theta = np.random.uniform(0.0, 2.0 * np.pi, N_samples_test)
-        phi = np.random.uniform(0.0, np.pi, N_samples_test)
-        x_val = np.stack(
+        r_val = jnp.exp(
+            jr.uniform(
+                key_r,
+                shape=(N_samples_test,),
+                minval=jnp.log(log_r_min),
+                maxval=jnp.log(r_max_test),
+            )
+        )
+        theta = jr.uniform(key_th, shape=(N_samples_test,), minval=0.0, maxval=2.0 * jnp.pi)
+        cos_phi = jr.uniform(key_cphi, shape=(N_samples_test,), minval=-1.0, maxval=1.0)
+        phi = jnp.arccos(cos_phi)
+
+        x_val = jnp.stack(
             [
-                r_val * np.sin(phi) * np.cos(theta),
-                r_val * np.sin(phi) * np.sin(theta),
-                r_val * np.cos(phi),
+                r_val * jnp.sin(phi) * jnp.cos(theta),
+                r_val * jnp.sin(phi) * jnp.sin(theta),
+                r_val * jnp.cos(phi),
             ],
             axis=1,
         )
@@ -315,12 +485,13 @@ def generate_static_datadict(
 
     x_val = _append_points(x_val, add_pts_test)
 
-    # --- evaluate ---
+    # -----------------
+    # Evaluate targets
+    # -----------------
     x_train, a_train, u_train = _evaluate(x_train, t=0.0)
     x_val, a_val, u_val = _evaluate(x_val, t=0.0)
-
-    r_train = np.linalg.norm(x_train, axis=1)
-    r_val = np.linalg.norm(x_val, axis=1)
+    r_train = jnp.linalg.norm(x_train, axis=1)
+    r_val = jnp.linalg.norm(x_val, axis=1)
 
     return {
         "x_train": x_train,
@@ -334,6 +505,7 @@ def generate_static_datadict(
     }
 
 
+
 def generate_time_dep_datadict(
     galax_potential,
     times_train: Sequence,
@@ -342,9 +514,7 @@ def generate_time_dep_datadict(
     N_samples_test: int,
     r_max_train: float,
     r_max_test: float,
-    *,
-    N_train_pts_list: Optional[Sequence[int]] = None,
-) -> Dict[str, Dict[float, Dict[str, np.ndarray]]]:
+) -> Dict[str, Dict[float, Dict[str, jnp.ndarray]]]:
     """
     Generate a time-dependent dataset as nested dicts keyed by time.
 
@@ -357,14 +527,13 @@ def generate_time_dep_datadict(
     Parameters
     ----------
     galax_potential
+        A Galax potential representing the true potential model.
     times_train, times_test
         Iterable of times (floats or Quantities).
     N_samples_train, N_samples_test
-        Samples per time (unless N_train_pts_list provided for train).
+        Samples per time.
     r_max_train, r_max_test
         Max radius for sampling positions.
-    N_train_pts_list
-        Optional list of per-time train sample counts (len must equal len(times_train)).
 
     Returns
     -------
@@ -378,15 +547,15 @@ def generate_time_dep_datadict(
             return float(t)
 
     def _get_data(t_myr: float, N_samples: int, R_max: float):
-        samples = rejection_sample_time_sphere(galax_potential, t_myr, N_samples=N_samples, R_max=R_max)
+        samples = rejection_sample_sphere(galax_potential, t_myr, N_samples=N_samples, R_max=R_max)
         x, y, z = samples.T
         pos = cx.CartesianPos3D(x = u.Quantity(x, "kpc"), y = u.Quantity(y, "kpc"), z = u.Quantity(z, "kpc"))
-        t_array = u.Quantity(np.full(len(samples), t_myr), "Myr")
+        t_array = u.Quantity(jnp.full(len(samples), t_myr), "Myr")
 
         acc = galax_potential.acceleration(pos, t_array)
         pot = galax_potential.potential(pos, t_array).ustrip("kpc2/Myr2")
 
-        a_flat = np.stack(
+        a_flat = jnp.stack(
             [
                 acc.x.ustrip("kpc/Myr2"),
                 acc.y.ustrip("kpc/Myr2"),
@@ -394,23 +563,21 @@ def generate_time_dep_datadict(
             ],
             axis=1,
         )
-        x_flat = np.stack([x, y, z], axis=1)
+        x_flat = jnp.stack([x, y, z], axis=1)
         return x_flat, a_flat, pot
 
-    if N_train_pts_list is not None and len(N_train_pts_list) != len(times_train):
-        raise ValueError("If provided, N_train_pts_list must match len(times_train).")
 
-    train_data: Dict[float, Dict[str, np.ndarray]] = {}
-    val_data: Dict[float, Dict[str, np.ndarray]] = {}
+    train_data: Dict[float, Dict[str, jnp.ndarray]] = {}
+    val_data: Dict[float, Dict[str, jnp.ndarray]] = {}
 
     for i, t in enumerate(times_train):
         t_myr = _as_float_myr(t)
-        N_here = N_samples_train if N_train_pts_list is None else int(N_train_pts_list[i])
+        N_here = N_samples_train
         x_flat, a_flat, u_flat = _get_data(t_myr, N_here, r_max_train)
 
         train_data[t_myr] = {
             "x": x_flat,
-            "r": np.linalg.norm(x_flat, axis=-1),
+            "r": jnp.linalg.norm(x_flat, axis=-1),
             "a": a_flat,
             "u": u_flat,
         }
@@ -420,24 +587,87 @@ def generate_time_dep_datadict(
         x_flat, a_flat, u_flat = _get_data(t_myr, N_samples_test, r_max_test)
         val_data[t_myr] = {
             "x": x_flat,
-            "r": np.linalg.norm(x_flat, axis=-1),
+            "r": jnp.linalg.norm(x_flat, axis=-1),
             "a": a_flat,
             "u": u_flat,
         }
 
     return {"train": train_data, "val": val_data}
 
+
+
 # -------------------------
 # Scaling utilities
 # -------------------------
 
 class UniformScaler:
+    """
+    Affine scaler that maps data to a fixed feature range or applies a fixed
+    multiplicative scaling factor.
+
+    This class is designed for non-dimensionalization of physical quantities (e.g., positions,
+    accelerations, potentials) where the scaling factor may be known a priori.
+
+    Notes
+    -----
+    - Units are not tracked; inputs are assumed to be unitless numeric arrays
+
+    Attributes
+    ----------
+    feature_range : tuple[float, float]
+        Target range ``(min, max)`` for range-based scaling.
+    scale_ : float
+        Multiplicative scaling factor.
+    min_ : float
+        Additive offset applied after scaling.
+    data_min_ : float
+        Minimum of the data seen during fitting.
+    data_max_ : float
+        Maximum of the data seen during fitting.
+    data_range_ : float
+        Difference ``data_max_ - data_min_``.
+    scaler : float or None
+        Fixed scaling factor used in constant-scaling mode.
+
+    Parameters
+    ----------
+    feature_range : tuple[float, float], optional
+        Desired output range for range-based scaling.
+        Defaults to ``(-1, 1)``.
+    """
+
     def __init__(self, feature_range=(-1, 1)):
-        """Scale the variable by the min and max of the range or by a constant scaler"""
+        """
+        Initialize an unfitted UniformScaler.
+
+        Parameters
+        ----------
+        feature_range : tuple[float, float], optional
+            Desired output range for range-based scaling.
+        """
         self.feature_range = feature_range
-        pass
 
     def fit(self, data, scaler=None):
+        """
+        Fit the scaler parameters from data.
+
+        Parameters
+        ----------
+        data : array-like
+            Input data used to determine scaling parameters.
+        scaler : float or None, optional
+            If provided, enables constant-scaling mode with
+            ``x_scaled = x * scaler``.
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        - In constant-scaling mode, the data min/max are still recorded but are
+          not used in the transformation.
+        """
         self.scaler = scaler
 
         data_max = jnp.max(data)
@@ -451,6 +681,27 @@ class UniformScaler:
         self.data_range_ = data_range
 
     def fit_transform(self, data, scaler=None):
+        """
+        Fit the scaler parameters and apply the transformation in one step.
+
+        Parameters
+        ----------
+        data : array-like
+            Input data to be scaled.
+        scaler : float or None, optional
+            If provided, enables constant-scaling mode with
+            ``x_scaled = x * scaler``.
+
+        Returns
+        -------
+        scaled : jnp.ndarray
+            Scaled data array with the same shape as the input.
+
+        Notes
+        -----
+        - When ``scaler`` is provided, ``feature_range`` is ignored and the
+          transformation reduces to multiplication by ``scaler``.
+        """
         self.scaler = scaler
         data_max = jnp.max(data)
         data_min = jnp.min(data)
@@ -471,6 +722,24 @@ class UniformScaler:
         return X
 
     def transform(self, data):
+        """
+        Apply the fitted scaling transformation to data.
+
+        Parameters
+        ----------
+        data : array-like
+            Input data to be scaled.
+
+        Returns
+        -------
+        scaled : jnp.ndarray
+            Scaled data array with the same shape as the input.
+
+        Raises
+        ------
+        AttributeError
+            If the scaler has not been fitted.
+        """
         if not hasattr(self, "scaler"):
             self.scaler = None
 
@@ -481,32 +750,101 @@ class UniformScaler:
         return X
 
     def inverse_transform(self, data):
+        """
+        Invert the scaling transformation.
+
+        Parameters
+        ----------
+        data : array-like
+            Scaled data to be transformed back to the original space.
+
+        Returns
+        -------
+        unscaled : jnp.ndarray
+            Data mapped back to the original scale.
+
+        Notes
+        -----
+        - In constant-scaling mode, this divides by ``scaler``.
+        - In range-based mode, this applies ``(x - min_) / scale_``.
+        """
         if not hasattr(self, "scaler"):
             self.scaler = None
+
         if self.scaler is not None:
             return data / self.scaler
         else:
             return (data - self.min_) / self.scale_
 
 
-
 class Transformer:
     """
-    Robust per-feature scaler that centers by mean and scales by max absolute deviation.
+    Per-feature affine scaler based on centering by the mean and scaling by the
+    maximum absolute deviation.
 
-    For a feature vector x:
+    This transformer rescales each feature independently according to:
+
         x_scaled = (x - mean) / scale
-    where scale = max(|x - mean|) per feature.
 
-    This is similar to sklearn's MaxAbsScaler on centered data.
+    where:
+        mean  = mean(x, axis=0)
+        scale = max(|x - mean|, axis=0)
+
+    This normalization is robust to outliers compared to standard deviation
+
+    Notes
+    -----
+    - A small positive floor ``eps`` is applied to the scale to prevent division
+      by zero for constant features.
+    - Both 1D arrays (shape ``(N,)``) and 2D arrays (shape ``(N, D)``) are
+      supported. One-dimensional inputs are treated as single-feature data and
+      are returned with the same dimensionality.
+    - This class does not track units; it assumes unitless numeric arrays
+
+    Attributes
+    ----------
+    mean : jnp.ndarray or None
+        Per-feature mean computed during :meth:`fit`. Shape ``(D,)``.
+    scale : jnp.ndarray or None
+        Per-feature scaling factor computed during :meth:`fit`. Shape ``(D,)``.
+
+    Parameters
+    ----------
+    eps : float, optional
+        Minimum allowed value for the scale to avoid division by zero.
+        Defaults to ``1e-12``.
+
     """
 
     def __init__(self, eps: float = 1e-12):
+        """
+        Initialize an unfitted Transformer.
+
+        Parameters
+        ----------
+        eps : float, optional
+            Minimum allowed scale value used to regularize constant features.
+        """
         self.mean: Optional[jnp.ndarray] = None
         self.scale: Optional[jnp.ndarray] = None
+        self.eps = eps
 
     def fit(self, data: jnp.ndarray) -> "Transformer":
-        """Fit mean and scale from data."""
+        """
+        Compute per-feature mean and scale from data.
+
+        Parameters
+        ----------
+        data : jnp.ndarray
+            Input data of shape ``(N, D)`` or ``(N,)``.
+            If one-dimensional, the data are treated as a single feature.
+
+        Returns
+        -------
+        self : Transformer
+            The fitted transformer instance.
+
+        """
         data = jnp.asarray(data)
         if data.ndim == 1:
             data = data[:, None]
@@ -520,7 +858,29 @@ class Transformer:
         return self
 
     def transform(self, data: jnp.ndarray) -> jnp.ndarray:
-        """Apply scaling."""
+        """
+        Apply the fitted scaling transformation to data.
+
+        Parameters
+        ----------
+        data : jnp.ndarray
+            Input data of shape ``(N, D)`` or ``(N,)``.
+
+        Returns
+        -------
+        scaled : jnp.ndarray
+            Scaled data with the same shape as the input.
+
+        Raises
+        ------
+        RuntimeError
+            If the transformer has not been fitted via :meth:`fit`.
+
+        Notes
+        -----
+        - One-dimensional inputs are treated as single-feature data and returned
+          as one-dimensional arrays.
+        """
         if self.mean is None or self.scale is None:
             raise RuntimeError("Transformer must be fit before calling transform().")
 
@@ -528,11 +888,29 @@ class Transformer:
         is_1d = (data.ndim == 1)
         if is_1d:
             data = data[:, None]
+
         out = (data - self.mean) / self.scale
         return out.squeeze() if is_1d else out
 
     def inverse_transform(self, data: jnp.ndarray) -> jnp.ndarray:
-        """Invert scaling."""
+        """
+        Invert the scaling transformation.
+
+        Parameters
+        ----------
+        data : jnp.ndarray
+            Scaled data of shape ``(N, D)`` or ``(N,)``.
+
+        Returns
+        -------
+        unscaled : jnp.ndarray
+            Data transformed back to the original feature space.
+
+        Raises
+        ------
+        RuntimeError
+            If the transformer has not been fitted via :meth:`fit`.
+        """
         if self.mean is None or self.scale is None:
             raise RuntimeError("Transformer must be fit before calling inverse_transform().")
 
@@ -540,8 +918,10 @@ class Transformer:
         is_1d = (data.ndim == 1)
         if is_1d:
             data = data[:, None]
+
         out = data * self.scale + self.mean
         return out.squeeze() if is_1d else out
+
 
 
 def scale_data(
@@ -574,7 +954,7 @@ def scale_data(
     r_s = float(config["r_s"])  # kpc
 
     if config.get("include_analytic", False):
-        lf_potential = config["lf_analytic_function"]
+        lf_potential = config["ab_potential"]
         pos = cx.CartesianPos3D(
             x = u.Quantity(data_dict["x_train"][:, 0], "kpc"),
             y = u.Quantity(data_dict["x_train"][:, 1], "kpc"),
@@ -582,9 +962,9 @@ def scale_data(
         )
         u_analytic = lf_potential.potential(pos, 0).ustrip("kpc2/Myr2")
         u_residual = data_dict["u_train"] - u_analytic
-        u_star = float(np.max(np.abs(u_residual)))
+        u_star = float(jnp.max(jnp.abs(u_residual)))
     else:
-        u_star = float(np.max(np.abs(data_dict["u_train"])))
+        u_star = float(jnp.max(jnp.abs(data_dict["u_train"])))
 
     if u_star <= 0:
         raise ValueError("Computed u_star must be positive.")
@@ -623,9 +1003,9 @@ def scale_data(
 
 
 def scale_data_time(
-    data_dict: Dict[str, Dict[float, Dict[str, np.ndarray]]],
+    data_dict: Dict[str, Dict[float, Dict[str, jnp.ndarray]]],
     config: dict,
-) -> Tuple[Dict[str, Dict[float, Dict[str, np.ndarray]]], Dict[str, UniformScaler]]:
+) -> Tuple[Dict[str, Dict[float, Dict[str, jnp.ndarray]]], Dict[str, UniformScaler]]:
     """
     Non-dimensionalize a nested time-dependent dataset and attach time as an input column.
 
@@ -659,31 +1039,31 @@ def scale_data_time(
         all_x.append(d["x"])
         all_a.append(d["a"])
         all_u.append(d["u"])
-        all_t.append(np.full(len(d["x"]), float(t)))
+        all_t.append(jnp.full(len(d["x"]), float(t)))
 
-    x_concat = np.vstack(all_x)
-    a_concat = np.vstack(all_a)
-    u_concat = np.hstack(all_u)
-    t_concat = np.concatenate(all_t)
+    x_concat = jnp.vstack(all_x)
+    a_concat = jnp.vstack(all_a)
+    u_concat = jnp.hstack(all_u)
+    t_concat = jnp.concatenate(all_t)
 
     if config.get("include_analytic", False):
-        lf_analytic = config["lf_analytic_function"]
+        analytic_baseline = config["ab_potential"]
         pos = cx.CartesianPos3D(
             x = u.Quantity(x_concat[:, 0], "kpc"),
             y = u.Quantity(x_concat[:, 1], "kpc"),
             z = u.Quantity(x_concat[:, 2], "kpc"),
         )
         t_quant = u.Quantity(t_concat, "Myr")
-        u_analytic = lf_analytic.potential(pos, t_quant).ustrip("kpc2/Myr2")
+        u_analytic = analytic_baseline.potential(pos, t_quant).ustrip("kpc2/Myr2")
         u_resid = u_concat - u_analytic
-        u_star = float(np.max(np.abs(u_resid)))
+        u_star = float(jnp.max(jnp.abs(u_resid)))
     else:
-        u_star = float(np.max(np.abs(u_concat)))
+        u_star = float(jnp.max(jnp.abs(u_concat)))
 
     if u_star <= 0:
         raise ValueError("Computed u_star must be positive.")
 
-    t_star = np.sqrt(r_s**2 / u_star)
+    t_star = jnp.sqrt(r_s**2 / u_star)
     a_star = r_s / (t_star**2)
     x_star = r_s
 
@@ -692,11 +1072,11 @@ def scale_data_time(
     u_transformer.fit(u_concat, scaler=1.0 / u_star)
     t_transformer.fit(t_concat, scaler=1.0 / t_star)
 
-    def _transform_block(x: np.ndarray, a: np.ndarray, u: np.ndarray, t_val: float) -> Dict[str, np.ndarray]:
+    def _transform_block(x: jnp.ndarray, a: jnp.ndarray, u: jnp.ndarray, t_val: float) -> Dict[str, jnp.ndarray]:
         x_scaled = x_transformer.transform(x)
         # force (N,1) then concat
-        t_scaled = t_transformer.transform(np.full((len(x_scaled), 1), float(t_val)))
-        x_with_time = np.concatenate([t_scaled, x_scaled], axis=1)
+        t_scaled = t_transformer.transform(jnp.full((len(x_scaled), 1), float(t_val)))
+        x_with_time = jnp.concatenate([t_scaled, x_scaled], axis=1)
         return {"x": x_with_time, "a": a_transformer.transform(a), "u": u_transformer.transform(u)}
 
     scaled_train = {t: _transform_block(d["x"], d["a"], d["u"], t) for t, d in train_data.items()}
@@ -710,7 +1090,7 @@ def scale_data_time(
 # Misc helpers
 # -------------------------
 
-def acc_cart_to_cyl_like(a: np.ndarray) -> np.ndarray:
+def acc_cart_to_cyl_like(a: jnp.ndarray) -> jnp.ndarray:
     """
     Compute simple cylindrical-like diagnostics of an acceleration vector.
     Parameters
@@ -722,38 +1102,141 @@ def acc_cart_to_cyl_like(a: np.ndarray) -> np.ndarray:
     -------
     out
         Array of shape (N, 4) with columns [a_rho, a_phi, a_z, a_mag].
+
+
+    Examples
+    --------
+    A simple vector along +x:
+
+    >>> import jax.numpy as jnp
+    >>> acc_cart_to_cyl_like(jnp.array([[3.0, 0.0, 4.0]])).tolist()
+    [[3.0, 0.0, 4.0, 5.0]]
     """
-    a = np.asarray(a)
+    a = jnp.asarray(a)
     if a.ndim != 2 or a.shape[1] != 3:
         raise ValueError("Expected a to have shape (N, 3).")
 
-    a_rho = np.sqrt(a[:, 0] ** 2 + a[:, 1] ** 2)
-    a_phi = np.arctan2(a[:, 1], a[:, 0])
+    a_rho = jnp.sqrt(a[:, 0] ** 2 + a[:, 1] ** 2)
+    a_phi = jnp.arctan2(a[:, 1], a[:, 0])
     a_z = a[:, 2]
-    a_mag = np.linalg.norm(a, axis=1)
-    return np.stack([a_rho, a_phi, a_z, a_mag], axis=1)
+    a_mag = jnp.linalg.norm(a, axis=1)
+    return jnp.stack([a_rho, a_phi, a_z, a_mag], axis=1)
 
-def generate_xz_plane_grid(xmin, xmax, zmin, zmax, num_x=50, num_z=50, y=0.0):
-    x = np.linspace(xmin, xmax, num_x)
-    z = np.linspace(zmin, zmax, num_z)
-    xx, zz = np.meshgrid(x, z)
-    yy = np.full_like(xx, y)
-    points = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3)
+
+
+
+def generate_xz_plane_grid(
+    xmin: float,
+    xmax: float,
+    zmin: float,
+    zmax: float,
+    *,
+    num_x: int = 50,
+    num_z: int = 50,
+    y: float = 0.0,
+) -> jnp.ndarray:
+    """
+    Generate a Cartesian grid of points on the x–z plane at fixed y.
+
+    Parameters
+    ----------
+    xmin, xmax
+        Minimum and maximum x-coordinates.
+    zmin, zmax
+        Minimum and maximum z-coordinates.
+    num_x
+        Number of grid points along the x-direction.
+    num_z
+        Number of grid points along the z-direction.
+    y
+        Fixed y-coordinate for all points.
+
+    Returns
+    -------
+    points : jnp.ndarray, shape (num_x * num_z, 3)
+        Array of Cartesian coordinates `[x, y, z]` for each grid point.
+    """
+    x = jnp.linspace(xmin, xmax, num_x)
+    z = jnp.linspace(zmin, zmax, num_z)
+    xx, zz = jnp.meshgrid(x, z)
+    yy = jnp.full_like(xx, y)
+    points = jnp.stack([xx, yy, zz], axis=-1).reshape(-1, 3)
     return points
 
-def generate_xy_plane_grid(xmin, xmax, ymin, ymax, num_x=50, num_y=50, z=0.0):
-    x = np.linspace(xmin, xmax, num_x)
-    y = np.linspace(ymin, ymax, num_y)
-    xx, yy = np.meshgrid(x, y)
-    zz = np.full_like(xx, z)
-    points = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3)
+
+def generate_xy_plane_grid(
+    xmin: float,
+    xmax: float,
+    ymin: float,
+    ymax: float,
+    *,
+    num_x: int = 50,
+    num_y: int = 50,
+    z: float = 0.0,
+) -> jnp.ndarray:
+    """
+    Generate a Cartesian grid of points on the x–y plane at fixed z.
+
+    Parameters
+    ----------
+    xmin, xmax
+        Minimum and maximum x-coordinates.
+    ymin, ymax
+        Minimum and maximum y-coordinates.
+    num_x
+        Number of grid points along the x-direction.
+    num_y
+        Number of grid points along the y-direction.
+    z
+        Fixed z-coordinate for all points.
+
+    Returns
+    -------
+    points : jnp.ndarray, shape (num_x * num_y, 3)
+        Array of Cartesian coordinates `[x, y, z]` for each grid point.
+    """
+    x = jnp.linspace(xmin, xmax, num_x)
+    y = jnp.linspace(ymin, ymax, num_y)
+    xx, yy = jnp.meshgrid(x, y)
+    zz = jnp.full_like(xx, z)
+    points = jnp.stack([xx, yy, zz], axis=-1).reshape(-1, 3)
     return points
 
 
-def generate_yz_plane_grid(ymin, ymax, zmin, zmax, num_y=50, num_z=50, x=0.0):
-    y = np.linspace(ymin, ymax, num_y)
-    z = np.linspace(zmin, zmax, num_z)
-    yy, zz = np.meshgrid(y, z)
-    xx = np.full_like(zz, x)
-    points = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3)
+def generate_yz_plane_grid(
+    ymin: float,
+    ymax: float,
+    zmin: float,
+    zmax: float,
+    *,
+    num_y: int = 50,
+    num_z: int = 50,
+    x: float = 0.0,
+) -> jnp.ndarray:
+    """
+    Generate a Cartesian grid of points on the y–z plane at fixed x.
+
+    Parameters
+    ----------
+    ymin, ymax
+        Minimum and maximum y-coordinates.
+    zmin, zmax
+        Minimum and maximum z-coordinates.
+    num_y
+        Number of grid points along the y-direction.
+    num_z
+        Number of grid points along the z-direction.
+    x
+        Fixed x-coordinate for all points.
+
+    Returns
+    -------
+    points : jnp.ndarray, shape (num_y * num_z, 3)
+        Array of Cartesian coordinates `[x, y, z]` for each grid point.
+    """
+    y = jnp.linspace(ymin, ymax, num_y)
+    z = jnp.linspace(zmin, zmax, num_z)
+    yy, zz = jnp.meshgrid(y, z)
+    xx = jnp.full_like(zz, x)
+    points = jnp.stack([xx, yy, zz], axis=-1).reshape(-1, 3)
     return points

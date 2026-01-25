@@ -1,5 +1,3 @@
-from typing import Any, Callable, Mapping, Optional
-
 import jax.random as jr
 import numpyro
 import numpyro.distributions as dist
@@ -7,6 +5,7 @@ import quaxed.numpy as jnp
 from numpyro.contrib.module import random_flax_module
 from numpyro.infer import SVI, Trace_ELBO
 from numpyro.optim import Adam
+from typing import Any, Callable, Mapping, Optional
 
 from .static_model import StaticModel
 
@@ -43,8 +42,7 @@ def model_svi(
     x : array, shape (N, D)
         Scaled model inputs.
     a_obs : array, shape (N, 3), optional
-        Observed accelerations in the *same space* as the model output for the likelihood term.
-        (Typically this means scaled accelerations if the model outputs scaled values.)
+        Observed accelerations in the same space as the model output for the likelihood term.
     sigma_lambda : float
         Prior std for neural network weights used by `random_flax_module`.
     sigma_a : float
@@ -63,7 +61,7 @@ def model_svi(
         Model configuration passed to `StaticModel(config=...)`.
     orbit_q : array, shape (B, T, 3), optional
         Orbit positions used to build an energy conservation penalty term.
-        Expected in the same coordinate space as the model input x (i.e., scaled positions).
+        Expected in the same coordinate space as the model input x (scaled positions).
     orbit_p : array, shape (B, T, 3), optional
         Orbit velocities/momenta used for kinetic energy.
     w_orbit : float
@@ -79,7 +77,7 @@ def model_svi(
     if config is None:
         raise ValueError("model_svi requires `config` to be provided.")
 
-    # ----- analytic parameter priors (optional) -----
+    # ----- Analytic parameter priors (optional) -----
     trainable_analytic_layer = None
     if (parameter_dict is not None) and (analytic_form is not None):
         parameter_distributions: dict[str, dist.Distribution] = {
@@ -87,7 +85,7 @@ def model_svi(
         }
         trainable_analytic_layer = analytic_form(parameter_distributions)
 
-    # ----- deterministic Flax model definition -----
+    # ----- Deterministic Flax model definition -----
     net = StaticModel(config=config, trainable_analytic_layer=trainable_analytic_layer)
 
     # ----- Bayesianize the Flax module weights -----
@@ -102,11 +100,11 @@ def model_svi(
     a_pred = out["acceleration"]
     u_pred = out["potential"]
 
-    # Record for posterior predictive inspection
+    # -----  Record for posterior predictive inspection -----
     numpyro.deterministic("acceleration", a_pred)
     numpyro.deterministic("potential", u_pred)
 
-    # ----- data term: acceleration loss -----
+    # ----- Data term: acceleration loss -----
     if a_obs is not None:
         diff = a_pred - a_obs
         diff_norm = jnp.linalg.norm(diff, axis=1)
@@ -118,7 +116,7 @@ def model_svi(
         data_weight = 1.0 / (2.0 * sigma_a**2)
         numpyro.factor("acc_loss", -data_weight * loss)
 
-        # ----- optional orbit energy loss -----
+        # ----- Optional orbit energy loss -----
         if (orbit_q is not None) and (orbit_p is not None):
             if orbit_q.ndim != 3 or orbit_q.shape[-1] != 3:
                 raise ValueError(f"orbit_q must have shape (B, T, 3); got {orbit_q.shape}")
@@ -135,7 +133,7 @@ def model_svi(
             phi_flat = bnn(q_flat)["potential"]  # (B*T,) or (B*T,1) depending on model
             phi = jnp.reshape(phi_flat, (B, T))
 
-            E = T_ke + phi  # (B, T)
+            E = T_ke + phi           # (B, T)
             dE = E[:, -1] - E[:, 0]  # (B,)
 
             # Energy fluctuation (trajectory-wise)
@@ -163,9 +161,6 @@ def make_svi(
 ) -> SVI:
     """
     Construct an SVI object with `model_svi` closed over configuration objects.
-
-    This avoids the common failure mode where `run_window` cannot pass non-array objects
-    (e.g. config dict, analytic constructors) through the SVI data signature.
 
     Returns
     -------
