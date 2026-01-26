@@ -1,15 +1,19 @@
-import jax
-import jax.numpy as jnp
-import jax.random as jr
-from typing import Any, Dict, Mapping, Union, Callable, Optional
-from .inference import apply_model
+"""Model evaluation utilities."""
 
-Array = jax.Array
 __all__ = (
+    "bnn_performance",
     "evaluate_performance",
     "evaluate_performance_node",
-    "bnn_performance",
 )
+
+from collections.abc import Callable, Mapping
+from typing import Any
+
+import jax.numpy as jnp
+import jax.random as jr
+from jaxtyping import Array
+
+from .inference import apply_model
 
 
 def evaluate_performance(
@@ -17,13 +21,14 @@ def evaluate_performance(
     trained_state_params: Any,
     raw_datadict: Mapping[str, Any],
     num_test: int,
-) -> Dict[str, Any]:
-    """
-    Evaluate a static model on a validation set and compute error metrics.
+) -> dict[str, Any]:
+    """Evaluate a static model on a validation set and compute error metrics.
 
     This function:
-    - transforms physical validation positions `x_val` to the model's scaled input space,
-    - runs `apply_model(...)` to obtain predicted potential and acceleration in scaled space,
+    - transforms physical validation positions `x_val` to the model's scaled
+      input space,
+    - runs `apply_model(...)` to obtain predicted potential and acceleration
+      in scaled space,
     - inverse-transforms predictions back to physical units,
     - computes percent errors against truth,
     - optionally compares against an analytic baseline potential/acceleration.
@@ -32,7 +37,8 @@ def evaluate_performance(
     ----------
     model : flax.linen.Module
         A trained static model object with attribute `config`.
-        The model is expected to support `model.apply({"params": params}, x_scaled)` via `apply_model`.
+        The model is expected to support
+        `model.apply({"params": params}, x_scaled)` via `apply_model`.
     trained_state_params : Any
         Parameters tree (e.g., `TrainState.params`) used for `model.apply`.
     raw_datadict : dict
@@ -49,14 +55,17 @@ def evaluate_performance(
     - "u_transformer": must implement .inverse_transform(u_scaled) -> u_phys
     - "a_transformer": must implement .inverse_transform(a_scaled) -> a_phys
     Optional:
-    - "include_analytic" (bool): whether to compute analytic baseline errors (default True)
-    - "ab_potential": analytic potential object with .potential(x, t=...) and .acceleration(x, t=...)
+    - "include_analytic" (bool): whether to compute analytic baseline errors
+      (default True)
+    - "ab_potential": analytic potential object with
+      .potential(x, t=...) and .acceleration(x, t=...)
 
     Returns
     -------
     results : dict
         Keys are designed for downstream plotting/analysis. Entries include:
-        - "r_eval": np.ndarray, shape (num_test,), radius of each evaluation point in physical space
+        - "r_eval": np.ndarray, shape (num_test,), radius of each evaluation
+          point in physical space
         - "x_val": physical positions used, shape (num_test, 3)
         - "true_u", "predicted_u": physical potentials, shape (num_test,)
         - "true_a", "predicted_a": physical accelerations, shape (num_test, 3)
@@ -66,7 +75,8 @@ def evaluate_performance(
         - "analytic_baseline": analytic baseline potential at t=0
         - "ab_pot_error", "ab_acc_error": baseline percent errors
         - "residual_pot": ab_potential - predicted_u
-        - "corrected_pot_percent_error": percent error after applying mean residual correction
+        - "corrected_pot_percent_error": percent error after applying mean
+          residual correction
 
     """
     true_pot = raw_datadict["u_val"][:num_test]
@@ -99,7 +109,9 @@ def evaluate_performance(
             raw_datadict["x_val"][:num_test], t=0
         )
 
-        ab_pot_error = 100 * jnp.abs((analytic_baseline_potential - true_pot) / true_pot)
+        ab_pot_error = 100 * jnp.abs(
+            (analytic_baseline_potential - true_pot) / true_pot
+        )
         ab_acc_error = (
             100
             * jnp.linalg.norm(analytic_baseline_acc - true_acc, axis=1)
@@ -146,12 +158,11 @@ def evaluate_performance(
 def evaluate_performance_node(
     model: Any,
     params: Any,
-    t_eval: Union[float, int, Any],
+    t_eval: float | Any,
     raw_datadict: Mapping[str, Any],
     num_test: int,
-) -> Dict[str, Any]:
-    """
-    Evaluate a time-dependent model at a single evaluation time.
+) -> dict[str, Any]:
+    """Evaluate a time-dependent model at a single evaluation time.
 
     This function expects the dataset to be organized by time keys:
         raw_datadict["val"][t_eval] -> dict with keys {"x", "u", "a"}
@@ -167,12 +178,13 @@ def evaluate_performance_node(
     params : Any
         Parameters tree used for `model.apply`.
     t_eval : float or int (or time key type)
-        The evaluation time. Used both to select `raw_datadict["val"][t_eval]` and to build
-        the time input feature.
-        Important: this must match the dictionary key exactly if keys are not floats.
+        The evaluation time. Used both to select `raw_datadict["val"][t_eval]`
+        and to build the time input feature.
+        Important: this must match the dictionary key exactly if keys are not
+        floats.
     raw_datadict : dict
-        Must contain `raw_datadict["val"]` mapping times -> per-time validation dict, where each
-        per-time dict contains:
+        Must contain `raw_datadict["val"]` mapping times -> per-time validation
+        dict, where each per-time dict contains:
         - "x": shape (N, 3) physical positions
         - "u": shape (N,) physical true potential at that time
         - "a": shape (N, 3) physical true acceleration at that time
@@ -186,8 +198,10 @@ def evaluate_performance_node(
     - "a_transformer": .transform / .inverse_transform
     - "t_transformer": .transform / .inverse_transform
     Optional:
-    - "include_analytic" (bool): whether to compute analytic baseline errors (default True)
-    - "ab_potential": analytic potential object with .potential(x, t=...) and .acceleration(x, t=...)
+    - "include_analytic" (bool): whether to compute analytic baseline errors
+      (default True)
+    - "ab_potential": analytic potential object with
+      .potential(x, t=...) and .acceleration(x, t=...)
 
     Returns
     -------
@@ -197,7 +211,8 @@ def evaluate_performance_node(
         - "true_u", "predicted_u": physical potentials, shape (num_test,)
         - "true_a", "predicted_a": physical accelerations, shape (num_test, 3)
         - "pot_percent_error", "acc_percent_error": percent errors, shape (num_test,)
-        - "true_a_norm", "predicted_a_norm": norms of acceleration vectors, shape (num_test, 1)
+        - "true_a_norm", "predicted_a_norm": norms of acceleration vectors,
+          shape (num_test, 1)
         If analytic baseline is enabled:
         - "analytic_baseline": analytic baseline potential at t_eval
         - "analytic_baseline_0": analytic baseline potential at t=0 (same x)
@@ -218,9 +233,7 @@ def evaluate_performance_node(
     true_acc = val_data["a"][:num_test]
 
     x_scaled = config["x_transformer"].transform(x_val)
-    t_scaled = config["t_transformer"].transform(t_eval) * jnp.ones(
-        (x_val.shape[0], 1)
-    )
+    t_scaled = config["t_transformer"].transform(t_eval) * jnp.ones((x_val.shape[0], 1))
     tx_scaled = jnp.concatenate([t_scaled, x_scaled], axis=1)
 
     output = apply_model(model, params, tx_scaled)
@@ -244,7 +257,9 @@ def evaluate_performance_node(
         analytic_baseline_acc = analytic_baseline.acceleration(x_val, t=t_eval)
         analytic_baseline_0 = analytic_baseline.potential(x_val, t=0)
         analytic_baseline_acc_norm = jnp.linalg.norm(analytic_baseline_acc, axis=1)
-        ab_pot_error = 100 * jnp.abs((analytic_baseline_potential - true_pot) / true_pot)
+        ab_pot_error = 100 * jnp.abs(
+            (analytic_baseline_potential - true_pot) / true_pot
+        )
         ab0_pot_error = 100 * jnp.abs((analytic_baseline_0 - true_pot) / true_pot)
         ab_acc_error = (
             100
@@ -291,15 +306,14 @@ def evaluate_performance_node(
     }
 
 
-
 def bnn_performance(
     predictive: Callable[[Array, Array], Mapping[str, Array]],
     x_test: Array,
     config: Mapping[str, Any],
-    rng_key: Optional[Array] = None,
-) -> Dict[str, Any]:
-    """
-    Summarize Bayesian posterior predictive outputs for potential and acceleration.
+    rng_key: Array | None = None,
+) -> dict[str, Any]:
+    """Summarize Bayesian posterior predictive outputs for potential and acceleration.
+
     This function is designed for NumPyro-style `Predictive` callables that return
     posterior samples for:
       - "potential": shape (S, N, ...) in scaled space
@@ -335,8 +349,11 @@ def bnn_performance(
         - "a_mean": posterior mean acceleration in physical units, shape (N, 3)
         - "u_std": posterior std potential in physical units, shape (N,)
         - "a_std": posterior std acceleration in physical units, shape (N, 3)
-        - "u_samples": posterior samples of potential in physical units, shape (S, N, ...)
-        - "a_samples": posterior samples of acceleration in physical units, shape (S, N, 3, ...)
+        - "u_samples": posterior samples of potential in physical units,
+          shape (S, N, ...)
+        - "a_samples": posterior samples of acceleration in physical units,
+          shape (S, N, 3, ...)
+
     """
     if rng_key is None:
         rng_key = jr.PRNGKey(0)

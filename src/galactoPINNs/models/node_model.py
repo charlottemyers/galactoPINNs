@@ -1,38 +1,42 @@
-from typing import Callable, Literal
+"""Neural ODE model implementations."""
+
+__all__ = (
+    "NODEModel",
+    "compute_delta_phi_batch",
+    "compute_delta_phi_per_point",
+    "compute_delta_phi_per_point_gl3",
+    "compute_delta_phi_per_point_gl3panels",
+)
+
+from collections.abc import Callable
+from typing import Any, Literal
+
+import diffrax as dfx
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-import diffrax as dfx
+from jaxtyping import Array
 
-from ..layers import (
-    CartesianToModifiedSphericalLayer,
-    ScaleNNPotentialLayer,
-    FuseModelsLayer,
+from galactoPINNs.layers import (
     AnalyticModelLayer,
+    CartesianToModifiedSphericalLayer,
+    FuseModelsLayer,
+    ScaleNNPotentialLayer,
     SmoothMLP,
 )
-
-__all__ = (
-    "compute_delta_phi_per_point",
-    "compute_delta_phi_batch",
-    "compute_delta_phi_per_point_gl3",
-    "compute_delta_phi_per_point_gl3panels",
-    "NODEModel",
-)
-
 
 # ----------------------------
 # Delta-phi integration helpers
 # ----------------------------
 
+
 def compute_delta_phi_per_point(
-    tx_sph: jnp.ndarray,
-    apply_fn: Callable[[jnp.ndarray], jnp.ndarray],
+    tx_sph: Array,
+    apply_fn: Callable[[Array], Array],
     t0: float,
     tf: float | None = None,
-) -> jnp.ndarray:
-    """
-    Compute delta_phi for each sample by solving an ODE independently per row.
+) -> Array:
+    """Compute delta_phi for each sample by solving an ODE independently per row.
 
     Solves:
         dphi/dt = f(t, x)  where f = apply_fn([t, x_sph...])
@@ -43,8 +47,8 @@ def compute_delta_phi_per_point(
         Array of shape (N, D) or (D,). Column 0 is the final time for each row unless
         `tf` is provided. Remaining columns are spatial features.
     apply_fn
-        Callable mapping an input of shape (N, D) or (1, D) to a scalar derivative per row.
-        Expected output is broadcastable to (N, 1) or (N,).
+        Callable mapping an input of shape (N, D) or (1, D) to a scalar
+        derivative per row. Expected output is broadcastable to (N, 1) or (N,).
     t0
         Integration start time.
     tf
@@ -54,15 +58,16 @@ def compute_delta_phi_per_point(
     -------
     delta_phi
         Array of shape (N,) containing delta_phi at the end time.
+
     """
     tx_sph = jnp.atleast_2d(tx_sph)
 
-    def single_integrator(row: jnp.ndarray) -> jnp.ndarray:
+    def single_integrator(row: Array) -> Array:
         # Initial condition delta_phi(t0) = 0
         y0 = jnp.zeros((1, 1))
         t1 = row[0] if tf is None else tf
 
-        def ode_fn(t, phi, _):
+        def ode_fn(t: float, *_: Any) -> Array:
             # Replace the time coordinate in the row at evaluation time t.
             row_t = row.at[0].set(t)
             return apply_fn(row_t[None, :]).reshape(1, 1)
@@ -91,14 +96,15 @@ def compute_delta_phi_per_point(
 
 
 def compute_delta_phi_batch(
-    tx_sph: jnp.ndarray,
-    apply_fn: Callable[[jnp.ndarray], jnp.ndarray],
+    tx_sph: Array,
+    apply_fn: Callable[[Array], Array],
     t0: float,
     nsteps: int = 64,
-) -> jnp.ndarray:
-    """
-    Compute delta_phi for a batch by solving one vector ODE system.
-    Assumes all samples share the same integration interval end time (taken from tx_sph[0, 0]).
+) -> Array:
+    """Compute delta_phi for a batch by solving one vector ODE system.
+
+    Assumes all samples share the same integration interval end time (taken
+    from tx_sph[0, 0]).
 
     Parameters
     ----------
@@ -116,16 +122,16 @@ def compute_delta_phi_batch(
     -------
     delta_phi
         Array of shape (N,) with the integrated delta_phi at t_end.
+
     """
     tx_sph = jnp.atleast_2d(tx_sph)
     batch_size = tx_sph.shape[0]
     t_end = tx_sph[0, 0]
 
-    def ode_fn(t, y, _):
+    def ode_fn(t: float, *_: Any) -> Array:
         # Overwrite time column for entire batch at time t.
         tx_sph_t = tx_sph.at[:, 0].set(t)
-        dphi_dt = apply_fn(tx_sph_t).reshape(batch_size, 1)
-        return dphi_dt
+        return apply_fn(tx_sph_t).reshape(batch_size, 1)
 
     y0 = jnp.zeros((batch_size, 1))
     term = dfx.ODETerm(ode_fn)
@@ -149,14 +155,13 @@ def compute_delta_phi_batch(
 
 
 def compute_delta_phi_per_point_gl3(
-    tx_sph: jnp.ndarray,
-    apply_fn: Callable[[jnp.ndarray], jnp.ndarray],
+    tx_sph: Array,
+    apply_fn: Callable[[Array], Array],
     t0: float,
-) -> jnp.ndarray:
-    """
-    Approximate delta_phi using single-panel 3-point Gauss–Legendre quadrature per row.
+) -> Array:
+    """Approximate delta_phi using single-panel 3-point Gauss-Legendre quadrature.
 
-    Computes:
+    Computes per row:
         int_{t0}^{tf} f(t, x) dt
     with tf = row[0].
 
@@ -173,6 +178,7 @@ def compute_delta_phi_per_point_gl3(
     -------
     delta_phi
         Array of shape (N,) quadrature approximation per row.
+
     """
     tx_sph = jnp.atleast_2d(tx_sph)
 
@@ -180,14 +186,14 @@ def compute_delta_phi_per_point_gl3(
     nodes = jnp.array([-jnp.sqrt(3.0 / 5.0), 0.0, jnp.sqrt(3.0 / 5.0)])
     weights = jnp.array([5.0 / 9.0, 8.0 / 9.0, 5.0 / 9.0])
 
-    def one(row: jnp.ndarray) -> jnp.ndarray:
+    def one(row: Array) -> Array:
         tf = row[0]
         # Map [-1, 1] -> [t0, tf]
         a = (tf - t0) / 2.0
         b = (tf + t0) / 2.0
         ts = a * nodes + b  # (3,)
 
-        def eval_at(t):
+        def eval_at(t: float) -> Array:
             row_t = row.at[0].set(t)
             return apply_fn(row_t[None, :]).squeeze()
 
@@ -198,14 +204,15 @@ def compute_delta_phi_per_point_gl3(
 
 
 def compute_delta_phi_per_point_gl3panels(
-    tx_sph: jnp.ndarray,
-    apply_fn: Callable[[jnp.ndarray], jnp.ndarray],
+    tx_sph: Array,
+    apply_fn: Callable[[Array], Array],
     t0: float,
     M: int = 4,
-) -> jnp.ndarray:
-    """
-    Composite GL3 quadrature over M panels; can improve accuracy over single-panel
-    GL3 when the interval is long or f(t, x) varies rapidly.
+) -> Array:
+    """Compute delta_phi using GL3 quadrature over M panels.
+
+    Can improve accuracy over single-panel GL3 when the interval is long or f(t,
+    x) varies rapidly.
 
     Parameters
     ----------
@@ -222,27 +229,28 @@ def compute_delta_phi_per_point_gl3panels(
     -------
     delta_phi
         Array of shape (N,) composite quadrature approximation per row.
+
     """
     tx_sph = jnp.atleast_2d(tx_sph)
 
     nodes = jnp.array([-jnp.sqrt(3.0 / 5.0), 0.0, jnp.sqrt(3.0 / 5.0)])
     weights = jnp.array([5.0 / 9.0, 8.0 / 9.0, 5.0 / 9.0])
 
-    def one(row: jnp.ndarray) -> jnp.ndarray:
+    def one(row: Array) -> Array:
         tf = row[0]
         L = tf - t0
 
         # Normalized panel edges in s \in [0, 1]
         s_edges = jnp.linspace(0.0, 1.0, M + 1)
 
-        def panel(i):
+        def panel(i: int) -> Array:
             a, b = s_edges[i], s_edges[i + 1]
             c = (b - a) / 2.0
             d = (b + a) / 2.0
-            s = c * nodes + d        # (3,)
-            t = t0 + s * L           # (3,)
+            s = c * nodes + d  # (3,)
+            t = t0 + s * L  # (3,)
 
-            def eval_at(ti):
+            def eval_at(ti: float) -> Array:
                 row_t = row.at[0].set(ti)
                 return apply_fn(row_t[None, :]).squeeze()
 
@@ -254,14 +262,13 @@ def compute_delta_phi_per_point_gl3panels(
     return jax.vmap(one)(tx_sph)
 
 
-
 # ----------------------------
 # NODE Model
 # ----------------------------
 
+
 class NODEModel(nn.Module):
-    """
-    Flax module implementing a time-dependent potential correction via integration.
+    """Flax module implementing a time-dependent potential correction via integration.
 
     Parameters
     ----------
@@ -282,22 +289,25 @@ class NODEModel(nn.Module):
     -----
     Input: tx_cart with shape (N, 4) containing [t, x, y, z] in scaled coords.
     Output: dict with "potential" (N,) and "acceleration" (N, 3).
+
     """
 
     config: dict
     depth: int = 4
 
-    def setup(self):
+    def setup(self) -> None:
+        """Initialize the delta_phi and initial_correction neural networks."""
         act = self.config.get("activation", None)
         gelu_approx = self.config.get("gelu_approximate", False)
 
         if act is not None and not callable(act):
-            raise TypeError(
+            msg = (
                 f"config['activation'] must be a callable (e.g. jax.nn.softplus), "
                 f"got {type(act)!r}"
             )
+            raise TypeError(msg)
 
-        mlp_common = dict(gelu_approximate=gelu_approx)
+        mlp_common = {"gelu_approximate": gelu_approx}
         if act is not None:
             mlp_common["act"] = act
 
@@ -313,10 +323,8 @@ class NODEModel(nn.Module):
             **mlp_common,
         )
 
-
-    def compute_potential(self, tx_cart: jnp.ndarray) -> jnp.ndarray:
-        """
-        Convenience wrapper that returns only the potential.
+    def compute_potential(self, tx_cart: Array) -> Array:
+        """Compute the potential.
 
         Parameters
         ----------
@@ -326,37 +334,45 @@ class NODEModel(nn.Module):
         Returns
         -------
         potential : array, shape (N,) or ()
-        """
-        return self.apply({"params": self.variables["params"]}, tx_cart, mode="potential")["potential"]
 
-    def compute_acceleration(self, tx_cart: jnp.ndarray) -> jnp.ndarray:
         """
-        Compute acceleration as -grad(Phi) by differentiating the model potential.
-        The gradient is taken w.r.t. the full input [t, x, y, z], then the spatial
-        components (x, y, z) are returned and the time derivative is discarded.
+        return self.apply(
+            {"params": self.variables["params"]}, tx_cart, mode="potential"
+        )["potential"]
+
+    def compute_acceleration(self, tx_cart: Array) -> Array:
+        """Compute acceleration as -grad(Phi) by differentiating the model potential.
+
+        The gradient is taken w.r.t. the full input [t, x, y, z], then the
+        spatial components (x, y, z) are returned and the time derivative is
+        discarded.
 
         Parameters
         ----------
-        tx_cart : array, shape (N, 4) or (4,)
+        tx_cart
+            Time+position input array with shape ``(N, 4)`` or ``(4,)``.
+            Columns are ``[t, x, y, z]``.
 
         Returns
         -------
         acceleration : array, shape (N, 3)
+            Acceleration vectors computed as ``-grad(Phi)``.
+
         """
         tx_cart = jnp.atleast_2d(tx_cart)
 
-        def potential_fn(single_tx):
+        def potential_fn(single_tx: Array) -> Array:
             return self.compute_potential(single_tx).squeeze()
 
         grad_fn = jax.vmap(jax.grad(potential_fn))
-        grad_tx = grad_fn(tx_cart)          # (N, 4)
-        accel = (-grad_tx)[:, 1:4]          # (N, 3)
-        return accel
+        grad_tx = grad_fn(tx_cart)  # (N, 4)
+        return (-grad_tx)[:, 1:4]  # (N, 3)
 
     @nn.compact
-    def __call__(self, tx_cart: jnp.ndarray, mode: Literal["full", "potential"] = "full") -> dict:
-        """
-        Forward pass.
+    def __call__(
+        self, tx_cart: Array, mode: Literal["full", "potential"] = "full"
+    ) -> dict:
+        """Forward pass.
 
         Parameters
         ----------
@@ -371,22 +387,26 @@ class NODEModel(nn.Module):
             If mode == "potential":
                 {"potential": potential}
             Else:
-                {"acceleration": acceleration, "potential": potential, "outputs": outputs}
+                {"acceleration": acceleration, "potential": potential,
+                 "outputs": outputs}
+
         """
         outputs: dict = {}
         t0 = 0.0  # Integration start time
 
         # Layers
-        cart_to_sph_layer = CartesianToModifiedSphericalLayer(clip=self.config.get("clip", 1.0))
+        cart_to_sph_layer = CartesianToModifiedSphericalLayer(
+            clip=self.config.get("clip", 1.0)
+        )
         scale_layer = ScaleNNPotentialLayer(config=self.config)
         fuse_layer = FuseModelsLayer()
-        analytic_layer = AnalyticModelLayer(config=self.config, mode = "time")
+        analytic_layer = AnalyticModelLayer(config=self.config, mode="time")
 
         tx_cart = jnp.atleast_2d(tx_cart)
 
         # Split time and space (as Einstein recoils)
-        x_cart = tx_cart[:, 1:4]     # (N, 3)
-        t = tx_cart[:, :1]           # (N, 1)
+        x_cart = tx_cart[:, 1:4]  # (N, 3)
+        t = tx_cart[:, :1]  # (N, 1)
 
         # Convert to modified spherical features
         x_sph = cart_to_sph_layer(x_cart)
@@ -401,7 +421,9 @@ class NODEModel(nn.Module):
         # Fix delta_phi_net params and define an apply_fn for integration/quadrature.
         _ = self.delta_phi_net(tx_sph)  # ensures parameter collection exists
         delta_phi_params = self.variables["params"]["delta_phi_net"]
-        apply_fn = lambda z: self.delta_phi_net.apply({"params": delta_phi_params}, z)
+
+        def apply_fn(z: Array) -> Array:
+            return self.delta_phi_net.apply({"params": delta_phi_params}, z)
 
         # Integrate delta_phi
         method = self.config.get("integration_mode", "gl3")
@@ -412,10 +434,11 @@ class NODEModel(nn.Module):
         elif method == "gl3":
             delta_phi = compute_delta_phi_per_point_gl3(tx_sph, apply_fn, t0)
         else:
-            raise ValueError(
+            msg = (
                 f"Unknown integration_mode='{method}'. "
                 "Use one of {'gl3', 'diffrax_batch', 'diffrax_per_point'}."
             )
+            raise ValueError(msg)
 
         outputs["delta_phi"] = delta_phi
 
