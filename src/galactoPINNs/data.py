@@ -16,10 +16,12 @@ __all__ = (
     "scale_data_time",
 )
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, Literal
 
 import coordinax as cx
+import equinox as eqx
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import unxt as u
@@ -27,16 +29,9 @@ from galax.potential import density
 from jaxtyping import Array, ArrayLike
 from unxt.quantity import AllowValue
 
-# -------------------------
-# Sampling utilities
-# -------------------------
-
 
 def sample_log_uniform_r(
-    key: jr.PRNGKey,
-    r_min: float,
-    r_max: float,
-    N: int,
+    key: jr.PRNGKey, r_min: float, r_max: float, *, N: int
 ) -> Array:
     """Sample radii distributed log-uniformly on the interval [r_min, r_max].
 
@@ -69,19 +64,18 @@ def sample_log_uniform_r(
     --------
     >>> import jax.random as jr
     >>> key = jr.PRNGKey(0)
-    >>> r = sample_log_uniform_r(key, 1.0, 100.0, 5)
+    >>> r = sample_log_uniform_r(key, 1.0, 100.0, N=5)
     >>> r.shape
     (5,)
     >>> jnp.all((r >= 1.0) & (r <= 100.0))
     Array(True, dtype=bool)
 
     """
-    if r_min <= 0:
-        raise ValueError("r_min must be strictly positive.")
-    if r_max <= r_min:
-        raise ValueError("r_max must be greater than r_min.")
     if N <= 0:
         raise ValueError("N must be positive.")
+
+    r_min = eqx.error_if(r_min, r_min <= 0, "r_min must be strictly positive.")
+    r_max = eqx.error_if(r_max, r_max <= r_min, "r_max must be greater than r_min.")
 
     u = jr.uniform(
         key,
@@ -161,12 +155,14 @@ def sample_angles(
 
 
 def biased_sphere_samples(
-    N: int, r_min: float, r_max: float
+    key: jr.PRNGKey, N: int, r_min: float, r_max: float
 ) -> tuple[Array, Array, Array]:
     """Sample points in a sphere with radii distributed log-uniformly.
 
     Parameters
     ----------
+    key
+        JAX random key used for sampling.
     N
         Number of samples.
     r_min, r_max
@@ -183,9 +179,9 @@ def biased_sphere_samples(
     if r_min <= 0 or r_max <= 0 or r_max <= r_min:
         raise ValueError("Require 0 < r_min < r_max.")
 
-    key = jr.PRNGKey(0)
-    r = sample_log_uniform_r(key, r_min, r_max, N)
-    theta, phi = sample_angles(key, N)
+    key_r, key_angles = jr.split(key)
+    r = sample_log_uniform_r(key_r, r_min, r_max, N=N)
+    theta, phi = sample_angles(key_angles, N)
 
     x = r * jnp.sin(phi) * jnp.cos(theta)
     y = r * jnp.sin(phi) * jnp.sin(theta)
@@ -194,11 +190,7 @@ def biased_sphere_samples(
 
 
 def _estimate_density_upper_bound(
-    galax_pot: Any,
-    r_max: float,
-    t: float,
-    grid_n: int = 20,
-    safety_factor: float = 1.2,
+    galax_pot: Any, r_max: float, t: float, grid_n: int = 20, safety_factor: float = 1.2
 ) -> float:
     """Estimate an upper bound on density inside a ball of radius r_max.
 
@@ -224,11 +216,32 @@ def _estimate_density_upper_bound(
     return safety_factor * rho_max
 
 
+def _make_density_fn(galax_pot: Any, t: float) -> Callable[[Array], Array]:
+    """Create a JIT-compiled density evaluation function.
+
+    Returns a function that takes raw (N, 3) position arrays (in kpc)
+    and returns density values, bypassing coordinax overhead in the hot path.
+    """
+    t_q = u.Quantity(t, "Myr")
+
+    def _density_raw(xyz: Array) -> Array:
+        """Evaluate density at positions xyz (N, 3) in kpc."""
+        pos = cx.CartesianPos3D(
+            x=u.Quantity(xyz[:, 0], "kpc"),
+            y=u.Quantity(xyz[:, 1], "kpc"),
+            z=u.Quantity(xyz[:, 2], "kpc"),
+        )
+        return density(galax_pot, pos, t=t_q).value
+
+    return jax.jit(_density_raw)
+
+
 def rejection_sample_sphere(
     galax_pot: Any,
     n_samples: int,
     r_max: float,
     *,
+    key: Array | None = None,
     batch_size: int = 10_000,
     t: float = 0.0,
     r_min: float = 0.0,
@@ -246,6 +259,8 @@ def rejection_sample_sphere(
         Total number of accepted samples to return.
     r_max
         Outer radius (kpc).
+    key
+        JAX random key. If None, uses PRNGKey(0).
     batch_size
         Proposal batch size per iteration.
     t
@@ -267,59 +282,102 @@ def rejection_sample_sphere(
     """
     if n_samples <= 0:
         raise ValueError("n_samples must be positive.")
-    if r_max <= 0 or r_min < 0 or r_max <= r_min:
-        raise ValueError("Require 0 <= r_min < r_max.")
     if batch_size <= 0:
         raise ValueError("batch_size must be positive.")
+
+    r_max = eqx.error_if(r_max, r_max <= 0, "r_max must be positive.")
+    r_min = eqx.error_if(r_min, r_min < 0, "r_min must be non-negative.")
+    r_max = eqx.error_if(r_max, r_max <= r_min, "r_max must be greater than r_min.")
+
+    key = jr.PRNGKey(0) if key is None else key
 
     normalization = _estimate_density_upper_bound(
         galax_pot, r_max=r_max, t=t, grid_n=grid_n, safety_factor=safety_factor
     )
 
-    accepted_chunks: list[Array] = []
-    accepted_total = 0
+    # Create JIT-compiled density function for fast evaluation
+    density_fn = _make_density_fn(galax_pot, t)
 
-    key = jr.PRNGKey(0)
-    while accepted_total < n_samples:
-        # split key for this iteration
-        key, key_prop = jr.split(key)
+    # Pre-allocate buffer for samples (oversize to avoid reallocation)
+    # We estimate needing ~2x samples due to rejection, but allocate more to be safe
+    buffer_size = max(n_samples * 4, batch_size * 2)
+    samples_buffer = jnp.zeros((buffer_size, 3), dtype=jnp.float32)
 
-        # ---- propose points ----
-        if log_proposal_pts:
-            key_prop, key_bs = jr.split(key_prop)
-            x, y, z = biased_sphere_samples(key_bs, batch_size, max(r_min, 1e-6), r_max)
-        else:
-            key_prop, kx, ky, kz = jr.split(key_prop, 4)
+    # Use r_min_safe for log proposal (must be > 0)
+    r_min_safe = jnp.maximum(r_min, 1e-6)
 
-            x = jr.uniform(kx, (batch_size,), minval=-r_max, maxval=r_max)
-            y = jr.uniform(ky, (batch_size,), minval=-r_max, maxval=r_max)
-            z = jr.uniform(kz, (batch_size,), minval=-r_max, maxval=r_max)
+    def _propose_uniform(key_prop: Array) -> tuple[Array, Array, Array]:
+        """Propose points uniformly in a cube."""
+        kx, ky, kz = jr.split(key_prop, 3)
+        x = jr.uniform(kx, (batch_size,), minval=-r_max, maxval=r_max)
+        y = jr.uniform(ky, (batch_size,), minval=-r_max, maxval=r_max)
+        z = jr.uniform(kz, (batch_size,), minval=-r_max, maxval=r_max)
+        return x, y, z
 
+    def _propose_log(key_prop: Array) -> tuple[Array, Array, Array]:
+        """Propose points with log-uniform radii."""
+        key_r, key_angles = jr.split(key_prop)
+        r = sample_log_uniform_r(key_r, r_min_safe, r_max, N=batch_size)
+        theta, phi = sample_angles(key_angles, batch_size)
+        x = r * jnp.sin(phi) * jnp.cos(theta)
+        y = r * jnp.sin(phi) * jnp.sin(theta)
+        z = r * jnp.cos(phi)
+        return x, y, z
+
+    propose_fn = _propose_log if log_proposal_pts else _propose_uniform
+
+    def cond_fn(carry: tuple[Array, int, Array]) -> Array:
+        """Continue while we haven't collected enough samples."""
+        _, accepted_total, _ = carry
+        return accepted_total < n_samples
+
+    def body_fn(carry: tuple[Array, int, Array]) -> tuple[Array, int, Array]:
+        """One iteration of rejection sampling."""
+        samples_buf, accepted_total, loop_key = carry
+
+        # Split key for this iteration
+        loop_key, key_prop, key_acc = jr.split(loop_key, 3)
+
+        # Propose points
+        x, y, z = propose_fn(key_prop)
+
+        # Filter to points inside the shell
         r = jnp.sqrt(x**2 + y**2 + z**2)
         inside = (r <= r_max) & (r >= r_min)
 
-        x, y, z = x[inside], y[inside], z[inside]
+        # Compute density and acceptance probability for ALL points
+        xyz = jnp.stack([x, y, z], axis=1)
+        rho = density_fn(xyz)
 
-        if x.shape[0] == 0:
-            continue
-
-        pos = cx.CartesianPos3D(
-            x=u.Quantity(x, "kpc"), y=u.Quantity(y, "kpc"), z=u.Quantity(z, "kpc")
-        )
-        rho = density(galax_pot, pos, t=t).value
-
-        # ---- accept/reject ----
-        # Ensure probability never exceeds 1.0 even if normalization is imperfect.
+        # Accept/reject
         p = jnp.clip(rho / normalization, 0.0, 1.0)
-        key, key_acc = jr.split(key)
-        u_all = jr.uniform(key_acc, shape=p.shape, minval=0.0, maxval=1.0)
-        accepted = u_all < p
+        u_all = jr.uniform(key_acc, shape=(batch_size,), minval=0.0, maxval=1.0)
+        accepted_mask = inside & (u_all < p)
 
-        new_samples = jnp.stack([x[accepted], y[accepted], z[accepted]], axis=1)
-        accepted_chunks.append(new_samples)
-        accepted_total += new_samples.shape[0]
+        # Count accepted and write to buffer using dynamic_update_slice
+        # We need to handle variable-length accepted samples
+        # Use a scatter approach: write accepted samples to contiguous slots
+        accepted_indices = jnp.where(accepted_mask, size=batch_size, fill_value=-1)[0]
+        n_accepted = jnp.sum(accepted_mask)
 
-    return jnp.vstack(accepted_chunks)[:n_samples]
+        # Create update: only write valid samples
+        def write_sample(i: int, buf: Array) -> Array:
+            idx = accepted_indices[i]
+            sample = xyz[idx]
+            write_pos = accepted_total + i
+            # Only write if idx is valid and we haven't exceeded buffer
+            should_write = (idx >= 0) & (write_pos < buffer_size)
+            return jnp.where(should_write, buf.at[write_pos].set(sample), buf)
+
+        # Use fori_loop to write samples
+        samples_buf = jax.lax.fori_loop(0, batch_size, write_sample, samples_buf)
+
+        return samples_buf, accepted_total + n_accepted, loop_key
+
+    # Run the while loop
+    final_buffer, *_ = jax.lax.while_loop(cond_fn, body_fn, (samples_buffer, 0, key))
+
+    return final_buffer[:n_samples]
 
 
 # -------------------------
@@ -417,18 +475,29 @@ def generate_static_datadict(
 
     """
 
-    def _evaluate(samples: Array, t: float = 0.0) -> tuple[Array, Array, Array]:
-        x, y, z = samples.T
-        pos = cx.CartesianPos3D(
-            x=u.Quantity(x, "kpc"),
-            y=u.Quantity(y, "kpc"),
-            z=u.Quantity(z, "kpc"),
-        )
+    def _make_evaluate_fn(
+        potential: Any, t: float
+    ) -> Callable[[Array], tuple[Array, Array, Array]]:
+        """Create a JIT-compiled evaluation function for positions.
+
+        Returns a function that takes raw (N, 3) position arrays (in kpc)
+        and returns (positions, accelerations, potentials).
+        """
         t_q = u.Quantity(t, "Myr")
-        acc = galax_potential.acceleration(pos, t=t_q)
-        pot = galax_potential.potential(pos, t=t_q).value  # keep as unitless array
-        a = jnp.stack([acc.x.value, acc.y.value, acc.z.value], axis=1)
-        return samples, a, pot
+
+        def _evaluate_raw(samples: Array) -> tuple[Array, Array, Array]:
+            x, y, z = samples.T
+            pos = cx.CartesianPos3D(
+                x=u.Quantity(x, "kpc"),
+                y=u.Quantity(y, "kpc"),
+                z=u.Quantity(z, "kpc"),
+            )
+            acc = potential.acceleration(pos, t=t_q)
+            pot = potential.potential(pos, t=t_q).value
+            a = jnp.stack([acc.x.value, acc.y.value, acc.z.value], axis=1)
+            return samples, a, pot
+
+        return jax.jit(_evaluate_raw)
 
     def _append_points(base: Array, extra: ArrayLike | None) -> Array:
         if extra is None:
@@ -439,6 +508,9 @@ def generate_static_datadict(
                 out = jnp.vstack([out, jnp.atleast_2d(pt)])
             return out
         return jnp.vstack([base, jnp.atleast_2d(extra)])
+
+    # Create JIT-compiled evaluation function (reused for train and val)
+    _evaluate = _make_evaluate_fn(galax_potential, t=0.0)
 
     # -----------------
     # Train positions
@@ -502,10 +574,10 @@ def generate_static_datadict(
     x_val = _append_points(x_val, add_pts_test)
 
     # -----------------
-    # Evaluate targets
+    # Evaluate targets (using JIT-compiled function)
     # -----------------
-    x_train, a_train, u_train = _evaluate(x_train, t=0.0)
-    x_val, a_val, u_val = _evaluate(x_val, t=0.0)
+    x_train, a_train, u_train = _evaluate(x_train)
+    x_val, a_val, u_val = _evaluate(x_val)
     r_train = jnp.linalg.norm(x_train, axis=1)
     r_val = jnp.linalg.norm(x_val, axis=1)
 
@@ -559,31 +631,40 @@ def generate_time_dep_datadict(
     def _as_float_myr(t: u.AbstractQuantity | ArrayLike) -> Array:
         return u.ustrip(AllowValue, "Myr", t)
 
+    def _make_evaluate_fn_time(
+        potential: Any, t_myr: float
+    ) -> Callable[[Array], tuple[Array, Array, Array]]:
+        """Create a JIT-compiled evaluation function for a specific time."""
+        t_q = u.Quantity(t_myr, "Myr")
+
+        def _evaluate_raw(samples: Array) -> tuple[Array, Array, Array]:
+            x, y, z = samples.T
+            pos = cx.CartesianPos3D(
+                x=u.Quantity(x, "kpc"),
+                y=u.Quantity(y, "kpc"),
+                z=u.Quantity(z, "kpc"),
+            )
+            acc = potential.acceleration(pos, t=t_q)
+            pot = potential.potential(pos, t=t_q).ustrip("kpc2/Myr2")
+            a_flat = jnp.stack(
+                [
+                    acc.x.ustrip("kpc/Myr2"),
+                    acc.y.ustrip("kpc/Myr2"),
+                    acc.z.ustrip("kpc/Myr2"),
+                ],
+                axis=1,
+            )
+            x_flat = jnp.stack([x, y, z], axis=1)
+            return x_flat, a_flat, pot
+
+        return jax.jit(_evaluate_raw)
+
     def _get_data(
         t_myr: float, n_samples: int, r_max: float
     ) -> tuple[Array, Array, Array]:
-        samples = rejection_sample_sphere(
-            galax_potential, t_myr, n_samples=n_samples, r_max=r_max
-        )
-        x, y, z = samples.T
-        pos = cx.CartesianPos3D(
-            x=u.Quantity(x, "kpc"), y=u.Quantity(y, "kpc"), z=u.Quantity(z, "kpc")
-        )
-        t_array = u.Quantity(jnp.full(len(samples), t_myr), "Myr")
-
-        acc = galax_potential.acceleration(pos, t_array)
-        pot = galax_potential.potential(pos, t_array).ustrip("kpc2/Myr2")
-
-        a_flat = jnp.stack(
-            [
-                acc.x.ustrip("kpc/Myr2"),
-                acc.y.ustrip("kpc/Myr2"),
-                acc.z.ustrip("kpc/Myr2"),
-            ],
-            axis=1,
-        )
-        x_flat = jnp.stack([x, y, z], axis=1)
-        return x_flat, a_flat, pot
+        samples = rejection_sample_sphere(galax_potential, n_samples, r_max, t=t_myr)
+        evaluate_fn = _make_evaluate_fn_time(galax_potential, t_myr)
+        return evaluate_fn(samples)
 
     train_data: dict[float, dict[str, Array]] = {}
     val_data: dict[float, dict[str, Array]] = {}

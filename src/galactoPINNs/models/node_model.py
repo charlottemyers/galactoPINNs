@@ -14,7 +14,7 @@ from typing import Any, Literal
 import diffrax as dfx
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
+from flax import nnx
 from jaxtyping import Array
 
 from galactoPINNs.layers import (
@@ -96,10 +96,7 @@ def compute_delta_phi_per_point(
 
 
 def compute_delta_phi_batch(
-    tx_sph: Array,
-    apply_fn: Callable[[Array], Array],
-    t0: float,
-    nsteps: int = 64,
+    tx_sph: Array, apply_fn: Callable[[Array], Array], t0: float, nsteps: int = 64
 ) -> Array:
     """Compute delta_phi for a batch by solving one vector ODE system.
 
@@ -155,9 +152,7 @@ def compute_delta_phi_batch(
 
 
 def compute_delta_phi_per_point_gl3(
-    tx_sph: Array,
-    apply_fn: Callable[[Array], Array],
-    t0: float,
+    tx_sph: Array, apply_fn: Callable[[Array], Array], t0: float
 ) -> Array:
     """Approximate delta_phi using single-panel 3-point Gauss-Legendre quadrature.
 
@@ -204,10 +199,7 @@ def compute_delta_phi_per_point_gl3(
 
 
 def compute_delta_phi_per_point_gl3panels(
-    tx_sph: Array,
-    apply_fn: Callable[[Array], Array],
-    t0: float,
-    M: int = 4,
+    tx_sph: Array, apply_fn: Callable[[Array], Array], t0: float, M: int = 4
 ) -> Array:
     """Compute delta_phi using GL3 quadrature over M panels.
 
@@ -267,12 +259,12 @@ def compute_delta_phi_per_point_gl3panels(
 # ----------------------------
 
 
-class NODEModel(nn.Module):
-    """Flax module implementing a time-dependent potential correction via integration.
+class NODEModel(nnx.Module):
+    """Flax NNX module implementing a time-dependent potential via integration.
 
     Parameters
     ----------
-    config : dict
+    config
         Configuration dict used by layers and integration routing.
         Expected keys include:
           - "activation" (callable, i.e. jax.nn.tanh): activation for MLPs
@@ -282,8 +274,11 @@ class NODEModel(nn.Module):
           - "include_analytic" (bool)
           - plus transformer and analytic-function keys used by ScaleNNPotentialLayer
             and AnalyticModelLayer.
-    depth : int
-        Kept for backwards-compatibility; primary depths are taken from config.
+    in_features
+        The number of spatial input features. Typically 3 for spherical coordinates.
+        The delta_phi network takes (in_features + 1) features for [t, sph_features...].
+    rngs
+        Random number generator state for parameter initialization.
 
     Notes
     -----
@@ -292,13 +287,13 @@ class NODEModel(nn.Module):
 
     """
 
-    config: dict
-    depth: int = 4
+    def __init__(
+        self, config: dict[str, Any], in_features: int = 3, *, rngs: nnx.Rngs
+    ) -> None:
+        """Initialize the NODEModel layers."""
+        self.config = nnx.data(config)
 
-    def setup(self) -> None:
-        """Initialize the delta_phi and initial_correction neural networks."""
-        act = self.config.get("activation", None)
-        gelu_approx = self.config.get("gelu_approximate", False)
+        act = config.get("activation")
 
         if act is not None and not callable(act):
             msg = (
@@ -307,21 +302,33 @@ class NODEModel(nn.Module):
             )
             raise TypeError(msg)
 
-        mlp_common = {"gelu_approximate": gelu_approx}
+        mlp_common: dict[str, Any] = {"rngs": rngs}
         if act is not None:
             mlp_common["act"] = act
 
+        # delta_phi_net takes [t, sph_features...] so has (in_features + 1) inputs
         self.delta_phi_net = SmoothMLP(
-            depth=self.config.get("delta_phi_depth", 4),
-            width=self.config.get("delta_phi_width", 128),
+            in_features=in_features + 1,
+            depth=config.get("delta_phi_depth", 4),
+            width=config.get("delta_phi_width", 128),
             **mlp_common,
         )
 
+        # initial_correction_net takes spatial features only
         self.initial_correction_net = SmoothMLP(
-            depth=self.config.get("initial_correction_depth", 4),
-            width=self.config.get("initial_correction_width", 128),
+            in_features=in_features,
+            depth=config.get("initial_correction_depth", 4),
+            width=config.get("initial_correction_width", 128),
             **mlp_common,
         )
+
+        # Initialize other layers
+        self.cart_to_sph_layer = CartesianToModifiedSphericalLayer(
+            clip=config.get("clip", 1.0)
+        )
+        self.scale_layer = ScaleNNPotentialLayer(config=config)
+        self.fuse_layer = FuseModelsLayer()
+        self.analytic_layer = AnalyticModelLayer(config=config, mode="time")
 
     def compute_potential(self, tx_cart: Array) -> Array:
         """Compute the potential.
@@ -336,9 +343,7 @@ class NODEModel(nn.Module):
         potential : array, shape (N,) or ()
 
         """
-        return self.apply(
-            {"params": self.variables["params"]}, tx_cart, mode="potential"
-        )["potential"]
+        return self(tx_cart, mode="potential")["potential"]
 
     def compute_acceleration(self, tx_cart: Array) -> Array:
         """Compute acceleration as -grad(Phi) by differentiating the model potential.
@@ -368,10 +373,9 @@ class NODEModel(nn.Module):
         grad_tx = grad_fn(tx_cart)  # (N, 4)
         return (-grad_tx)[:, 1:4]  # (N, 3)
 
-    @nn.compact
     def __call__(
         self, tx_cart: Array, mode: Literal["full", "potential"] = "full"
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Forward pass.
 
         Parameters
@@ -391,16 +395,8 @@ class NODEModel(nn.Module):
                  "outputs": outputs}
 
         """
-        outputs: dict = {}
+        outputs: dict[str, Any] = {}
         t0 = 0.0  # Integration start time
-
-        # Layers
-        cart_to_sph_layer = CartesianToModifiedSphericalLayer(
-            clip=self.config.get("clip", 1.0)
-        )
-        scale_layer = ScaleNNPotentialLayer(config=self.config)
-        fuse_layer = FuseModelsLayer()
-        analytic_layer = AnalyticModelLayer(config=self.config, mode="time")
 
         tx_cart = jnp.atleast_2d(tx_cart)
 
@@ -409,7 +405,7 @@ class NODEModel(nn.Module):
         t = tx_cart[:, :1]  # (N, 1)
 
         # Convert to modified spherical features
-        x_sph = cart_to_sph_layer(x_cart)
+        x_sph = self.cart_to_sph_layer(x_cart)
 
         # Build [t, sph_features...] for delta_phi network
         tx_sph = jnp.concatenate([t, x_sph], axis=1)
@@ -418,12 +414,9 @@ class NODEModel(nn.Module):
         initial_correction = self.initial_correction_net(x_sph)  # (N,)
         outputs["initial_correction"] = initial_correction
 
-        # Fix delta_phi_net params and define an apply_fn for integration/quadrature.
-        _ = self.delta_phi_net(tx_sph)  # ensures parameter collection exists
-        delta_phi_params = self.variables["params"]["delta_phi_net"]
-
+        # Define an apply_fn for integration/quadrature using the delta_phi_net
         def apply_fn(z: Array) -> Array:
-            return self.delta_phi_net.apply({"params": delta_phi_params}, z)
+            return self.delta_phi_net(z)
 
         # Integrate delta_phi
         method = self.config.get("integration_mode", "gl3")
@@ -446,15 +439,15 @@ class NODEModel(nn.Module):
         total_correction = initial_correction + delta_phi
 
         # Convert correction to a potential term (radial scaling, etc.)
-        scaled_potential = scale_layer(x_cart, total_correction)
+        scaled_potential = self.scale_layer(x_cart, total_correction)
         outputs["scale_nn_potential"] = scaled_potential
 
         # Analytic potential term
-        analytic_potential = analytic_layer(tx_cart)
+        analytic_potential = self.analytic_layer(tx_cart)
         outputs["analytic_model_layer"] = analytic_potential
 
         # Fuse (NN + analytic)
-        fused_potential = fuse_layer(scaled_potential, analytic_potential)
+        fused_potential = self.fuse_layer(scaled_potential, analytic_potential)
         outputs["fuse_models"] = fused_potential
 
         # Choose final output

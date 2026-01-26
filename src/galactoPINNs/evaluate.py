@@ -18,7 +18,6 @@ from .inference import apply_model
 
 def evaluate_performance(
     model: Any,
-    trained_state_params: Any,
     raw_datadict: Mapping[str, Any],
     num_test: int,
 ) -> dict[str, Any]:
@@ -35,12 +34,9 @@ def evaluate_performance(
 
     Parameters
     ----------
-    model : flax.linen.Module
-        A trained static model object with attribute `config`.
-        The model is expected to support
-        `model.apply({"params": params}, x_scaled)` via `apply_model`.
-    trained_state_params : Any
-        Parameters tree (e.g., `TrainState.params`) used for `model.apply`.
+    model : flax.nnx.Module
+        A trained static NNX model object with attribute `config`.
+        The model is called directly via `model(x_scaled)`.
     raw_datadict : dict
         Dictionary containing (at min.) the following keys:
         - "x_val": array-like, shape (N, 3), physical validation positions
@@ -85,7 +81,7 @@ def evaluate_performance(
     config = model.config
     r_eval = jnp.linalg.norm(raw_datadict["x_val"][:num_test], axis=1)
     scaled_x_val = config["x_transformer"].transform(raw_datadict["x_val"][:num_test])
-    output = apply_model(model, trained_state_params, scaled_x_val)
+    output = apply_model(model, scaled_x_val)
     predicted_pot = config["u_transformer"].inverse_transform(output["u_pred"])
     predicted_acc = config["a_transformer"].inverse_transform(output["a_pred"])
     acc_percent_error = (
@@ -157,7 +153,6 @@ def evaluate_performance(
 
 def evaluate_performance_node(
     model: Any,
-    params: Any,
     t_eval: float | Any,
     raw_datadict: Mapping[str, Any],
     num_test: int,
@@ -172,11 +167,10 @@ def evaluate_performance_node(
 
     Parameters
     ----------
-    model : flax.linen.Module (or compatible)
-        A time-dependent model with attribute `config`. The model is expected to accept
-        a scaled input of shape (N, 1+3) = (N, 4): [t_scaled, x_scaled...].
-    params : Any
-        Parameters tree used for `model.apply`.
+    model : flax.nnx.Module (or compatible)
+        A time-dependent NNX model with attribute `config`. The model is called
+        directly with a scaled input of shape (N, 1+3) = (N, 4): [t_scaled,
+        x_scaled...].
     t_eval : float or int (or time key type)
         The evaluation time. Used both to select `raw_datadict["val"][t_eval]`
         and to build the time input feature.
@@ -236,7 +230,7 @@ def evaluate_performance_node(
     t_scaled = config["t_transformer"].transform(t_eval) * jnp.ones((x_val.shape[0], 1))
     tx_scaled = jnp.concatenate([t_scaled, x_scaled], axis=1)
 
-    output = apply_model(model, params, tx_scaled)
+    output = apply_model(model, tx_scaled)
 
     predicted_pot = config["u_transformer"].inverse_transform(output["u_pred"])
     predicted_acc = config["a_transformer"].inverse_transform(output["a_pred"])
@@ -355,8 +349,7 @@ def bnn_performance(
           shape (S, N, 3, ...)
 
     """
-    if rng_key is None:
-        rng_key = jr.PRNGKey(0)
+    rng_key = jr.PRNGKey(0) if rng_key is None else rng_key
 
     x_test_scaled = config["x_transformer"].transform(x_test)
     pred = predictive(jr.PRNGKey(2), x_test_scaled)

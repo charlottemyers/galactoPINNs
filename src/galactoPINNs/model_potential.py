@@ -5,7 +5,7 @@ __all__ = (
     "make_galax_potential",
 )
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import KW_ONLY
 from typing import Any, TypeAlias, final
 
@@ -19,8 +19,6 @@ from unxt import unitsystems
 from unxt.quantity import AbstractQuantity
 from xmmutablemap import ImmutableMap
 
-Params: TypeAlias = Any
-ApplyFn: TypeAlias = Any
 Config: TypeAlias = Mapping[str, Any]
 PositionInput: TypeAlias = Array | AbstractQuantity
 
@@ -31,18 +29,15 @@ class ModelPotential(AbstractPotential):
 
     Parameters
     ----------
-    apply_fn : callable
-        Callable compatible with Flax apply.
-        Must accept `(variables, x_scaled)` and return a dict containing keys
-    params : Any
-        Parameter pytree to pass as `{"params": params}` into apply_fn.
+    model_fn : callable
+        Callable that accepts ``(x_scaled)`` and returns a dict containing
+        keys ``"potential"`` and ``"acceleration"``.
     config : dict
         Must contain the transformers listed in the module docstring.
 
     """
 
-    apply_fn: Any = eqx.field(static=True)
-    params: Any = eqx.field(static=True)
+    model_fn: Callable[[Array], dict[str, Array]] = eqx.field(static=True)
     config: dict = eqx.field(static=True)
 
     _: KW_ONLY
@@ -51,10 +46,7 @@ class ModelPotential(AbstractPotential):
         default=default_constants, converter=ImmutableMap
     )
 
-    def _as_batched_xyz(
-        self,
-        q: PositionInput,
-    ) -> tuple[Array, bool]:
+    def _as_batched_xyz(self, q: PositionInput) -> tuple[Array, bool]:
         """Normalize input positions to shape ``(N, 3)``.
 
         Parameters
@@ -73,21 +65,15 @@ class ModelPotential(AbstractPotential):
 
         """
         x = jnp.asarray(getattr(q, "value", q))
+        was_batched = x.ndim == 2
 
-        if x.ndim == 1:
-            if x.shape[0] != 3:
-                msg = f"Expected position shape (3,), got {x.shape}."
-                raise ValueError(msg)
-            return x.reshape(1, 3), False
-
-        if x.ndim == 2:
-            if x.shape[1] != 3:
-                msg = f"Expected position shape (N, 3), got {x.shape}."
-                raise ValueError(msg)
-            return x, True
-
-        msg = f"Expected position ndim 1 or 2, got ndim={x.ndim}, shape={x.shape}."
-        raise ValueError(msg)
+        # Validate and batch in one step
+        x = eqx.error_if(
+            x,
+            (x.ndim < 1) | (x.ndim > 2) | (x.shape[-1] != 3),
+            "Expected position shape (3,) or (N, 3).",
+        )
+        return jnp.atleast_2d(x), was_batched
 
     def _acceleration(self, q: PositionInput, _: Any) -> Array:
         """Return physical acceleration at positions ``q``.
@@ -103,10 +89,7 @@ class ModelPotential(AbstractPotential):
         x_batched = x_batched.astype(jnp.float32)
 
         x_scaled = self.config["x_transformer"].transform(x_batched)
-        a_scaled = self.apply_fn(
-            {"params": self.params},
-            x_scaled,
-        )["acceleration"]
+        a_scaled = self.model_fn(x_scaled)["acceleration"]
         a_phys = self.config["a_transformer"].inverse_transform(a_scaled)
 
         return jnp.squeeze(a_phys, axis=0) if not batched else a_phys
@@ -125,19 +108,12 @@ class ModelPotential(AbstractPotential):
         x_batched = x_batched.astype(jnp.float32)
 
         x_scaled = self.config["x_transformer"].transform(x_batched)
-        u_scaled = self.apply_fn(
-            {"params": self.params},
-            x_scaled,
-        )["potential"]
+        u_scaled = self.model_fn(x_scaled)["potential"]
         u_phys = self.config["u_transformer"].inverse_transform(u_scaled)
 
         return jnp.squeeze(u_phys, axis=0) if not batched else jnp.ravel(u_phys)
 
-    def _gradient(
-        self,
-        q: PositionInput,
-        t: Any,
-    ) -> Array:
+    def _gradient(self, q: PositionInput, t: Any) -> Array:
         """Return spatial gradient of the potential at ``q``.
 
         Notes
@@ -149,20 +125,15 @@ class ModelPotential(AbstractPotential):
 
 
 def make_galax_potential(
-    model: Any,
-    params: Any,
-    *,
-    units: u.AbstractUnitSystem = unitsystems.galactic,
+    model: Any, *, units: u.AbstractUnitSystem = unitsystems.galactic
 ) -> ModelPotential:
-    """Wrap a trained model as a Galax `AbstractPotential`.
+    """Wrap a trained NNX model as a Galax `AbstractPotential`.
 
     Parameters
     ----------
-    model : object or callable
-        Either a Flax module with attribute `.apply` and `.config`, or a
-        callable apply function.
-    params : Any
-        Parameter pytree used by the model.
+    model : nnx.Module
+        A Flax NNX module with a `.config` attribute. The model must be
+        callable and return a dict with ``"potential"`` and ``"acceleration"``.
     units : unxt.AbstractUnitSystem, optional
         Unit system for the Galax potential (defaults to galactic).
 
@@ -172,16 +143,9 @@ def make_galax_potential(
         A Galax-compatible potential.
 
     """
-    apply_fn = model.apply
-    config = model.config
-    if config is None:
+    if model.config is None:
         raise ValueError(
             "make_galax_potential requires `model` to have a `.config` attribute."
         )
 
-    return ModelPotential(
-        apply_fn=apply_fn,
-        params=params,
-        config=config,
-        units=units,
-    )
+    return ModelPotential(model_fn=model, config=model.config, units=units)

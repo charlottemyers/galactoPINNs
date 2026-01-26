@@ -2,6 +2,7 @@
 
 __all__ = (
     "alternate_training",
+    "create_optimizer",
     "train_model_state_node",
     "train_model_static",
     "train_model_with_trainable_analytic_layer",
@@ -11,52 +12,81 @@ __all__ = (
 
 import logging
 from collections.abc import Callable, Mapping, Sequence
-from functools import partial
-from typing import Any, Literal, Protocol
+from typing import Any, Literal
 
 import jax
 import jax.numpy as jnp
-import jax.random as jr
 import optax
-from flax import traverse_util
-from flax.linen import Module
-from flax.training.train_state import TrainState
-from jaxtyping import Array, PyTree
+from flax import nnx
+from jaxtyping import Array
 
 log = logging.getLogger(__name__)
 
 StaticTarget = Literal["acceleration", "orbit_energy", "mixed"]
-TrainStepFn = Callable[..., tuple[TrainState, Array]]
+TrainStepFn = Callable[..., Array]
 
 
-class _FlaxModuleWithInit(Protocol):
-    """Minimal protocol for Flax modules used here."""
+def create_optimizer(
+    model: nnx.Module, tx: optax.GradientTransformation
+) -> nnx.Optimizer:
+    """Create an NNX optimizer from a model and optax transformation.
 
-    def init(self, rngs: Any, *args: Any, **kwargs: Any) -> Mapping[str, Any]: ...
+    Parameters
+    ----------
+    model
+        An NNX module instance (already initialized with parameters).
+    tx
+        An optax gradient transformation.
+
+    Returns
+    -------
+    nnx.Optimizer
+        An optimizer that tracks the model parameters.
+
+    """
+    return nnx.Optimizer(model, tx, wrt=nnx.Param)
+
+
+def get_model_params(model: nnx.Module) -> dict[str, Any]:
+    """Get the current model parameters as a nested dict.
+
+    Parameters
+    ----------
+    model
+        An NNX module instance.
+
+    Returns
+    -------
+    dict
+        The model parameters in dict form.
+
+    """
+    _, state = nnx.split(model)
+    return nnx.to_pure_dict(state)
 
 
 #############
 
 
-@partial(jax.jit, static_argnames=("target",))
+@nnx.jit(static_argnames=("target",))
 def train_step_static(
-    state: TrainState,
+    model: nnx.Module,
+    optimizer: nnx.Optimizer,
     x: Array,
     a_true: Array,
     *,
-    target: Literal["acceleration", "orbit_energy", "mixed"] = "acceleration",
     lambda_rel: float = 1.0,
     orbit_q: Array | None = None,
     orbit_p: Array | None = None,
     lambda_E: float = 5.0,
     std_weight: float = 10.0,
-) -> tuple[TrainState, Array]:
+    target: Literal["acceleration", "orbit_energy", "mixed"] = "acceleration",
+) -> Array:
     """Perform one optimizer step for a static potential model.
 
     This function computes a scalar training loss, differentiates it with
-    respect to the model parameters stored in ``state.params``, and applies the
-    resulting gradients via ``state.apply_gradients``. The loss target is
-    controlled by ``target``:
+    respect to the model parameters, and applies the resulting gradients
+    via the optimizer. The loss target is controlled by ``target``:
 
     - ``"acceleration"``: matches predicted accelerations to ``a_true`` at input
       positions ``x``.
@@ -67,29 +97,24 @@ def train_step_static(
 
     Notes
     -----
-    - This function is JIT-compiled. The ``target`` argument is marked static
-      via ``static_argnames``.
-    - The implementation assumes ``state.apply_fn`` returns a dict containing:
-        - ``"acceleration"`` when called as ``apply_fn({"params": params}, x)``
-        - ``"potential"`` when called as
-          ``apply_fn({"params": params}, q_flat, mode="potential")``
+    - This function is JIT-compiled using ``nnx.jit``.
+    - The model and optimizer are mutated in place (NNX pattern).
+    - The implementation assumes the model returns a dict containing:
+        - ``"acceleration"`` when called as ``model(x)``
+        - ``"potential"`` when called as ``model(q_flat, mode="potential")``
     - Orbit arrays ``orbit_q`` and ``orbit_p`` are expected to already be in the
       model's scaled / nondimensional coordinates/velocities
 
     Parameters
     ----------
-    state
-        Flax ``TrainState`` holding:
-        - ``params``: parameter PyTree
-        - ``tx``: optimizer transformation
-        - ``apply_fn``: model forward function
+    model
+        NNX module implementing the static potential model.
+    optimizer
+        NNX optimizer wrapping the model parameters.
     x
         Batch of input positions. Shape ``(N, 3)`` (scaled coordinates).
     a_true
         True accelerations at ``x``. Shape ``(N, 3)`` (scaled accelerations).
-    target
-        Loss configuration. One of:
-        ``"acceleration"``, ``"orbit_energy"``, or ``"mixed"``.
     lambda_rel
         Weight applied to a relative-error term in the acceleration loss.
         Larger values emphasize fractional error in regions where |a_true| is small.
@@ -105,13 +130,14 @@ def train_step_static(
         Weight applied to the orbit-energy loss when ``target="mixed"``.
     std_weight
         Weight applied to the within-orbit energy standard deviation term.
+    target
+        Loss configuration. One of:
+        ``"acceleration"``, ``"orbit_energy"``, or ``"mixed"``.
 
     Returns
     -------
-    new_state, loss
-        ``new_state`` is the updated TrainState after applying gradients.
-        ``loss`` is a scalar JAX array (shape ``()``) containing the loss value
-        for this step.
+    loss
+        A scalar JAX array (shape ``()``) containing the loss value for this step.
 
     Raises
     ------
@@ -123,7 +149,7 @@ def train_step_static(
         msg = f"target='{target}' requires orbit_q and orbit_p (got None)."
         raise ValueError(msg)
 
-    def acc_loss_fn(params: PyTree, lambda_rel_: float) -> Array:
+    def acc_loss_fn(model: nnx.Module, lambda_rel_: float) -> Array:
         """Acceleration loss with an absolute + relative magnitude term.
 
         Computes::
@@ -137,7 +163,7 @@ def train_step_static(
             Scalar loss (shape ``()``).
 
         """
-        out: dict[str, Array] = state.apply_fn({"params": params}, x)
+        out: dict[str, Array] = model(x)
         a_pred = out["acceleration"]  # (N, 3)
 
         diff = a_pred - a_true
@@ -148,7 +174,7 @@ def train_step_static(
         return jnp.mean(diff_norm + lambda_rel_ * (diff_norm / (a_true_norm + eps)))
 
     def orbit_energy(
-        params: PyTree, orbit_q_scaled: Array, orbit_p_scaled: Array
+        model: nnx.Module, orbit_q_scaled: Array, orbit_p_scaled: Array
     ) -> Array:
         """Compute predicted total specific energy along orbits.
 
@@ -159,8 +185,8 @@ def train_step_static(
 
         Parameters
         ----------
-        params
-            Model parameters PyTree.
+        model
+            The NNX model.
         orbit_q_scaled
             Orbit positions (scaled). Shape ``(B, T, 3)``.
         orbit_p_scaled
@@ -176,16 +202,17 @@ def train_step_static(
         T_ke = 0.5 * jnp.sum(orbit_p_scaled**2, axis=-1)  # (B, T)
 
         q_flat = orbit_q_scaled.reshape(B * T, 3)  # (B*T, 3)
-        out: dict[str, Array] = state.apply_fn(
-            {"params": params}, q_flat, mode="potential"
-        )
+        out: dict[str, Array] = model(q_flat, mode="potential")
         Phi_flat = out["potential"]  # (B*T,)
         Phi = Phi_flat.reshape(B, T)  # (B, T)
 
         return T_ke + Phi
 
     def orbit_E_loss(
-        params: PyTree, orbit_q_scaled: Array, orbit_p_scaled: Array, std_weight_: float
+        model: nnx.Module,
+        orbit_q_scaled: Array,
+        orbit_p_scaled: Array,
+        std_weight_: float,
     ) -> Array:
         """Penalize energy non-conservation along each trajectory.
 
@@ -198,8 +225,8 @@ def train_step_static(
 
         Parameters
         ----------
-        params
-            Model parameters PyTree.
+        model
+            The NNX model.
         orbit_q_scaled
             Orbit positions. Shape ``(B, T, 3)``.
         orbit_p_scaled
@@ -213,7 +240,7 @@ def train_step_static(
             Scalar loss (shape ``()``).
 
         """
-        E = orbit_energy(params, orbit_q_scaled, orbit_p_scaled)  # (B, T)
+        E = orbit_energy(model, orbit_q_scaled, orbit_p_scaled)  # (B, T)
         delta_E = E[:, -1] - E[:, 0]  # (B,)
 
         # Center each orbit's energy time series before computing std
@@ -222,7 +249,7 @@ def train_step_static(
 
         return jnp.mean(delta_E**2 + std_weight_ * std_E**2)
 
-    def total_loss(params: PyTree) -> Array:
+    def total_loss(model: nnx.Module) -> Array:
         """Dispatch the total loss based on ``target``.
 
         Returns
@@ -235,30 +262,31 @@ def train_step_static(
             assert orbit_q is not None
             assert orbit_p is not None
             return lambda_E * orbit_E_loss(
-                params, orbit_q, orbit_p, std_weight
-            ) + acc_loss_fn(params, lambda_rel)
+                model, orbit_q, orbit_p, std_weight
+            ) + acc_loss_fn(model, lambda_rel)
 
         if target == "orbit_energy":
             assert orbit_q is not None
             assert orbit_p is not None
-            return orbit_E_loss(params, orbit_q, orbit_p, std_weight)
+            return orbit_E_loss(model, orbit_q, orbit_p, std_weight)
 
         # default: acceleration-only
-        return acc_loss_fn(params, lambda_rel)
+        return acc_loss_fn(model, lambda_rel)
 
-    loss, grads = jax.value_and_grad(total_loss)(state.params)
-    new_state = state.apply_gradients(grads=grads)
-    return new_state, loss
+    loss, grads = nnx.value_and_grad(total_loss)(model)
+    optimizer.update(model, grads)
+    return loss
 
 
-@jax.jit
+@nnx.jit
 def train_step_node(
-    state: TrainState,
+    model: nnx.Module,
+    optimizer: nnx.Optimizer,
     tx_cart: Array,
     a_true: Array,
     *,
     lambda_rel: float = 1.0,
-) -> tuple[TrainState, Array]:
+) -> Array:
     """Optimization step for NODE with acceleration training objective.
 
     Perform one optimizer step for a time-dependent (Neural ODE / NODE-style)
@@ -271,17 +299,19 @@ def train_step_node(
 
     Notes
     -----
-    - The implementation assumes ``state.apply_fn`` returns a dict containing
-      the key ``"acceleration"`` when called as:
-          ``state.apply_fn({"params": params}, tx_cart)``.
+    - This function is JIT-compiled using ``nnx.jit``.
+    - The model and optimizer are mutated in place (NNX pattern).
+    - The implementation assumes the model returns a dict containing
+      the key ``"acceleration"`` when called as ``model(tx_cart)``.
     - ``tx_cart`` is assumed to be concatenated time + Cartesian position,
       typically shaped ``(N, 4)`` with columns ``[t, x, y, z]``.
 
     Parameters
     ----------
-    state
-        Flax ``TrainState`` holding parameters, optimizer state, and the model
-        apply function.
+    model
+        NNX module implementing the time-dependent potential model.
+    optimizer
+        NNX optimizer wrapping the model parameters.
     tx_cart
         Batch of model inputs containing time and Cartesian coordinates.
         Recommended shape ``(N, 4)`` with columns ``[t, x, y, z]``.
@@ -295,20 +325,18 @@ def train_step_node(
 
     Returns
     -------
-    new_state, loss
-        ``new_state`` is the updated TrainState after applying gradients.
-        ``loss`` is a scalar JAX array (shape ``()``) with the loss value for
-        this step.
+    loss
+        A scalar JAX array (shape ``()``) with the loss value for this step.
 
     """
 
-    def loss_fn(params: PyTree) -> Array:
+    def loss_fn(model: nnx.Module) -> Array:
         """Acceleration-only objective.
 
         Parameters
         ----------
-        params
-            Model parameters PyTree.
+        model
+            The NNX model.
 
         Returns
         -------
@@ -316,7 +344,7 @@ def train_step_node(
             Scalar loss (shape ``()``).
 
         """
-        outputs: dict[str, Array] = state.apply_fn({"params": params}, tx_cart)
+        outputs: dict[str, Array] = model(tx_cart)
         a_pred = outputs["acceleration"]  # (N, 3)
 
         diff = a_pred - a_true
@@ -326,14 +354,14 @@ def train_step_node(
         eps = 1e-10
         return jnp.mean(diff_norm + lambda_rel * (diff_norm / (a_true_norm + eps)))
 
-    loss, grads = jax.value_and_grad(loss_fn)(state.params)
-    new_state = state.apply_gradients(grads=grads)
-    return new_state, loss
+    loss, grads = nnx.value_and_grad(loss_fn)(model)
+    optimizer.update(model, grads)
+    return loss
 
 
 def train_model_static(
-    model: Module,
-    optimizer: optax.GradientTransformation,
+    model: nnx.Module,
+    tx: optax.GradientTransformation,
     x_train: Array,
     a_train: Array,
     num_epochs: int,
@@ -341,7 +369,7 @@ def train_model_static(
     target: StaticTarget = "acceleration",
     log_every: int = 100,
     lambda_rel: float = 1.0,
-    init_state: TrainState | None = None,
+    optimizer: nnx.Optimizer | None = None,
     orbit_q: Array | None = None,
     orbit_p: Array | None = None,
     lambda_E: float = 5.0,
@@ -359,9 +387,8 @@ def train_model_static(
     Parameters
     ----------
     model
-        A Flax ``Module`` implementing the static model. Its ``apply`` function is
-        used as the TrainState apply_fn.
-    optimizer
+        An NNX ``Module`` implementing the static model (already initialized).
+    tx
         Optax optimizer transformation used to update parameters.
     x_train
         Training positions, typically shape ``(N, 3)`` in scaled coordinates.
@@ -376,9 +403,9 @@ def train_model_static(
         Print a progress line every ``log_every`` epochs.
     lambda_rel
         Weight for the relative-error term in the acceleration loss.
-    init_state
-        Optional pre-initialized ``TrainState``. If not provided, a new TrainState
-        is created using ``model.init`` with a fixed PRNG key (0).
+    optimizer
+        Optional pre-initialized ``nnx.Optimizer``. If not provided, a new
+        optimizer is created from the model and ``tx``.
     orbit_q
         Scaled orbit positions used for orbit-energy loss. Required when any
         stage uses ``"orbit_energy"`` or ``"mixed"``. Expected shape ``(B, T, 3)``.
@@ -397,7 +424,8 @@ def train_model_static(
     -------
     out : dict
         Dictionary with:
-        - ``"state"``: final TrainState
+        - ``"model"``: the trained model
+        - ``"optimizer"``: the final optimizer state
         - ``"epochs"``: list of epoch indices completed per stage (ints)
         - ``"losses"``: list of final loss values per stage (JAX scalars)
 
@@ -405,14 +433,8 @@ def train_model_static(
     epochs: list[int] = []
     losses: list[Array] = []
 
-    if init_state is None:
-        state = TrainState.create(
-            apply_fn=model.apply,
-            params=model.init(jax.random.PRNGKey(0), x_train)["params"],
-            tx=optimizer,
-        )
-    else:
-        state = init_state
+    if optimizer is None:
+        optimizer = create_optimizer(model, tx)
 
     schedule: Mapping[StaticTarget, int] = (
         train_dict if train_dict is not None else {target: num_epochs}
@@ -422,8 +444,9 @@ def train_model_static(
         log.info("Training for %d epochs on target: %s", n_epochs, stage_target)
 
         for epoch in range(n_epochs):
-            state, loss = train_step_static(
-                state,
+            loss = train_step_static(
+                model,
+                optimizer,
                 x_train,
                 a_train,
                 target=stage_target,
@@ -439,26 +462,29 @@ def train_model_static(
         epochs.append(epoch)
         losses.append(loss)
 
-    return {"state": state, "epochs": epochs, "losses": losses}
+    return {"model": model, "optimizer": optimizer, "epochs": epochs, "losses": losses}
 
 
 def train_model_state_node(
-    initial_state: TrainState,
+    model: nnx.Module,
+    optimizer: nnx.Optimizer,
     x_train: Array,
     a_train: Array,
     num_epochs: int,
     *,
     log_every: int = 1000,
 ) -> dict[str, Any]:
-    """Train a time-dependent model from an initial state.
+    """Train a time-dependent model.
 
     This function controls the training of a time-dependent model by
     repeatedly calling `train_step_node`.
 
     Parameters
     ----------
-    initial_state
-        The initial training state to start from.
+    model
+        The NNX model to train.
+    optimizer
+        The NNX optimizer wrapping the model parameters.
     x_train
         Training data (concatenated time and position).
     a_train
@@ -471,29 +497,25 @@ def train_model_state_node(
     Returns
     -------
     dict
-        A dictionary containing the final ``TrainState``, a list of epochs, and
-        a list of losses over time.
+        A dictionary containing the trained model, optimizer, epochs, and losses.
 
     """
     epochs = []
     losses = []
 
-    state = initial_state
     for epoch in range(num_epochs):
-        state, loss = train_step_node(state, x_train, a_train)
+        loss = train_step_node(model, optimizer, x_train, a_train)
         if epoch % log_every == 0:
             log.info("Epoch %d, Loss: %.6f", epoch, loss)
         epochs.append(epoch)
         losses.append(loss)
-    return {"state": state, "epochs": epochs, "losses": losses}
+    return {"model": model, "optimizer": optimizer, "epochs": epochs, "losses": losses}
 
 
 def train_model_with_trainable_analytic_layer(
-    init_state: TrainState,
-    train_step: Callable[
-        [TrainState, Array, Array],
-        tuple[TrainState, Array],
-    ],
+    model: nnx.Module,
+    optimizer: nnx.Optimizer,
+    train_step: TrainStepFn,
     x_train: Array,
     a_train: Array,
     num_epochs: int,
@@ -514,14 +536,15 @@ def train_model_with_trainable_analytic_layer(
 
     Parameters
     ----------
-    init_state
-        Initial Flax ``TrainState`` containing parameters, optimizer state, and
-        apply function.
+    model
+        NNX module containing the model (with trainable_analytic_layer).
+    optimizer
+        NNX optimizer wrapping the model parameters.
     train_step
         Callable implementing a single training step. It must accept:
 
-            ``(state, x_train, a_train, radial_weight=...)``
-        and return ``(new_state, loss)``, where ``loss`` is a scalar JAX array.
+            ``(model, optimizer, x_train, a_train, lambda_rel=...)``
+        and return ``loss``, a scalar JAX array.
     x_train
         Training input positions. Shape ``(N, 3)`` (scaled coordinates).
     a_train
@@ -539,66 +562,58 @@ def train_model_with_trainable_analytic_layer(
     out : dict
         Dictionary containing:
 
-        - ``"state"`` : TrainState
-          Final training state after ``num_epochs`` updates.
+        - ``"model"`` : nnx.Module
+          The trained model (mutated in place).
 
-        - ``"epochs"`` : list[int]
-          Epoch indices completed (0-based).
+        - ``"optimizer"`` : nnx.Optimizer
+          The optimizer state.
 
-        - ``"losses"`` : list[float]
-          Scalar loss values per epoch (converted to Python floats).
+        - ``"final_loss"`` : float
+          Final loss value after training.
 
-        - ``"analytic_params_history"`` : list[PyTree]
-          History of the parameter subtree
-          ``state.params["trainable_analytic_layer"]`` recorded at each epoch.
+        - ``"final_analytic_params"`` : dict | None
+          Final parameter values from trainable_analytic_layer (if present).
 
     Raises
     ------
-    KeyError
-        If ``"trainable_analytic_layer"`` is not present in ``state.params``.
+    AttributeError
+        If ``trainable_analytic_layer`` is not present in the model.
 
     """
-    epochs: list[int] = []
-    losses: list[float] = []
-    analytic_params_history: list[PyTree] = []
+    # Log at start
+    if log_every > 0:
+        log.info("Training for %d epochs...", num_epochs)
 
-    state = init_state
-
+    # Training loop - train_step is already JIT-compiled
+    loss = jnp.array(0.0)  # Initialize for type checker
     for epoch in range(num_epochs):
-        state, loss = train_step(
-            state,
-            x_train,
-            a_train,
-            lambda_rel=lambda_rel,
-        )
-
+        loss = train_step(model, optimizer, x_train, a_train, lambda_rel=lambda_rel)
         if log_every > 0 and (epoch % log_every == 0):
             log.info("Epoch %d, Loss: %.6f", epoch + 1, float(loss))
 
-        # Track analytic parameter subtree
-        analytic_params = state.params["trainable_analytic_layer"]
-        analytic_params_history.append(analytic_params)
-
-        epochs.append(epoch)
-        losses.append(float(loss))
+    # Extract final analytic params (only once at the end, not every epoch)
+    final_analytic_params = None
+    analytic_layer = model.trainable_analytic_layer
+    if analytic_layer is not None:
+        _, layer_state = nnx.split(analytic_layer)
+        final_analytic_params = layer_state.to_pure_dict()
 
     return {
-        "state": state,
-        "epochs": epochs,
-        "losses": losses,
-        "analytic_params_history": analytic_params_history,
+        "model": model,
+        "optimizer": optimizer,
+        "final_loss": float(loss),
+        "final_analytic_params": final_analytic_params,
     }
 
 
 def initialize_staged_optimizers(
-    net: _FlaxModuleWithInit,
+    model: nnx.Module,
     optimizer: optax.GradientTransformation,
-    x_train: Array,
 ) -> tuple[optax.GradientTransformation, optax.GradientTransformation]:
     """Create two Optax `multi_transform` optimizers for staged training.
 
-    This utility builds parameter partitions from a model's initialized
-    parameter pytree and returns two optimizer transformations:
+    This utility builds parameter partitions from a model's parameter
+    pytree and returns two optimizer transformations:
 
     - `tx1` ("AB-only"): trains only parameters under the subtree whose path
       contains `"trainable_analytic_layer"` and freezes all other parameters by
@@ -608,17 +623,12 @@ def initialize_staged_optimizers(
 
     Parameters
     ----------
-    net
-        Flax module (or compatible object) providing `init(rng, x_example)` and
-        returning a dict containing the `"params"` pytree.
+    model
+        NNX module (already initialized with parameters).
     optimizer
         The Optax optimizer to use for trainable parameters (e.g.,
         `optax.adam(...)`).  Frozen parameters receive `optax.set_to_zero()`
         regardless of this choice.
-    x_train
-        Training inputs. Only the first example (`x_train[:1]`) is used to
-        initialize model parameters via `net.init(...)`. Must be compatible with
-        the model's input signature.
 
     Returns
     -------
@@ -633,34 +643,49 @@ def initialize_staged_optimizers(
     --------
     .. skip: start
 
-    >>> tx1, tx2 = initialize_staged_optimizers(net, optax.adam(1e-3), x_train)
-    >>> state1 = TrainState.create(
-    ...     apply_fn=net.apply, params=params, tx=tx1
-    ... )  # trains analytic only
-    >>> state2 = TrainState.create(
-    ...     apply_fn=net.apply, params=params, tx=tx2
-    ... )  # trains all
+    >>> tx1, tx2 = initialize_staged_optimizers(model, optax.adam(1e-3))
+    >>> optimizer1 = create_optimizer(model, tx1)  # trains analytic only
+    >>> optimizer2 = create_optimizer(model, tx2)  # trains all
 
     .. skip: end
 
     """
-    rng = jr.PRNGKey(0)
-    init_params: PyTree = net.init(rng, x_train[:1])["params"]
+    # Get the parameter state and extract pure arrays for partition labels.
+    # nnx.Optimizer uses nnx.pure() internally, which extracts raw arrays from
+    # the State. The partition labels must match this pure array structure,
+    # not the State structure with nnx.Param wrappers.
+    param_state = nnx.state(model, nnx.Param)
+    # Extract the pure array structure that optax will see
+    pure_params = nnx.pure(param_state)
 
     partition_optimizers: Mapping[str, optax.GradientTransformation] = {
         "trainable": optimizer,
         "frozen": optax.set_to_zero(),
     }
 
-    param_partitions_AB_only: PyTree = traverse_util.path_aware_map(
-        lambda path, _: "trainable"
-        if ("trainable_analytic_layer" in path)
-        else "frozen",
-        init_params,
+    # Build partition labels using tree_map_with_path to match pure array structure
+    def make_label_fn(train_path_substr: str | None) -> Callable[[Any, Any], str]:
+        """Create a labeling function for tree_map_with_path."""
+
+        def label_fn(path: Any, _: Any) -> str:
+            # Convert path elements to string for matching
+            path_str = "/".join(
+                str(p.key) if hasattr(p, "key") else str(p) for p in path
+            )
+            if train_path_substr is None or train_path_substr in path_str:
+                return "trainable"
+            return "frozen"
+
+        return label_fn
+
+    # Stage 1: train only trainable_analytic_layer (use pure_params for structure)
+    param_partitions_AB_only = jax.tree_util.tree_map_with_path(
+        make_label_fn("trainable_analytic_layer"), pure_params
     )
-    param_partitions_joint: PyTree = traverse_util.path_aware_map(
-        lambda path, _: "trainable",  # noqa: ARG005
-        init_params,
+
+    # Stage 2: train all parameters
+    param_partitions_joint = jax.tree_util.tree_map_with_path(
+        make_label_fn(None), pure_params
     )
 
     tx1 = optax.multi_transform(partition_optimizers, param_partitions_AB_only)
@@ -672,7 +697,7 @@ def alternate_training(
     train_step: TrainStepFn,
     x_train: Array,
     a_train: Array,
-    model: Module,
+    model: nnx.Module,
     num_epochs_stage1: int,
     num_epochs_stage2: int,
     cycles: int,
@@ -691,31 +716,29 @@ def alternate_training(
     cycles:
 
       Stage 1 (analytic focus):
-          - Create a TrainState using optimizer ``tx_1``.
+          - Create an optimizer using ``tx_1``.
           - Train for ``num_epochs_stage1`` epochs.
       Stage 2 (NN focus):
-          - Create a TrainState using optimizer ``tx_2`` initialized from Stage
-            1 parameters.
+          - Create an optimizer using ``tx_2``.
           - Train for ``num_epochs_stage2`` epochs.
 
     During training, this function tracks:
       - the loss history across all stages and cycles, and
-      - selected parameter values from ``params["trainable_analytic_layer"]``
+      - selected parameter values from the trainable_analytic_layer
         over train time
 
     Parameters
     ----------
     train_step
-        Callable implementing one training step. It is passed through to the
-        trainer and should return ``(new_state, loss)``.
+        Callable implementing one training step. It must accept:
+        ``(model, optimizer, x_train, a_train, lambda_rel=...)``
+        and return ``loss``.
     x_train
         Training positions, typically shape ``(N, 3)`` (scaled).
     a_train
         True accelerations at ``x_train``, shape ``(N, 3)`` (scaled).
     model
-        Flax module to train. Must support:
-          - ``model.init(key, x_example)["params"]`` for initialization, and
-          - ``model.apply`` for TrainState apply_fn.
+        NNX module to train (already initialized with parameters).
     num_epochs_stage1
         Number of epochs to run in Stage 1 for each cycle (excluding burn-in).
     num_epochs_stage2
@@ -723,8 +746,8 @@ def alternate_training(
     cycles
         Number of times to repeat the Stage1 / Stage2 cycle.
     param_list
-        Names of parameters inside ``params["trainable_analytic_layer"]`` to
-        record into history.  Each entry is treated as a key into that dict.
+        Names of parameters inside the trainable_analytic_layer to
+        record into history.  Each entry is treated as a key into the params dict.
     tx_1
         Optax optimizer used in Stage 1 (analytic-focused phase).
     tx_2
@@ -738,32 +761,30 @@ def alternate_training(
     Returns
     -------
     out : dict
-        Dictionary containing: - ``"state"``: TrainState
-            Final TrainState after the last Stage 2 of the last cycle.
+        Dictionary containing:
+        - ``"model"``: nnx.Module
+            The trained model (mutated in place).
         - ``"history"``: dict
             Contains:
-              - ``"losses"``: list[float]
-              - ``"epochs"``: Array of shape (total_steps,) containing
-                0..total_steps-1
-              - For each name in ``param_list``: a list of tracked values over
-                time.
-        - ``"model"``: Module
-            The model instance
+              - ``"final_losses"``: list[float] - final loss from each stage
+              - ``"total_epochs"``: int - total epochs trained
+              - For each name in ``param_list``: final learned value.
 
     Notes
     -----
     - This function does not freeze parameter subsets; the actual freezing
       behavior must be implemented inside ``train_step`` (by controlling which
       params are updated by the optimizer).
-    - The initialization uses ``model.init(jr.PRNGKey(0), x_train[:1])`` in the
-      first cycle.
+    - The NNX model should already be initialized with parameters.
+    - For performance, per-epoch loss/param tracking is removed. Only final
+      values per stage are recorded.
 
     Raises
     ------
     ValueError
         If epoch counts or cycles are non-positive.
-    KeyError
-        If ``"trainable_analytic_layer"`` is missing when tracking analytic
+    AttributeError
+        If ``trainable_analytic_layer`` is missing when tracking analytic
         parameters.
 
     """
@@ -772,62 +793,44 @@ def alternate_training(
     if num_epochs_stage1 <= 0 or num_epochs_stage2 <= 0:
         raise ValueError("Stage epoch counts must be positive.")
 
-    total_steps = cycles * (num_epochs_stage1 + num_epochs_stage2)
-    history: dict[str, Any] = {
-        "losses": [],  # will extend with stage outputs
-        "epochs": jnp.arange(total_steps),
-    }
-    for param in param_list:
-        history[param] = []
-
-    stage2_output_state: TrainState | None = None
+    total_epochs = cycles * (num_epochs_stage1 + num_epochs_stage2)
+    final_losses: list[float] = []
+    final_params: dict[str, Any] = dict.fromkeys(param_list)
 
     for cycle in range(cycles):
-        # Initialize params in first cycle; otherwise continue from previous cycle.
-        if cycle == 0:
-            params: PyTree = model.init(jr.PRNGKey(0), x_train[:1])["params"]
-        else:
-            assert stage2_output_state is not None
-            params = stage2_output_state.params
-
         # === Stage 1 ===
         log.info("=== Starting Cycle %d / %d: Stage 1 ===", cycle + 1, cycles)
-        stage1_input_state = TrainState.create(
-            apply_fn=model.apply, params=params, tx=tx_1
-        )
 
-        epochs_s1 = num_epochs_stage1
-        output1: dict[str, Any] = train_model_with_trainable_analytic_layer(
-            stage1_input_state,
+        optimizer1 = create_optimizer(model, tx_1)
+        output1 = train_model_with_trainable_analytic_layer(
+            model,
+            optimizer1,
             train_step,
             x_train,
             a_train,
-            epochs_s1,
+            num_epochs_stage1,
             log_every=log_every,
             lambda_rel=lambda_rel,
         )
-        stage1_output_state: TrainState = output1["state"]
+        final_losses.append(output1["final_loss"])
 
-        history["losses"] += list(output1["losses"])
-
-        analytic_tree = stage1_output_state.params["trainable_analytic_layer"]
-        for param in param_list:
-            if isinstance(analytic_tree, Mapping) and (param in analytic_tree):
-                # output1["analytic_params_history"] entries are expected to be
-                # dict-like
-                history[param] += [d[param] for d in output1["analytic_params_history"]]
-                log.info("Learned %s in cycle %d: %s", param, cycle, history[param][-1])
+        # Log learned analytic params at end of stage
+        if output1["final_analytic_params"] is not None:
+            for param in param_list:
+                val = output1["final_analytic_params"].get(param)
+                if val is not None:
+                    final_params[param] = val
+                    log.info(
+                        "Learned %s in cycle %d stage 1: %s", param, cycle + 1, val
+                    )
 
         # === Stage 2 ===
         log.info("=== Starting Cycle %d / %d: Stage 2 ===", cycle + 1, cycles)
-        stage2_input_state = TrainState.create(
-            apply_fn=model.apply,
-            params=stage1_output_state.params,
-            tx=tx_2,
-        )
 
-        output2: dict[str, Any] = train_model_with_trainable_analytic_layer(
-            stage2_input_state,
+        optimizer2 = create_optimizer(model, tx_2)
+        output2 = train_model_with_trainable_analytic_layer(
+            model,
+            optimizer2,
             train_step,
             x_train,
             a_train,
@@ -835,14 +838,19 @@ def alternate_training(
             log_every=log_every,
             lambda_rel=lambda_rel,
         )
-        stage2_output_state = output2["state"]
+        final_losses.append(output2["final_loss"])
 
-        analytic_tree2 = stage1_output_state.params["trainable_analytic_layer"]
-        for param in param_list:
-            if isinstance(analytic_tree2, Mapping) and (param in analytic_tree2):
-                history[param] += [d[param] for d in output2["analytic_params_history"]]
+        # Update final params from stage 2
+        if output2["final_analytic_params"] is not None:
+            for param in param_list:
+                val = output2["final_analytic_params"].get(param)
+                if val is not None:
+                    final_params[param] = val
 
-        history["losses"] += list(output2["losses"])
+    history = {
+        "final_losses": final_losses,
+        "total_epochs": total_epochs,
+        **final_params,
+    }
 
-    assert stage2_output_state is not None
-    return {"state": stage2_output_state, "history": history, "model": model}
+    return {"model": model, "history": history}

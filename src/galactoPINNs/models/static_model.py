@@ -1,11 +1,11 @@
 """Static gravitational potential model implementations."""
 
 from collections.abc import Mapping
-from typing import Any, Literal, Optional, TypedDict
+from typing import Any, Literal, TypedDict
 
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
+from flax import nnx
 from jaxtyping import Array
 
 from galactoPINNs.layers import (
@@ -34,15 +34,15 @@ class StaticOutputs(TypedDict, total=False):
 # ----------------------------
 
 
-class StaticModel(nn.Module):
-    """A Flax module for a static gravitational potential model.
+class StaticModel(nnx.Module):
+    """A Flax NNX module for a static gravitational potential model.
 
     This class defines a flexible model for a gravitational potential, which can
     be a pure neural network, a known analytic potential, or a hybrid of the two.
     It computes the potential and its derivatives, and is designed to be highly
     configurable through a dictionary (config).
 
-    Attributes
+    Parameters
     ----------
     config
         A dictionary containing the configuration for the model's architecture
@@ -61,22 +61,57 @@ class StaticModel(nn.Module):
           ``SmoothMLP``.
         - Configuration for sub-layers like ``FuseandBoundary`` (``r_trans``,
           ``k_smooth``, etc.).
-
-    depth
-        The number of hidden layers in the ``SmoothMLP``.
+    in_features
+        The number of input features for the MLP. Typically 3 for spherical
+        coordinates or 3 for Cartesian if not converting.
     trainable_analytic_layer
         An instance of a trainable analytic potential layer, passed if
         ``config['trainable']`` is True.
+    rngs
+        Random number generator state for parameter initialization.
 
     """
 
-    config: Mapping[str, Any]
-    trainable_analytic_layer: Optional["TrainableGalaxPotential"] = None
-    depth: int = 4
+    def __init__(
+        self,
+        config: Mapping[str, Any],
+        in_features: int = 3,
+        trainable_analytic_layer: TrainableGalaxPotential | None = None,
+        *,
+        rngs: nnx.Rngs,
+    ) -> None:
+        """Initialize the static model layers."""
+        self.config = nnx.data(config)
+        self.trainable_analytic_layer = trainable_analytic_layer
 
-    def setup(self) -> None:
-        """Initialize the trainable analytic layer reference."""
-        self.trainable_layer = self.trainable_analytic_layer
+        # Initialize coordinate transform layer
+        self.cart_to_sph_layer = CartesianToModifiedSphericalLayer(
+            clip=config.get("clip", 1.0)
+        )
+
+        # Initialize scaling and fusion layers
+        self.scale_layer = ScaleNNPotentialLayer(config=config)
+        self.fuse_layer = FuseModelsLayer()
+        self.analytic_layer = AnalyticModelLayer(config=config, mode="static")
+
+        # Initialize MLP if not disabled
+        self.nn_off = config.get("nn_off", False)
+        if not self.nn_off:
+            depth = config.get("depth", 4)
+            width = config.get("width", 128)
+            act = config.get("activation", None)
+
+            mlp_kwargs: dict[str, Any] = {
+                "in_features": in_features,
+                "width": width,
+                "depth": depth,
+                "rngs": rngs,
+            }
+            if act is not None:
+                mlp_kwargs["act"] = act  # must be callable
+            self.mlp = SmoothMLP(**mlp_kwargs)
+        else:
+            self.mlp = None
 
     def compute_potential(self, cart_x: Array) -> Array:
         """Evaluate the model potential at Cartesian position(s).
@@ -93,11 +128,7 @@ class StaticModel(nn.Module):
             Potential values. Shape is ``(N,)``, or ``(N, 1)`` for batched input.
 
         """
-        return self.apply(
-            {"params": self.variables["params"]},
-            cart_x,
-            mode="potential",
-        )["potential"]
+        return self(cart_x, mode="potential")["potential"]
 
     def compute_acceleration(self, cart_x: Array) -> Array:
         """Compute acceleration: ``a = -grad(Φ)``.
@@ -157,7 +188,6 @@ class StaticModel(nn.Module):
         laplacian_fn = jax.vmap(laplacian_single)
         return laplacian_fn(cart_x)
 
-    @nn.compact
     def __call__(self, cart_x: Array, mode: Mode = "full") -> StaticOutputs:
         """Forward pass for the static model.
 
@@ -178,42 +208,14 @@ class StaticModel(nn.Module):
             A dict-like object containing keys "potential" and "acceleration".
 
         """
-        outputs = {}
-        if self.trainable_analytic_layer is not None:
-            # stub parameter ensures that the `trainable_analytic_layer` is
-            # correctly registered within the Flax parameter structure, even if it
-            # contains no trainable parameters itself
-            _stub = self.param("_stub", lambda _: jnp.array(0.0))
-
-        cart_to_sph_layer = CartesianToModifiedSphericalLayer(
-            clip=self.config.get("clip", 1.0)
-        )
-
-        scale_layer = ScaleNNPotentialLayer(config=self.config)
-        fuse_layer = FuseModelsLayer()
-        analytic_layer = AnalyticModelLayer(config=self.config, mode="static")
+        outputs: dict[str, Any] = {}
 
         if self.config.get("convert_to_spherical", True):
-            x = cart_to_sph_layer(cart_x)
+            x = self.cart_to_sph_layer(cart_x)
         else:
             x = cart_x
 
-        depth = self.config.get("depth", 4)
-        width = self.config.get("width", 128)
-        act = self.config.get("activation", None)
-        gelu_approx = self.config.get("gelu_approximate", False)
-
-        if self.config.get("nn_off", False):
-            u_nn = 0.0
-        else:
-            mlp_kwargs = {
-                "width": width,
-                "depth": depth,
-                "gelu_approximate": gelu_approx,
-            }
-            if act is not None:
-                mlp_kwargs["act"] = act  # must be callable
-            u_nn = SmoothMLP(**mlp_kwargs)(x)
+        u_nn = 0.0 if self.nn_off or self.mlp is None else self.mlp(x)
 
         outputs["u_nn"] = u_nn
 
@@ -226,17 +228,17 @@ class StaticModel(nn.Module):
             )
 
         else:
-            analytic_potential = analytic_layer(cart_x)
+            analytic_potential = self.analytic_layer(cart_x)
             r_s_learned = self.config["r_s"]
 
-        scaled_potential = scale_layer(cart_x, u_nn, r_s_learned=r_s_learned)
+        scaled_potential = self.scale_layer(cart_x, u_nn, r_s_learned=r_s_learned)
         outputs["scale_nn_potential"] = scaled_potential
 
         # Fuse unscaled NN output with physical analytic model
         if self.config.get("analytic_only", False):
             fused_potential = analytic_potential
         else:
-            fused_potential = fuse_layer(scaled_potential, analytic_potential)
+            fused_potential = self.fuse_layer(scaled_potential, analytic_potential)
         outputs["fuse_models"] = fused_potential
 
         if self.config["include_analytic"]:
