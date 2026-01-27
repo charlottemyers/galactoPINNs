@@ -1,35 +1,33 @@
-import jax
-import jax.numpy as jnp
-from unxt import unitsystems
-from dataclasses import KW_ONLY
-from typing import Any, final, Tuple, Mapping, Union
-from typing_extensions import TypeAlias
-
-from galax.potential._src.base import default_constants
-from galax.potential._src.base_single import AbstractPotential
-import equinox as eqx
-from xmmutablemap import ImmutableMap
-import unxt as u
-from unxt.quantity import AbstractQuantity
-
-Array: TypeAlias = jax.Array
-Params: TypeAlias = Any
-ApplyFn: TypeAlias = Any
-Config: TypeAlias = Mapping[str, Any]
-PositionInput: TypeAlias = Union[
-    Array,
-    AbstractQuantity,
-]
+"""Gravitational potential model definitions."""
 
 __all__ = (
     "ModelPotential",
     "make_galax_potential",
 )
 
+from collections.abc import Mapping
+from dataclasses import KW_ONLY
+from typing import Any, TypeAlias, final
+
+import equinox as eqx
+import jax.numpy as jnp
+import unxt as u
+from galax.potential._src.base import default_constants
+from galax.potential._src.base_single import AbstractPotential
+from jaxtyping import Array
+from unxt import unitsystems
+from unxt.quantity import AbstractQuantity
+from xmmutablemap import ImmutableMap
+
+Params: TypeAlias = Any
+ApplyFn: TypeAlias = Any
+Config: TypeAlias = Mapping[str, Any]
+PositionInput: TypeAlias = Array | AbstractQuantity
+
+
 @final
 class ModelPotential(AbstractPotential):
-    """
-    Galax potential backed by a learned galactoPINN model.
+    """Galax potential backed by a learned galactoPINN model.
 
     Parameters
     ----------
@@ -56,9 +54,8 @@ class ModelPotential(AbstractPotential):
     def _as_batched_xyz(
         self,
         q: PositionInput,
-    ) -> Tuple[Array, bool]:
-        """
-        Normalize input positions to shape ``(N, 3)``.
+    ) -> tuple[Array, bool]:
+        """Normalize input positions to shape ``(N, 3)``.
 
         Parameters
         ----------
@@ -73,40 +70,34 @@ class ModelPotential(AbstractPotential):
             Array of shape ``(N, 3)``.
         was_batched
             True if the input was already batched, False if a single point.
+
         """
         x = jnp.asarray(getattr(q, "value", q))
 
         if x.ndim == 1:
             if x.shape[0] != 3:
-                raise ValueError(
-                    f"Expected position shape (3,), got {x.shape}."
-                )
+                msg = f"Expected position shape (3,), got {x.shape}."
+                raise ValueError(msg)
             return x.reshape(1, 3), False
 
         if x.ndim == 2:
             if x.shape[1] != 3:
-                raise ValueError(
-                    f"Expected position shape (N, 3), got {x.shape}."
-                )
+                msg = f"Expected position shape (N, 3), got {x.shape}."
+                raise ValueError(msg)
             return x, True
 
-        raise ValueError(
-            f"Expected position ndim 1 or 2, got ndim={x.ndim}, shape={x.shape}."
-        )
+        msg = f"Expected position ndim 1 or 2, got ndim={x.ndim}, shape={x.shape}."
+        raise ValueError(msg)
 
-    def _acceleration(
-        self,
-        q: PositionInput,
-        t: Any,
-    ) -> Array:
-        """
-        Return physical acceleration at positions ``q``.
+    def _acceleration(self, q: PositionInput, _: Any) -> Array:
+        """Return physical acceleration at positions ``q``.
 
         Returns
         -------
         a
             - shape ``(3,)`` if ``q`` is a single point
             - shape ``(N, 3)`` if ``q`` is batched
+
         """
         x_batched, batched = self._as_batched_xyz(q)
         x_batched = x_batched.astype(jnp.float32)
@@ -120,19 +111,15 @@ class ModelPotential(AbstractPotential):
 
         return jnp.squeeze(a_phys, axis=0) if not batched else a_phys
 
-    def _potential(
-        self,
-        q: PositionInput,
-        t: Any,
-    ) -> Array:
-        """
-        Return physical potential at positions ``q``.
+    def _potential(self, q: PositionInput, _: Any) -> Array:
+        """Return physical potential at positions ``q``.
 
         Returns
         -------
         u
             - scalar if ``q`` is a single point
             - shape ``(N,)`` if ``q`` is batched
+
         """
         x_batched, batched = self._as_batched_xyz(q)
         x_batched = x_batched.astype(jnp.float32)
@@ -146,18 +133,17 @@ class ModelPotential(AbstractPotential):
 
         return jnp.squeeze(u_phys, axis=0) if not batched else jnp.ravel(u_phys)
 
-
     def _gradient(
         self,
         q: PositionInput,
         t: Any,
     ) -> Array:
-        """
-        Return spatial gradient of the potential at ``q``.
+        """Return spatial gradient of the potential at ``q``.
 
         Notes
         -----
         Defined as ``-acceleration`` to ensure consistency.
+
         """
         return -self._acceleration(q, t)
 
@@ -168,13 +154,13 @@ def make_galax_potential(
     *,
     units: u.AbstractUnitSystem = unitsystems.galactic,
 ) -> ModelPotential:
-    """
-    Wrap a trained model as a Galax `AbstractPotential`.
+    """Wrap a trained model as a Galax `AbstractPotential`.
 
     Parameters
     ----------
     model : object or callable
-        Either a Flax module with attribute `.apply` and `.config`, or a callable apply function.
+        Either a Flax module with attribute `.apply` and `.config`, or a
+        callable apply function.
     params : Any
         Parameter pytree used by the model.
     units : unxt.AbstractUnitSystem, optional
@@ -184,11 +170,14 @@ def make_galax_potential(
     -------
     pot : ModelPotential
         A Galax-compatible potential.
+
     """
     apply_fn = model.apply
     config = model.config
     if config is None:
-        raise ValueError("make_galax_potential requires `model` to have a `.config` attribute.")
+        raise ValueError(
+            "make_galax_potential requires `model` to have a `.config` attribute."
+        )
 
     return ModelPotential(
         apply_fn=apply_fn,
