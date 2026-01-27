@@ -1,24 +1,29 @@
+"""Bayesian neural network model implementations."""
+
+__all__ = (
+    "make_svi",
+    "model_svi",
+    "run_window",
+)
+
+from collections.abc import Callable, Mapping
+from typing import Any
+
 import jax.random as jr
 import numpyro
 import numpyro.distributions as dist
 import quaxed.numpy as jnp
+from jaxtyping import Array
 from numpyro.contrib.module import random_flax_module
 from numpyro.infer import SVI, Trace_ELBO
 from numpyro.optim import Adam
-from typing import Any, Callable, Mapping, Optional
 
 from .static_model import StaticModel
 
-__all__ = (
-    "model_svi",
-    "make_svi",
-    "run_window",
-)
-
 
 def model_svi(
-    x: jnp.ndarray,
-    a_obs: Optional[jnp.ndarray] = None,
+    x: Array,
+    a_obs: Array | None = None,
     *,
     # priors / noise
     sigma_lambda: float = 0.05,
@@ -26,23 +31,23 @@ def model_svi(
     # relative-error weighting in the acc loss
     lambda_rel: float = 0.1,
     parameter_dict: Mapping[str, tuple] | None = None,
-    analytic_form: Optional[Callable[[dict[str, dist.Distribution]], Any]] = None,
-    config: Optional[dict] = None,
+    analytic_form: Callable[[dict[str, dist.Distribution]], Any] | None = None,
+    config: dict | None = None,
     # optional orbit-energy penalty
-    orbit_q: Optional[jnp.ndarray] = None,
-    orbit_p: Optional[jnp.ndarray] = None,
+    orbit_q: Array | None = None,
+    orbit_p: Array | None = None,
     w_orbit: float = 1.0,
     std_weight: float = 1.0,
 ) -> None:
-    """
-    NumPyro model for SVI training of a Bayesian galactoPINNs static model.
+    """NumPyro model for SVI training of a Bayesian galactoPINNs static model.
 
     Parameters
     ----------
     x : array, shape (N, D)
         Scaled model inputs.
     a_obs : array, shape (N, 3), optional
-        Observed accelerations in the same space as the model output for the likelihood term.
+        Observed accelerations in the same space as the model output for the
+        likelihood term.
     sigma_lambda : float
         Prior std for neural network weights used by `random_flax_module`.
     sigma_a : float
@@ -52,11 +57,12 @@ def model_svi(
         Additional relative-error weighting term in the per-point loss:
             diff_norm + lambda_rel * (diff_norm / ||a_obs||)
     parameter_dict : mapping, optional
-        Dict mapping parameter name -> tuple of args for `dist.TruncatedNormal(*param_info)`.
+        Dict mapping parameter name -> tuple of args for
+        `dist.TruncatedNormal(*param_info)`.
         Used to define priors over analytic potential parameters.
     analytic_form : callable, optional
-        Function that takes `parameter_distributions` and returns an object compatible with
-        `StaticModel(trainable_analytic_layer=...)`.
+        Function that takes `parameter_distributions` and returns an object
+        compatible with `StaticModel(trainable_analytic_layer=...)`.
     config : dict
         Model configuration passed to `StaticModel(config=...)`.
     orbit_q : array, shape (B, T, 3), optional
@@ -73,6 +79,7 @@ def model_svi(
     -------
     None
         This is a NumPyro model; it records factors and deterministic sites.
+
     """
     if config is None:
         raise ValueError("model_svi requires `config` to be provided.")
@@ -119,9 +126,11 @@ def model_svi(
         # ----- Optional orbit energy loss -----
         if (orbit_q is not None) and (orbit_p is not None):
             if orbit_q.ndim != 3 or orbit_q.shape[-1] != 3:
-                raise ValueError(f"orbit_q must have shape (B, T, 3); got {orbit_q.shape}")
+                msg = f"orbit_q must have shape (B, T, 3); got {orbit_q.shape}"
+                raise ValueError(msg)
             if orbit_p.ndim != 3 or orbit_p.shape[-1] != 3:
-                raise ValueError(f"orbit_p must have shape (B, T, 3); got {orbit_p.shape}")
+                msg = f"orbit_p must have shape (B, T, 3); got {orbit_p.shape}"
+                raise ValueError(msg)
 
             B, T, _ = orbit_q.shape
 
@@ -133,7 +142,7 @@ def model_svi(
             phi_flat = bnn(q_flat)["potential"]  # (B*T,) or (B*T,1) depending on model
             phi = jnp.reshape(phi_flat, (B, T))
 
-            E = T_ke + phi           # (B, T)
+            E = T_ke + phi  # (B, T)
             dE = E[:, -1] - E[:, 0]  # (B,)
 
             # Energy fluctuation (trajectory-wise)
@@ -146,27 +155,28 @@ def model_svi(
 
 def make_svi(
     *,
-    guide,
+    guide: Callable[..., Any],
     sigma_lambda: float,
     sigma_a: float,
     lambda_rel: float,
     parameter_dict: Mapping[str, tuple] | None,
-    analytic_form: Optional[Callable[[dict[str, dist.Distribution]], Any]],
+    analytic_form: Callable[[dict[str, dist.Distribution]], Any] | None,
     config: dict,
-    orbit_q: Optional[jnp.ndarray] = None,
-    orbit_p: Optional[jnp.ndarray] = None,
+    orbit_q: Array | None = None,
+    orbit_p: Array | None = None,
     w_orbit: float = 1.0,
     std_weight: float = 1.0,
     lr: float = 5e-3,
 ) -> SVI:
-    """
-    Construct an SVI object with `model_svi` closed over configuration objects.
+    """Construct an SVI object with `model_svi` closed over configuration objects.
 
     Returns
     -------
     svi : numpyro.infer.SVI
+
     """
-    def _model(x, a_obs=None):
+
+    def _model(x: Array, a_obs: Array | None = None) -> Any:
         return model_svi(
             x,
             a_obs,
@@ -186,27 +196,26 @@ def make_svi(
 
 
 def run_window(
-    prev_result,
-    guide,
+    prev_result: Any,
+    guide: Callable[..., Any],
     *,
-    x_train,
-    a_train,
+    x_train: Array,
+    a_train: Array,
     steps: int = 1000,
     lr: float = 5e-3,
     sigma_lambda: float = 0.05,
     sigma_a: float = 2e-4,
     lambda_rel: float = 0.1,
     parameter_dict: Mapping[str, tuple] | None = None,
-    analytic_form: Optional[Callable[[dict[str, dist.Distribution]], Any]] = None,
-    config: Optional[dict] = None,
-    orbit_q: Optional[jnp.ndarray] = None,
-    orbit_p: Optional[jnp.ndarray] = None,
+    analytic_form: Callable[[dict[str, dist.Distribution]], Any] | None = None,
+    config: dict | None = None,
+    orbit_q: Array | None = None,
+    orbit_p: Array | None = None,
     w_orbit: float = 1.0,
     std_weight: float = 1.0,
-    rng_key=None,
-):
-    """
-    Run (or continue) SVI optimization.
+    rng_key: jr.PRNGKey | None = None,
+) -> Any:
+    """Run (or continue) SVI optimization.
 
     Parameters
     ----------
@@ -233,6 +242,7 @@ def run_window(
     -------
     result : numpyro.infer.SVIState
         Result of `svi.run`.
+
     """
     if config is None:
         raise ValueError("run_window requires `config` to be provided.")
