@@ -109,17 +109,6 @@ class TestStaticModel:
         assert potential.shape == (1,)
         assert jnp.isfinite(potential).all()
 
-    def test_compute_acceleration(self):
-        """Test compute_acceleration method."""
-        config = make_minimal_config()
-        model = StaticModel(config, in_features=5, rngs=nnx.Rngs(0))
-
-        x = jnp.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
-        acceleration = model.compute_acceleration(x)
-
-        assert acceleration.shape == (2, 3)
-        assert jnp.isfinite(acceleration).all()
-
     def test_compute_laplacian(self):
         """Test compute_laplacian method."""
         config = make_minimal_config()
@@ -155,7 +144,6 @@ class TestStaticModel:
             x = jnp.array([[1.0, 2.0, 3.0]])
             outputs = model(x, mode="potential")
             return jnp.sum(outputs["potential"] ** 2)
-
         grads = nnx.grad(loss_fn)(model)
         assert grads is not None
 

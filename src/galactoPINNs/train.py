@@ -3,7 +3,7 @@
 __all__ = (
     "alternate_training",
     "create_optimizer",
-    "train_model_state_node",
+    "train_model_node",
     "train_model_static",
     "train_model_with_trainable_analytic_layer",
     "train_step_node",
@@ -12,9 +12,8 @@ __all__ = (
 
 import logging
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
-import jax
 import jax.numpy as jnp
 import optax
 from flax import nnx
@@ -24,6 +23,16 @@ log = logging.getLogger(__name__)
 
 StaticTarget = Literal["acceleration", "orbit_energy", "mixed"]
 TrainStepFn = Callable[..., Array]
+
+# --- Typing for the analytic potential ---
+try:
+    from galax.potential import AbstractPotential as GalaxPotential
+except Exception:  # noqa: BLE001
+    # fallback: duck-typed "potential-like" object
+    class GalaxPotential(Protocol):
+        def potential(self,    positions: Any, *, t: Any = ...) -> Any: ...
+        def acceleration(self, positions: Any, *, t: Any = ...) -> Any: ...
+
 
 
 def create_optimizer(
@@ -67,7 +76,6 @@ def get_model_params(model: nnx.Module) -> dict[str, Any]:
 
 #############
 
-
 @nnx.jit(static_argnames=("target",))
 def train_step_static(
     model: nnx.Module,
@@ -75,6 +83,7 @@ def train_step_static(
     x: Array,
     a_true: Array,
     *,
+    analytic_potential: GalaxPotential | None = None,
     lambda_rel: float = 1.0,
     orbit_q: Array | None = None,
     orbit_p: Array | None = None,
@@ -89,11 +98,11 @@ def train_step_static(
     via the optimizer. The loss target is controlled by ``target``:
 
     - ``"acceleration"``: matches predicted accelerations to ``a_true`` at input
-      positions ``x``.
+    positions ``x``.
     - ``"orbit_energy"``: penalizes non-conservation of total specific energy
-      along pre-computed orbit trajectories.
+    along pre-computed orbit trajectories.
     - ``"mixed"``: uses a weighted sum of the orbit-energy loss and the
-      acceleration loss.
+    acceleration loss.
 
     Notes
     -----
@@ -103,7 +112,7 @@ def train_step_static(
         - ``"acceleration"`` when called as ``model(x)``
         - ``"potential"`` when called as ``model(q_flat, mode="potential")``
     - Orbit arrays ``orbit_q`` and ``orbit_p`` are expected to already be in the
-      model's scaled / nondimensional coordinates/velocities
+    model's scaled / nondimensional coordinates/velocities
 
     Parameters
     ----------
@@ -133,6 +142,8 @@ def train_step_static(
     target
         Loss configuration. One of:
         ``"acceleration"``, ``"orbit_energy"``, or ``"mixed"``.
+    analytic_potential
+        An optional analytic potential to be passed to the model during calls.
 
     Returns
     -------
@@ -146,137 +157,66 @@ def train_step_static(
 
     """
     if target in ("orbit_energy", "mixed") and (orbit_q is None or orbit_p is None):
-        msg = f"target='{target}' requires orbit_q and orbit_p (got None)."
-        raise ValueError(msg)
+        raise ValueError(f"target='{target}' requires orbit_q and orbit_p (got None).")
 
-    def acc_loss_fn(model: nnx.Module, lambda_rel_: float) -> Array:
-        """Acceleration loss with an absolute + relative magnitude term.
+    # Extract trainable and frozen parts of the model
+    graphdef, train_state, frozen_state = nnx.split(model, optimizer.wrt, ...)
 
-        Computes::
+    def loss_fn(train_state: nnx.State) -> Array:
+        # Reconstruct full model for forward pass
+        m = nnx.merge(graphdef, train_state, frozen_state)
 
-            mean( ||a_pred - a_true||
-                  + lambda_rel * ||a_pred - a_true|| / (||a_true|| + eps) )
-
-        Returns
-        -------
-        loss : Array
-            Scalar loss (shape ``()``).
-
-        """
-        out: dict[str, Array] = model(x)
+        # -------- acceleration loss --------
+        out: dict[str, Array] = m(x, analytic_potential=analytic_potential)
         a_pred = out["acceleration"]  # (N, 3)
 
         diff = a_pred - a_true
-        diff_norm = jnp.linalg.norm(diff, axis=1)  # (N,)
-        a_true_norm = jnp.linalg.norm(a_true, axis=1)  # (N,)
-
+        diff_norm = jnp.linalg.norm(diff, axis=1)       # (N,)
+        a_true_norm = jnp.linalg.norm(a_true, axis=1)   # (N,)
         eps = 1e-10
-        return jnp.mean(diff_norm + lambda_rel_ * (diff_norm / (a_true_norm + eps)))
+        acc_loss = jnp.mean(diff_norm + lambda_rel * (diff_norm / (a_true_norm + eps)))
 
-    def orbit_energy(
-        model: nnx.Module, orbit_q_scaled: Array, orbit_p_scaled: Array
-    ) -> Array:
-        """Compute predicted total specific energy along orbits.
+        if target == "acceleration":
+            return acc_loss
 
-        Energy is defined as:
-            E(t) = T(t) + Phi(q(t))
-        with:
-            T(t) = 0.5 * ||v(t)||^2
+        # -------- orbit-energy loss helpers --------
+        def orbit_energy(orbit_q_scaled: Array, orbit_p_scaled: Array) -> Array:
+            """E(t) = 0.5||v||^2 + Phi(q). Returns (B, T)."""
+            B, T, _ = orbit_q_scaled.shape
+            T_ke = 0.5 * jnp.sum(orbit_p_scaled**2, axis=-1)  # (B, T)
 
-        Parameters
-        ----------
-        model
-            The NNX model.
-        orbit_q_scaled
-            Orbit positions (scaled). Shape ``(B, T, 3)``.
-        orbit_p_scaled
-            Orbit velocities/momenta (scaled). Shape ``(B, T, 3)``.
+            q_flat = orbit_q_scaled.reshape(B * T, 3)  # (B*T, 3)
+            outp: dict[str, Array] = m(
+                q_flat, mode="potential", analytic_potential=analytic_potential
+            )
+            Phi_flat = outp["potential"]               # (B*T,)
+            Phi = Phi_flat.reshape(B, T)               # (B, T)
+            return T_ke + Phi
 
-        Returns
-        -------
-        E : Array
-            Total specific energy along each orbit. Shape ``(B, T)``.
+        def orbit_E_loss(orbit_q_scaled: Array, orbit_p_scaled: Array) -> Array:
+            """mean_b[ (E_T - E_0)^2 + std_weight * std_t(E - mean_t E)^2 ]."""
+            E = orbit_energy(orbit_q_scaled, orbit_p_scaled)  # (B, T)
+            delta_E = E[:, -1] - E[:, 0]                      # (B,)
 
-        """
-        B, T, _ = orbit_q_scaled.shape
-        T_ke = 0.5 * jnp.sum(orbit_p_scaled**2, axis=-1)  # (B, T)
+            E_centered = E - jnp.mean(E, axis=1, keepdims=True)
+            std_E = jnp.std(E_centered, axis=1)               # (B,)
 
-        q_flat = orbit_q_scaled.reshape(B * T, 3)  # (B*T, 3)
-        out: dict[str, Array] = model(q_flat, mode="potential")
-        Phi_flat = out["potential"]  # (B*T,)
-        Phi = Phi_flat.reshape(B, T)  # (B, T)
+            return jnp.mean(delta_E**2 + std_weight * std_E**2)
 
-        return T_ke + Phi
-
-    def orbit_E_loss(
-        model: nnx.Module,
-        orbit_q_scaled: Array,
-        orbit_p_scaled: Array,
-        std_weight_: float,
-    ) -> Array:
-        """Penalize energy non-conservation along each trajectory.
-
-        For each orbit b:
-            drift_b = E_b(T_end) - E_b(T_start)
-            std_b   = std_t (E_b(t) - mean_t E_b(t))
-
-        Loss:
-            mean_b [ drift_b^2 + std_weight * std_b^2 ]
-
-        Parameters
-        ----------
-        model
-            The NNX model.
-        orbit_q_scaled
-            Orbit positions. Shape ``(B, T, 3)``.
-        orbit_p_scaled
-            Orbit velocities/momenta. Shape ``(B, T, 3)``.
-        std_weight_
-            Weight on the within-orbit variance proxy term.
-
-        Returns
-        -------
-        loss : Array
-            Scalar loss (shape ``()``).
-
-        """
-        E = orbit_energy(model, orbit_q_scaled, orbit_p_scaled)  # (B, T)
-        delta_E = E[:, -1] - E[:, 0]  # (B,)
-
-        # Center each orbit's energy time series before computing std
-        E_centered = E - jnp.mean(E, axis=1, keepdims=True)
-        std_E = jnp.std(E_centered, axis=1)  # (B,)
-
-        return jnp.mean(delta_E**2 + std_weight_ * std_E**2)
-
-    def total_loss(model: nnx.Module) -> Array:
-        """Dispatch the total loss based on ``target``.
-
-        Returns
-        -------
-        loss : Array
-            Scalar loss (shape ``()``).
-
-        """
-        if target == "mixed":
-            assert orbit_q is not None
-            assert orbit_p is not None
-            return lambda_E * orbit_E_loss(
-                model, orbit_q, orbit_p, std_weight
-            ) + acc_loss_fn(model, lambda_rel)
+        # dispatch
+        assert orbit_q is not None
+        assert orbit_p is not None
+        E_loss = orbit_E_loss(orbit_q, orbit_p)
 
         if target == "orbit_energy":
-            assert orbit_q is not None
-            assert orbit_p is not None
-            return orbit_E_loss(model, orbit_q, orbit_p, std_weight)
+            return E_loss
 
-        # default: acceleration-only
-        return acc_loss_fn(model, lambda_rel)
+        # target == "mixed"
+        return acc_loss + lambda_E * E_loss
 
-    loss, grads = nnx.value_and_grad(total_loss)(model)
+    loss, grads = nnx.value_and_grad(loss_fn)(train_state)
     optimizer.update(model, grads)
     return loss
-
 
 @nnx.jit
 def train_step_node(
@@ -285,6 +225,7 @@ def train_step_node(
     tx_cart: Array,
     a_true: Array,
     *,
+    analytic_potential: GalaxPotential | None = None,
     lambda_rel: float = 1.0,
 ) -> Array:
     """Optimization step for NODE with acceleration training objective.
@@ -322,6 +263,8 @@ def train_step_node(
         Weight applied to the relative-error component of the loss. Larger
         values emphasize fractional error in regions where ``||a_true||`` is
         small.
+    analytic_potential
+        An optional analytic potential to be passed to the model during calls.
 
     Returns
     -------
@@ -344,7 +287,7 @@ def train_step_node(
             Scalar loss (shape ``()``).
 
         """
-        outputs: dict[str, Array] = model(tx_cart)
+        outputs: dict[str, Array] = model(tx_cart, analytic_potential=analytic_potential)
         a_pred = outputs["acceleration"]  # (N, 3)
 
         diff = a_pred - a_true
@@ -365,6 +308,7 @@ def train_model_static(
     x_train: Array,
     a_train: Array,
     num_epochs: int,
+    analytic_potential: GalaxPotential | None = None,
     *,
     target: StaticTarget = "acceleration",
     log_every: int = 100,
@@ -396,6 +340,8 @@ def train_model_static(
         True accelerations at ``x_train``, shape ``(N, 3)`` in scaled units.
     num_epochs
         Total number of epochs to train if ``train_dict`` is not provided.
+    analytic_potential
+        An optional analytic potential to be passed to the model during calls.
     target
         Default loss target when ``train_dict`` is not provided. One of
         ``"acceleration"``, ``"orbit_energy"``, or ``"mixed"``.
@@ -455,6 +401,7 @@ def train_model_static(
                 orbit_p=orbit_p,
                 lambda_E=lambda_E,
                 std_weight=std_weight,
+                analytic_potential = analytic_potential,
             )
             if log_every > 0 and (epoch % log_every == 0):
                 log.info("Epoch %d, Loss: %.6f", epoch + 1, float(loss))
@@ -465,13 +412,15 @@ def train_model_static(
     return {"model": model, "optimizer": optimizer, "epochs": epochs, "losses": losses}
 
 
-def train_model_state_node(
+def train_model_node(
     model: nnx.Module,
     optimizer: nnx.Optimizer,
     x_train: Array,
     a_train: Array,
     num_epochs: int,
+    analytic_potential: GalaxPotential | None = None,
     *,
+    lambda_rel: float = 1.0,
     log_every: int = 1000,
 ) -> dict[str, Any]:
     """Train a time-dependent model.
@@ -491,6 +440,10 @@ def train_model_state_node(
         Training accelerations.
     num_epochs
         The number of epochs to train for.
+    analytic_potential
+        An optional analytic potential to be passed to the model during calls.
+    lambda_rel
+        Weight for the relative-error term in the loss function.
     log_every
         The interval at which to log training progress.
 
@@ -504,7 +457,7 @@ def train_model_state_node(
     losses = []
 
     for epoch in range(num_epochs):
-        loss = train_step_node(model, optimizer, x_train, a_train)
+        loss = train_step_node(model, optimizer, x_train, a_train, lambda_rel = lambda_rel, analytic_potential = analytic_potential)
         if epoch % log_every == 0:
             log.info("Epoch %d, Loss: %.6f", epoch, loss)
         epochs.append(epoch)
@@ -606,93 +559,6 @@ def train_model_with_trainable_analytic_layer(
     }
 
 
-def initialize_staged_optimizers(
-    model: nnx.Module,
-    optimizer: optax.GradientTransformation,
-) -> tuple[optax.GradientTransformation, optax.GradientTransformation]:
-    """Create two Optax `multi_transform` optimizers for staged training.
-
-    This utility builds parameter partitions from a model's parameter
-    pytree and returns two optimizer transformations:
-
-    - `tx1` ("AB-only"): trains only parameters under the subtree whose path
-      contains `"trainable_analytic_layer"` and freezes all other parameters by
-      applying `optax.set_to_zero()` to their updates.
-
-    - `tx2` ("joint training"): trains all parameters (i.e., no freezing).
-
-    Parameters
-    ----------
-    model
-        NNX module (already initialized with parameters).
-    optimizer
-        The Optax optimizer to use for trainable parameters (e.g.,
-        `optax.adam(...)`).  Frozen parameters receive `optax.set_to_zero()`
-        regardless of this choice.
-
-    Returns
-    -------
-    tx1, tx2
-        A pair of Optax gradient transformations:
-
-        - `tx1`: multi-transform optimizer that trains only
-          `"trainable_analytic_layer"` params
-        - `tx2`: multi-transform optimizer that trains all params
-
-    Examples
-    --------
-    .. skip: start
-
-    >>> tx1, tx2 = initialize_staged_optimizers(model, optax.adam(1e-3))
-    >>> optimizer1 = create_optimizer(model, tx1)  # trains analytic only
-    >>> optimizer2 = create_optimizer(model, tx2)  # trains all
-
-    .. skip: end
-
-    """
-    # Get the parameter state and extract pure arrays for partition labels.
-    # nnx.Optimizer uses nnx.pure() internally, which extracts raw arrays from
-    # the State. The partition labels must match this pure array structure,
-    # not the State structure with nnx.Param wrappers.
-    param_state = nnx.state(model, nnx.Param)
-    # Extract the pure array structure that optax will see
-    pure_params = nnx.pure(param_state)
-
-    partition_optimizers: Mapping[str, optax.GradientTransformation] = {
-        "trainable": optimizer,
-        "frozen": optax.set_to_zero(),
-    }
-
-    # Build partition labels using tree_map_with_path to match pure array structure
-    def make_label_fn(train_path_substr: str | None) -> Callable[[Any, Any], str]:
-        """Create a labeling function for tree_map_with_path."""
-
-        def label_fn(path: Any, _: Any) -> str:
-            # Convert path elements to string for matching
-            path_str = "/".join(
-                str(p.key) if hasattr(p, "key") else str(p) for p in path
-            )
-            if train_path_substr is None or train_path_substr in path_str:
-                return "trainable"
-            return "frozen"
-
-        return label_fn
-
-    # Stage 1: train only trainable_analytic_layer (use pure_params for structure)
-    param_partitions_AB_only = jax.tree_util.tree_map_with_path(
-        make_label_fn("trainable_analytic_layer"), pure_params
-    )
-
-    # Stage 2: train all parameters
-    param_partitions_joint = jax.tree_util.tree_map_with_path(
-        make_label_fn(None), pure_params
-    )
-
-    tx1 = optax.multi_transform(partition_optimizers, param_partitions_AB_only)
-    tx2 = optax.multi_transform(partition_optimizers, param_partitions_joint)
-    return tx1, tx2
-
-
 def alternate_training(
     train_step: TrainStepFn,
     x_train: Array,
@@ -702,8 +568,8 @@ def alternate_training(
     num_epochs_stage2: int,
     cycles: int,
     param_list: Sequence[str],
-    tx_1: optax.GradientTransformation,
-    tx_2: optax.GradientTransformation,
+    optimizer1: nnx.Optimizer,
+    optimizer2: nnx.Optimizer,
     *,
     log_every: int = 1000,
     lambda_rel: float = 1.0,
@@ -748,10 +614,10 @@ def alternate_training(
     param_list
         Names of parameters inside the trainable_analytic_layer to
         record into history.  Each entry is treated as a key into the params dict.
-    tx_1
-        Optax optimizer used in Stage 1 (analytic-focused phase).
-    tx_2
-        Optax optimizer used in Stage 2 (NN-focused phase).
+    optimizer1
+        NNX optimizer for Stage 1 (trainable_analytic_layer only).
+    optimizer2
+        NNX optimizer for Stage 2 (all parameters).
     log_every
         Interval (in epochs) at which to log training progress.
     lambda_rel
@@ -800,8 +666,6 @@ def alternate_training(
     for cycle in range(cycles):
         # === Stage 1 ===
         log.info("=== Starting Cycle %d / %d: Stage 1 ===", cycle + 1, cycles)
-
-        optimizer1 = create_optimizer(model, tx_1)
         output1 = train_model_with_trainable_analytic_layer(
             model,
             optimizer1,
@@ -827,7 +691,6 @@ def alternate_training(
         # === Stage 2 ===
         log.info("=== Starting Cycle %d / %d: Stage 2 ===", cycle + 1, cycles)
 
-        optimizer2 = create_optimizer(model, tx_2)
         output2 = train_model_with_trainable_analytic_layer(
             model,
             optimizer2,

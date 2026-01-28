@@ -9,8 +9,8 @@ __all__ = (
     # sampling
     "biased_sphere_samples",
     # datasets
-    "generate_static_datadict",
-    "generate_time_dep_datadict",
+    "generate_static_data",
+    "generate_time_dep_data",
     "rejection_sample_sphere",
     "scale_data",
     "scale_data_time",
@@ -355,7 +355,6 @@ def rejection_sample_sphere(
         accepted_mask = inside & (u_all < p)
 
         # Count accepted and write to buffer using dynamic_update_slice
-        # We need to handle variable-length accepted samples
         # Use a scatter approach: write accepted samples to contiguous slots
         accepted_indices = jnp.where(accepted_mask, size=batch_size, fill_value=-1)[0]
         n_accepted = jnp.sum(accepted_mask)
@@ -385,7 +384,7 @@ def rejection_sample_sphere(
 # -------------------------
 
 
-def generate_static_datadict(
+def generate_static_data(
     galax_potential: Any,
     n_samples_train: int,
     n_samples_test: int,
@@ -593,7 +592,7 @@ def generate_static_datadict(
     }
 
 
-def generate_time_dep_datadict(
+def generate_time_dep_data(
     galax_potential: Any,
     times_train: Sequence[float],
     times_test: Sequence[float],
@@ -1200,6 +1199,57 @@ def scale_data_time(
 # -------------------------
 # Misc helpers
 # -------------------------
+
+def flatten_time_dict_by_time(
+    data_dict: dict[str, dict[float, dict[str, Array]]], split: str = "train"
+) -> tuple[Array, Array]:
+    """Flatten a time-keyed dictionary into concatenated arrays.
+
+    This function is a utility for handling the output of
+    `generate_time_dep_data`. It takes the nested dictionary structure and
+    combines all time-sliced data from a given split (e.g., "train") into
+    two large arrays for positions and accelerations.
+
+    Parameters
+    ----------
+    data_dict : dict
+        A nested dictionary, typically from `generate_time_dep_data`, with the
+        structure: `{"train": {t0: {"x": ..., "a": ...}, ...}, "val": ...}`.
+    split : str, optional
+        The top-level key to select from `data_dict`, by default "train".
+
+    Returns
+    -------
+    tuple[Array, Array]
+        A tuple containing:
+        - A single array of all concatenated positions, shape (N_total, D).
+        - A single array of all concatenated accelerations, shape (N_total, D).
+
+    Examples
+    --------
+    >>> import jax.numpy as jnp
+    >>> data = {
+    ...     "train": {
+    ...         0.0: {"x": jnp.ones((2, 3)), "a": jnp.ones((2, 3))},
+    ...         1.0: {"x": jnp.zeros((3, 3)), "a": jnp.zeros((3, 3))},
+    ...     }
+    ... }
+    >>> x_flat, a_flat = flatten_time_dict_by_time(data, split="train")
+    >>> x_flat.shape
+    (5, 3)
+    >>> a_flat.shape
+    (5, 3)
+
+    """
+    time_batches = []
+
+    for t, d in data_dict[split].items():
+        x_t = d["x"]
+        a_t = d["a"]
+        time_batches.append((x_t, a_t))
+    x_train = jnp.concatenate([time_batches[i][0] for i in range(len(time_batches))], axis=0)
+    a_train = jnp.concatenate([time_batches[i][1] for i in range(len(time_batches))], axis=0)
+    return x_train, a_train
 
 
 def acc_cart_to_cyl_like(a: Array) -> Array:

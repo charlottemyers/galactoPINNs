@@ -1,7 +1,7 @@
 """Neural network layers for physics-informed models."""
 
 __all__ = (
-    "AnalyticModelLayer",
+    #"AnalyticModelLayer",
     "CartesianToModifiedSphericalLayer",
     "FuseModelsLayer",
     "FuseandBoundary",
@@ -12,7 +12,7 @@ __all__ = (
 
 import functools as ft
 from collections.abc import Callable, Mapping
-from typing import Any, Literal, Protocol, TypeAlias, cast
+from typing import Any, Protocol, TypeAlias, cast
 
 import jax
 import jax.numpy as jnp
@@ -52,20 +52,6 @@ class _GalaxPotential(Protocol):
     """Protocol for instantiated Galax potentials used here."""
 
     def potential(self, positions: Any, *, t: Any = ...) -> Any: ...
-
-
-class _Transformer(Protocol):
-    """Minimal protocol for (inverse_)transformers used in analytic layer."""
-
-    def transform(self, x: Any) -> Any: ...
-    def inverse_transform(self, x: Any) -> Any: ...
-
-
-class _AnalyticPotential(Protocol):
-    """Minimal protocol for an analytic potential used here."""
-
-    def potential(self, positions: Any, *, t: Any = ...) -> Any: ...
-
 
 ScaleSpec = str | _HasPotential
 
@@ -169,6 +155,8 @@ class SmoothMLP(nnx.Module):
 
     """
 
+    hidden_layers: nnx.List
+
     def __init__(
         self,
         in_features: int,
@@ -183,7 +171,6 @@ class SmoothMLP(nnx.Module):
         self.depth = depth
         self.act = act
 
-        # Build the hidden layers using nnx.List for proper pytree handling
         layers = []
         current_in = in_features
         for _ in range(depth):
@@ -331,7 +318,7 @@ class ScaleNNPotentialLayer(nnx.Module):
 
     def __init__(self, config: Mapping[str, Any]) -> None:
         """Initialize the scaling layer with configuration."""
-        self.config = nnx.data(config)
+        self.config = config
         self._scale_fn = self._build_scale_fn(config)
 
     def _build_scale_fn(
@@ -568,109 +555,6 @@ class TrainableGalaxPotential(nnx.Module):
         return phi, r_s_out
 
 
-class AnalyticModelLayer(nnx.Module):
-    """Evaluate an analytic (baseline) potential inside an NNX model.
-
-    Operates in scaled space.
-
-    Modes
-    -----
-    static
-        Input is scaled Cartesian position(s) ``x_cart`` with shape ``(3,)``
-        or ``(N, 3)``. Time is taken from ``config["time"]`` if present,
-        otherwise ``0.0``.
-
-    time
-        Input is scaled concatenated ``tx_cart`` with shape ``(4,)`` or ``(N, 4)``,
-        interpreted as ``[t_scaled, x_scaled, y_scaled, z_scaled]``.
-        The physical time is obtained via ``config["t_transformer"].inverse_transform``.
-
-    Parameters
-    ----------
-    config
-        Configuration mapping. Required keys:
-
-        - ``x_transformer``: object with ``inverse_transform`` for positions
-        - ``u_transformer``: object with ``transform`` for potentials
-        - ``ab_potential``: object with method ``potential(positions, t=...)``
-
-        Additional keys by mode:
-        - static: optional ``time`` (float-like), default 0.0
-        - time: required ``t_transformer`` with ``inverse_transform``
-
-    mode
-        Either ``"static"`` or ``"time"``. Defaults to ``"static"``.
-
-    """
-
-    def __init__(
-        self, config: Mapping[str, Any], mode: Literal["static", "time"] = "static"
-    ) -> None:
-        """Initialize the analytic layer with configuration and mode."""
-        self.config = nnx.data(config)
-        self.mode = mode
-
-    def __call__(self, inp: Array) -> Any:
-        """Evaluate the analytic potential in scaled coordinates.
-
-        Parameters
-        ----------
-        inp
-            Scaled inputs. Shape ``(3,)`` or ``(N, 3)`` for static mode;
-            ``(4,)`` or ``(N, 4)`` for time mode.
-
-        Returns
-        -------
-        u_scaled
-            Analytic potential in scaled units, shape ``(N,)``.
-
-        """
-        # Ensure batched
-        if inp.ndim == 1:
-            inp = inp[None, :]
-
-        x_transformer = cast("_Transformer", self.config["x_transformer"])
-        u_transformer = cast("_Transformer", self.config["u_transformer"])
-        analytic = cast("_AnalyticPotential", self.config["ab_potential"])
-
-        if self.mode == "static":
-            # inp: (N,3) in scaled coords
-            x_cart: Array = inp
-            positions = x_transformer.inverse_transform(x_cart)  # physical positions
-            t = self.config.get("time", 0.0)
-
-            # Evaluate potential (try batched; fallback to per-sample).
-            def pot_one(pos: Any) -> Any:
-                return analytic.potential(pos, t=t)
-
-            try:
-                dimensional_potential = analytic.potential(positions, t=t)
-            except Exception:  # noqa: BLE001
-                dimensional_potential = jax.vmap(pot_one)(positions)
-
-            return u_transformer.transform(dimensional_potential)
-
-        if self.mode == "time":
-            # input: (N,4) = [t, x, y, z] in scaled coords
-            t_scaled: Array = inp[:, 0]
-            x_cart: Array = inp[:, 1:4]
-
-            t_transformer = cast("_Transformer", self.config["t_transformer"])
-            t_phys = t_transformer.inverse_transform(t_scaled)  # (N,)
-
-            positions = x_transformer.inverse_transform(x_cart)  # (N,3)
-
-            # Evaluate per sample: potential(pos_i, t_i)
-            def pot_one(pos: Any, tt: Any) -> Any:
-                return analytic.potential(pos, t=tt)
-
-            dimensional_potential = jax.vmap(pot_one)(positions, t_phys)
-            return u_transformer.transform(dimensional_potential)
-
-        msg = f"Unknown mode={self.mode!r}. Use 'static' or 'time'."
-        raise ValueError(msg)
-
-
 class FuseModelsLayer(nnx.Module):
     """A simple layer that fuses an NN and an analytic potential by addition.
 
@@ -720,35 +604,22 @@ class FuseandBoundary(nnx.Module):
     config
         Configuration mapping. Expected keys:
 
-        Required
-        --------
-        x_transformer
-            Transformer that maps between scaled and physical coordinates.
-            Must implement ``inverse_transform(positions)``.
+        Required:
+        - x_transformer: Transformer that maps between scaled and physical
+          coordinates. Must implement ``inverse_transform(positions)``.
 
-        Optional (tanh blend)
-        ---------------------
-        r_trans
-            Transition radius (in physical coordinate units).
-            Default 200.
-        k_smooth
-            Steepness of the tanh transition. Default 0.5 (when not trainable).
-        train_k
-            If True, make k_smooth trainable via ``exp(log_k)``. Default False.
-        min_k
-            Lower bound for k_smooth when trainable. Default 0.01.
+        Optional (tanh blend):
+        - r_trans: Transition radius (in physical units). Default 200.
+        - k_smooth: Steepness of the tanh transition. Default 0.5.
+        - train_k: If True, make k_smooth trainable. Default False.
+        - min_k: Lower bound for k_smooth when trainable. Default 0.01.
 
-        Optional (power-law blend)
-        --------------------------
-        radial_power
-            If provided (not None), uses the power-law blend instead of tanh.
-        r_smooth
-            Smoothing radius for the power-law blend. Default 150.0.
+        Optional (power-law blend):
+        - radial_power: If provided, uses the power-law blend instead of tanh.
+        - r_smooth: Smoothing radius for the power-law blend. Default 150.0.
 
-        Optional (both)
-        ---------------
-        saturation
-            Asymptotic value of h(r) as r -> infinity. Default 1.0.
+        Optional (both):
+        - saturation: Asymptotic value of h(r) as r -> infinity. Default 1.0.
 
     rngs
         Random number generator state (unused but kept for API consistency).
@@ -762,7 +633,7 @@ class FuseandBoundary(nnx.Module):
         rngs: nnx.Rngs | None = None,  # noqa: ARG002
     ) -> None:
         """Initialize blending parameters from config."""
-        self.config = nnx.data(config)
+        self.config = config
         self.log_k: float = float(config.get("k_smooth", 1.0))
         self.r_trans: float = float(config.get("r_trans", 200.0))
 
@@ -781,7 +652,23 @@ class FuseandBoundary(nnx.Module):
     def __call__(
         self, positions: Array, u_nn: Array, u_analytic: Array
     ) -> dict[str, Array]:
-        """Fuse NN and analytic potentials with a smooth radial transition."""
+        """Fuse NN and analytic potentials with a smooth radial transition.
+
+        Parameters
+        ----------
+        positions
+            Scaled Cartesian positions, shape ``(N, 3)`` or ``(3,)``.
+        u_nn
+            Neural network potential component (scaled).
+        u_analytic
+            Analytic potential component (scaled).
+
+        Returns
+        -------
+        Array
+            The fused potential (scaled).
+
+        """
         x_transformer = self.config["x_transformer"]
         dimensional_positions: Array = x_transformer.inverse_transform(positions)
 
@@ -810,5 +697,4 @@ class FuseandBoundary(nnx.Module):
         g = 1.0 - h
 
         # Blend NN output and analytic function
-        u_model = g * u_nn + u_analytic
-        return {"fused_potential": u_model, "h": h, "g": g}
+        return g * u_nn + u_analytic

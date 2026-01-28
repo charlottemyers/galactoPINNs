@@ -9,7 +9,7 @@ __all__ = (
 )
 
 from collections.abc import Callable
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 import diffrax as dfx
 import jax
@@ -18,12 +18,20 @@ from flax import nnx
 from jaxtyping import Array
 
 from galactoPINNs.layers import (
-    AnalyticModelLayer,
     CartesianToModifiedSphericalLayer,
+    FuseandBoundary,
     FuseModelsLayer,
     ScaleNNPotentialLayer,
     SmoothMLP,
 )
+
+# --- Typing for the analytic potential ---
+try:
+    from galax.potential import AbstractPotential as GalaxPotential
+except Exception:  # noqa: BLE001
+    class GalaxPotential(Protocol):
+        def potential(self,    positions: Any, *, t: Any = ...) -> Any: ...
+        def acceleration(self, positions: Any, *, t: Any = ...) -> Any: ...
 
 # ----------------------------
 # Delta-phi integration helpers
@@ -275,7 +283,7 @@ class NODEModel(nnx.Module):
           - plus transformer and analytic-function keys used by ScaleNNPotentialLayer
             and AnalyticModelLayer.
     in_features
-        The number of spatial input features. Typically 3 for spherical coordinates.
+        The number of spatial input features. Typically 5 for modified spherical coordinates.
         The delta_phi network takes (in_features + 1) features for [t, sph_features...].
     rngs
         Random number generator state for parameter initialization.
@@ -288,10 +296,10 @@ class NODEModel(nnx.Module):
     """
 
     def __init__(
-        self, config: dict[str, Any], in_features: int = 3, *, rngs: nnx.Rngs
+        self, config: dict[str, Any], in_features: int = 5, *, rngs: nnx.Rngs
     ) -> None:
         """Initialize the NODEModel layers."""
-        self.config = nnx.data(config)
+        self.config = config
 
         act = config.get("activation")
 
@@ -328,7 +336,7 @@ class NODEModel(nnx.Module):
         )
         self.scale_layer = ScaleNNPotentialLayer(config=config)
         self.fuse_layer = FuseModelsLayer()
-        self.analytic_layer = AnalyticModelLayer(config=config, mode="time")
+        self.fuse_boundary_layer = FuseandBoundary(config=config)
 
     def compute_potential(self, tx_cart: Array) -> Array:
         """Compute the potential.
@@ -345,36 +353,9 @@ class NODEModel(nnx.Module):
         """
         return self(tx_cart, mode="potential")["potential"]
 
-    def compute_acceleration(self, tx_cart: Array) -> Array:
-        """Compute acceleration as -grad(Phi) by differentiating the model potential.
-
-        The gradient is taken w.r.t. the full input [t, x, y, z], then the
-        spatial components (x, y, z) are returned and the time derivative is
-        discarded.
-
-        Parameters
-        ----------
-        tx_cart
-            Time+position input array with shape ``(N, 4)`` or ``(4,)``.
-            Columns are ``[t, x, y, z]``.
-
-        Returns
-        -------
-        acceleration : array, shape (N, 3)
-            Acceleration vectors computed as ``-grad(Phi)``.
-
-        """
-        tx_cart = jnp.atleast_2d(tx_cart)
-
-        def potential_fn(single_tx: Array) -> Array:
-            return self.compute_potential(single_tx).squeeze()
-
-        grad_fn = jax.vmap(jax.grad(potential_fn))
-        grad_tx = grad_fn(tx_cart)  # (N, 4)
-        return (-grad_tx)[:, 1:4]  # (N, 3)
-
     def __call__(
-        self, tx_cart: Array, mode: Literal["full", "potential"] = "full"
+        self, tx_cart: Array, mode: Literal["full", "potential"] = "full",
+        analytic_potential: GalaxPotential | None = None,
     ) -> dict[str, Any]:
         """Forward pass.
 
@@ -382,8 +363,13 @@ class NODEModel(nnx.Module):
         ----------
         tx_cart : array, shape (N, 4) or (4,)
             Time+position input: [t, x, y, z].
-        mode : {"full", "potential"}
-            If "potential", returns {"potential": ...} only.
+        mode
+            If "potential", returns ``{"potential": ...}`` only.
+            If "full", computes and returns potential and acceleration.
+        analytic_potential : galax.potential.AbstractPotential, optional
+            An external, non-trainable analytic potential object. This is only
+            used if ``config["include_analytic"]`` is True.
+
 
         Returns
         -------
@@ -443,23 +429,47 @@ class NODEModel(nnx.Module):
         outputs["scale_nn_potential"] = scaled_potential
 
         # Analytic potential term
-        analytic_potential = self.analytic_layer(tx_cart)
-        outputs["analytic_model_layer"] = analytic_potential
+        analytic_potential_scaled = 0.0
+        if self.config.get("include_analytic", False) and analytic_potential is not None:
+            # 1. Evaluate the external analytic potential in physical units
+            x_phys = self.config["x_transformer"].inverse_transform(x_cart)
+            u_phys = analytic_potential.potential(x_phys, t= t)
+
+            # 2. Transform to scaled units
+            analytic_potential_scaled = self.config["u_transformer"].transform(
+                    u_phys
+                )
 
         # Fuse (NN + analytic)
-        fused_potential = self.fuse_layer(scaled_potential, analytic_potential)
+        fused_potential = self.fuse_layer(scaled_potential, analytic_potential_scaled)
         outputs["fuse_models"] = fused_potential
 
         # Choose final output
-        include_analytic = self.config.get("include_analytic", True)
-        potential = fused_potential if include_analytic else scaled_potential
+        fuse_boundary_potential = self.fuse_boundary_layer(x_cart, scaled_potential, analytic_potential_scaled)
+
+        if self.config.get("analytic_only", False):
+            potential = analytic_potential_scaled
+        elif self.config.get("enforce_boundary", False):
+            potential = fuse_boundary_potential
+        elif self.config.get("include_analytic", True):
+            potential = fused_potential
+        else:
+            potential = scaled_potential
+
         outputs["final"] = potential
 
         if mode == "potential":
             return {"potential": potential}
 
-        # Acceleration via gradient
-        acceleration = self.compute_acceleration(tx_cart)
+        def potential_for_grad(tx_arg: Array) -> Array:
+            return self(
+                tx_arg, mode="potential", analytic_potential=analytic_potential
+            )["potential"].squeeze()
+
+        # The gradient is taken w.r.t. the full input [t, x, y, z].
+        grad_tx = jax.vmap(jax.grad(potential_for_grad))(tx_cart)  # (N, 4)
+        # Return the spatial components (x, y, z) and discard the time derivative.
+        acceleration = (-grad_tx)[:, 1:4]
 
         return {
             "acceleration": acceleration,

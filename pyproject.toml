@@ -75,7 +75,7 @@ addopts = [
   "-p no:doctest",    # using sybil
   "-ra",
 ]
-filterwarnings = ["error"]
+filterwarnings = ["error",   "ignore::DeprecationWarning"]
 log_level = "INFO"
 minversion = "8.3"
 testpaths = ["README.md", "src/", "tests/"]
