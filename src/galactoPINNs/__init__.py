@@ -12,4 +12,9 @@ except PackageNotFoundError:
 
 __all__ = ["__version__"]
 
-from ._version import __version__
+from importlib.metadata import version, PackageNotFoundError
+
+try:
+    __version__ = version("galactoPINNs")
+except PackageNotFoundError:
+    __version__ = "0+unknown"

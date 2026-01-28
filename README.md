@@ -33,14 +33,14 @@ pip install git+https://github.com/charlottemyers/galactoPINNs.git
 ## Basic Usage
 
 Training data consists of positions and accelerations, which may be provided
-externally or generated from a known analytic potential (e.g. using galax):
+externally or generated from a known analytic potential (e.g. using Galax):
 
 ```python
-from galactoPINNs.data import generate_static_datadict
+from galactoPINNs.data import generate_static_data
 import galax.potential as gp
 
 true_potential = gp.MilkyWayPotential()
-raw_datadict = generate_static_datadict(
+raw_datadict = generate_static_data(
     galax_potential=true_potential,
     n_samples_train=2048,
     n_samples_test=4096,
@@ -56,6 +56,7 @@ non-dimensionalize the training data into scaled model space:
 
 ```python
 from galactoPINNs.data import scale_data
+import galax.potential as gp
 
 halo_rs = 15.62
 analytic_baseline_potential = gp.NFWPotential(m=5.4e11, r_s=halo_rs, units="galactic")
@@ -75,7 +76,6 @@ train_config = {
     "a_transformer": transformers["a"],
     "u_transformer": transformers["u"],
     "r_s": halo_rs,
-    "ab_potential": analytic_baseline_potential,
     "include_analytic": True,
     "scale": "nfw",
     "depth": 6,
@@ -89,15 +89,15 @@ from galactoPINNs.models.static_model import StaticModel
 from galactoPINNs.train import train_model_static
 import optax
 import jax.random as jr
+from flax import nnx
 
-net = StaticModel(train_config)
+net = StaticModel(train_config,rngs=nnx.Rngs(0))
 x_train = scaled_data["x_train"]
 a_train = scaled_data["a_train"]
 
-
-optimizer = optax.adam(1e-3)
+tx = optax.adam(1e-3)
 rng = jr.PRNGKey(0)
-train_output = train_model_static(net, optimizer, x_train, a_train, num_epochs=10)
+train_output = train_model_static(net, tx, x_train, a_train, 2000, analytic_potential=analytic_baseline_potential)
 ```
 
 Use the provided evaluation features to assess the acceleration and potential
@@ -111,13 +111,14 @@ import unxt as u
 import galax.dynamics as gd
 from galax.coordinates import PhaseSpacePosition
 import jax.numpy as np
+import jax.numpy as jnp
 
-learned_potential = make_galax_potential(net, train_output["state"].params)
+learned_galax_potential = make_galax_potential(model=train_output["model"])
 
-# compute the predicted potential and acceleration
+# compute the predicted potential
 test_points = raw_datadict["x_val"]
-learned_potential = learned_potential.potential(test_points, t=0)
-learned_acceleration = learned_potential.acceleration(test_points, t=0)
+learned_potential = learned_galax_potential.potential(test_points, t=0)
+learned_acceleration = learned_galax_potential.acceleration(test_points, t=0)
 
 # integrate orbits in the learned potential
 w0 = PhaseSpacePosition(
@@ -127,5 +128,5 @@ w0 = PhaseSpacePosition(
 
 ts = u.Quantity(jnp.linspace(0, 500.0, 500), "Myr")
 
-learned_orbit = gd.evaluate_orbit(learned_potential, w0, ts)
+learned_orbit = gd.evaluate_orbit(learned_galax_potential, w0, ts)
 ```

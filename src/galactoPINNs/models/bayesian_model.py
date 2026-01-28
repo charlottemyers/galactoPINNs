@@ -1,4 +1,4 @@
-"""Bayesian neural network model implementations."""
+"""Bayesian neural network model implementation."""
 
 __all__ = (
     "make_svi",

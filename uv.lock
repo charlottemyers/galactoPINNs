@@ -749,6 +749,7 @@ wheels = [
 
 [[package]]
 name = "galactopinns"
+version = "0.1.dev16"
 source = { editable = "." }
 dependencies = [
     { name = "astropy" },

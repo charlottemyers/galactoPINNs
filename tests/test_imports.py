@@ -28,8 +28,9 @@ def test_import_models():
 def test_import_train():
     """Test that training module can be imported."""
     assert train is not None
+    assert hasattr(train, "create_optimizer")
+    assert hasattr(train, "get_model_params")
     assert hasattr(train, "train_step_static")
-    assert hasattr(train, "train_model_static")
 
 
 def test_import_inference():

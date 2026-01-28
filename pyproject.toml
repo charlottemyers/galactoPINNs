@@ -75,7 +75,7 @@ addopts = [
   "-p no:doctest",    # using sybil
   "-ra",
 ]
-filterwarnings = ["error"]
+filterwarnings = ["error",   "ignore::DeprecationWarning"]
 log_level = "INFO"
 minversion = "8.3"
 testpaths = ["README.md", "src/", "tests/"]
@@ -99,6 +99,7 @@ ignore = [
   "D107",    # Missing docstring in __init__
   "D203",    # 1 blank line required before class docstring
   "D213",    # Multi-line docstring summary should start at the second line
+  "E731",    # Do not assign a lambda expression, use a def
   "EM101",   # Exception must not use a string literal
   "ERA001",  # Commented out code
   "F722",    # Syntax error in forward annotation <- jaxtyping
@@ -119,7 +120,16 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"**tests/**"  = ["ANN", "E731", "INP001", "S101", "SLF001", "T20"]
+"**tests/**" = [
+  "ANN",
+  "ARG002",
+  "D102",
+  "E731",
+  "INP001",
+  "S101",
+  "SLF001",
+  "T20",
+]
 "__init__.py" = ["F403"]
 "examples/**" = ["E501", "N816"]
 

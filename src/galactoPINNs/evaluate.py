@@ -18,9 +18,10 @@ from .inference import apply_model
 
 def evaluate_performance(
     model: Any,
-    trained_state_params: Any,
     raw_datadict: Mapping[str, Any],
     num_test: int,
+    *,
+    analytic_baseline: Any | None = None,
 ) -> dict[str, Any]:
     """Evaluate a static model on a validation set and compute error metrics.
 
@@ -35,12 +36,9 @@ def evaluate_performance(
 
     Parameters
     ----------
-    model : flax.linen.Module
-        A trained static model object with attribute `config`.
-        The model is expected to support
-        `model.apply({"params": params}, x_scaled)` via `apply_model`.
-    trained_state_params : Any
-        Parameters tree (e.g., `TrainState.params`) used for `model.apply`.
+    model : flax.nnx.Module
+        A trained static NNX model object with attribute `config`.
+        The model is called directly via `model(x_scaled)`.
     raw_datadict : dict
         Dictionary containing (at min.) the following keys:
         - "x_val": array-like, shape (N, 3), physical validation positions
@@ -48,6 +46,9 @@ def evaluate_performance(
         - "a_val": array-like, shape (N, 3), physical true acceleration
     num_test : int
         Number of validation samples to evaluate (uses the first `num_test` rows).
+    analytic_baseline : galax.potential.AbstractPotential, optional
+        An optional analytic potential to use for baseline error calculations.
+
 
     Required config keys (model.config)
     -----------------------------------
@@ -57,8 +58,6 @@ def evaluate_performance(
     Optional:
     - "include_analytic" (bool): whether to compute analytic baseline errors
       (default True)
-    - "ab_potential": analytic potential object with
-      .potential(x, t=...) and .acceleration(x, t=...)
 
     Returns
     -------
@@ -85,7 +84,7 @@ def evaluate_performance(
     config = model.config
     r_eval = jnp.linalg.norm(raw_datadict["x_val"][:num_test], axis=1)
     scaled_x_val = config["x_transformer"].transform(raw_datadict["x_val"][:num_test])
-    output = apply_model(model, trained_state_params, scaled_x_val)
+    output = apply_model(model, scaled_x_val, analytic_potential = analytic_baseline)
     predicted_pot = config["u_transformer"].inverse_transform(output["u_pred"])
     predicted_acc = config["a_transformer"].inverse_transform(output["a_pred"])
     acc_percent_error = (
@@ -100,8 +99,7 @@ def evaluate_performance(
     fiducial_acc_error = None
     fiducial_pot_error = None
 
-    if config.get("include_analytic", True):
-        analytic_baseline = config["ab_potential"]
+    if analytic_baseline is not None:
         analytic_baseline_potential = analytic_baseline.potential(
             raw_datadict["x_val"][:num_test], t=0
         )
@@ -157,10 +155,11 @@ def evaluate_performance(
 
 def evaluate_performance_node(
     model: Any,
-    params: Any,
     t_eval: float | Any,
     raw_datadict: Mapping[str, Any],
     num_test: int,
+    *,
+    analytic_baseline: Any | None = None,
 ) -> dict[str, Any]:
     """Evaluate a time-dependent model at a single evaluation time.
 
@@ -172,55 +171,24 @@ def evaluate_performance_node(
 
     Parameters
     ----------
-    model : flax.linen.Module (or compatible)
-        A time-dependent model with attribute `config`. The model is expected to accept
-        a scaled input of shape (N, 1+3) = (N, 4): [t_scaled, x_scaled...].
-    params : Any
-        Parameters tree used for `model.apply`.
-    t_eval : float or int (or time key type)
-        The evaluation time. Used both to select `raw_datadict["val"][t_eval]`
-        and to build the time input feature.
-        Important: this must match the dictionary key exactly if keys are not
-        floats.
+    model : _NNXModelLike
+        A time-dependent NNX model with attribute `config`.
+    t_eval : float or int
+        The evaluation time, used as a key for `raw_datadict["val"]`.
     raw_datadict : dict
-        Must contain `raw_datadict["val"]` mapping times -> per-time validation
-        dict, where each per-time dict contains:
-        - "x": shape (N, 3) physical positions
-        - "u": shape (N,) physical true potential at that time
-        - "a": shape (N, 3) physical true acceleration at that time
+        A nested dictionary mapping split -> time -> data arrays.
     num_test : int
-        Number of validation samples to evaluate from that time slice.
-
-    Required config keys (model.config)
-    -----------------------------------
-    - "x_transformer": .transform / .inverse_transform
-    - "u_transformer": .transform / .inverse_transform
-    - "a_transformer": .transform / .inverse_transform
-    - "t_transformer": .transform / .inverse_transform
-    Optional:
-    - "include_analytic" (bool): whether to compute analytic baseline errors
-      (default True)
-    - "ab_potential": analytic potential object with
-      .potential(x, t=...) and .acceleration(x, t=...)
+        Number of validation samples to evaluate from the `t_eval` time slice.
+    analytic_baseline : galax.potential.AbstractPotential, optional
+        An optional analytic potential for baseline error calculations and to
+        pass to the model's forward pass.
 
     Returns
     -------
     results : dict
-        Includes:
-        - "r_eval": radii of evaluation points, shape (num_test,)
-        - "true_u", "predicted_u": physical potentials, shape (num_test,)
-        - "true_a", "predicted_a": physical accelerations, shape (num_test, 3)
-        - "pot_percent_error", "acc_percent_error": percent errors, shape (num_test,)
-        - "true_a_norm", "predicted_a_norm": norms of acceleration vectors,
-          shape (num_test, 1)
-        If analytic baseline is enabled:
-        - "analytic_baseline": analytic baseline potential at t_eval
-        - "analytic_baseline_0": analytic baseline potential at t=0 (same x)
-        - "ab_pot_error": baseline potential percent error at t_eval
-        - "ab0_pot_error": baseline potential percent error at t=0
-        - "ab_acc_error": baseline acceleration percent error at t_eval
-        - "ab_acc_norm": norm of baseline analytic acceleration, shape (num_test,)
-        - "residual_pot", "corrected_potential", "corrected_pot_percent_error"
+        A dictionary of evaluation metrics for the specified time slice.
+        Includes predicted and true values, error metrics, and optional
+        baseline comparison metrics.
 
     """
     val_data = raw_datadict["val"][t_eval]
@@ -236,7 +204,7 @@ def evaluate_performance_node(
     t_scaled = config["t_transformer"].transform(t_eval) * jnp.ones((x_val.shape[0], 1))
     tx_scaled = jnp.concatenate([t_scaled, x_scaled], axis=1)
 
-    output = apply_model(model, params, tx_scaled)
+    output = apply_model(model, tx_scaled, analytic_potential = analytic_baseline)
 
     predicted_pot = config["u_transformer"].inverse_transform(output["u_pred"])
     predicted_acc = config["a_transformer"].inverse_transform(output["a_pred"])
@@ -251,8 +219,7 @@ def evaluate_performance_node(
     )
     pot_percent_error = 100 * jnp.abs((true_pot - predicted_pot) / true_pot)
 
-    if config.get("include_analytic", True):
-        analytic_baseline = config["ab_potential"]
+    if analytic_baseline is not None:
         analytic_baseline_potential = analytic_baseline.potential(x_val, t=t_eval)
         analytic_baseline_acc = analytic_baseline.acceleration(x_val, t=t_eval)
         analytic_baseline_0 = analytic_baseline.potential(x_val, t=0)
@@ -355,8 +322,7 @@ def bnn_performance(
           shape (S, N, 3, ...)
 
     """
-    if rng_key is None:
-        rng_key = jr.PRNGKey(0)
+    rng_key = jr.PRNGKey(0) if rng_key is None else rng_key
 
     x_test_scaled = config["x_transformer"].transform(x_test)
     pred = predictive(jr.PRNGKey(2), x_test_scaled)
