@@ -140,5 +140,6 @@ extra-standard-library = ["typing_extensions"]
 [tool.ruff.format]
 docstring-code-format = true
 
-[tool.uv.sources]
-galax = { git = "https://github.com/GalacticDynamics/galax" }
+[tool.uv.sources.galax]
+git = "https://github.com/GalacticDynamics/galax"
+rev = "86ae1747faeab729f5bc42239d61e59217cd780d"

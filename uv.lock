@@ -749,7 +749,7 @@ wheels = [
 
 [[package]]
 name = "galactopinns"
-version = "0.1.dev16"
+version = "0.1.dev19"
 source = { editable = "." }
 dependencies = [
     { name = "astropy" },
@@ -780,7 +780,7 @@ requires-dist = [
     { name = "astropy", specifier = ">=7.2.0" },
     { name = "equinox", specifier = ">=0.13.3" },
     { name = "flax", specifier = ">=0.12.2" },
-    { name = "galax", git = "https://github.com/GalacticDynamics/galax" },
+    { name = "galax", git = "https://github.com/GalacticDynamics/galax?rev=86ae1747faeab729f5bc42239d61e59217cd780d" },
     { name = "jax", specifier = ">=0.8.2" },
     { name = "jaxtyping", specifier = ">=0.3.6" },
     { name = "numpy", specifier = ">=2.3.5" },
@@ -803,7 +803,7 @@ dev = [
 [[package]]
 name = "galax"
 version = "0.0.3.dev391+g86ae1747f"
-source = { git = "https://github.com/GalacticDynamics/galax#86ae1747faeab729f5bc42239d61e59217cd780d" }
+source = { git = "https://github.com/GalacticDynamics/galax?rev=86ae1747faeab729f5bc42239d61e59217cd780d#86ae1747faeab729f5bc42239d61e59217cd780d" }
 dependencies = [
     { name = "astropy" },
     { name = "beartype" },
@@ -901,7 +901,7 @@ name = "ipykernel"
 version = "7.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "appnope", marker = "sys_platform == 'darwin'" },
+    { name = "appnope", marker = "platform_system == 'Darwin'" },
     { name = "comm" },
     { name = "debugpy" },
     { name = "ipython" },
@@ -2491,7 +2491,7 @@ name = "tqdm"
 version = "4.67.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32'" },
+    { name = "colorama", marker = "platform_system == 'Windows'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a8/4b/29b4ef32e036bb34e4ab51796dd745cdba7ed47ad142a9f4a1eb8e0c744d/tqdm-4.67.1.tar.gz", hash = "sha256:f8aef9c52c08c13a65f30ea34f4e5aac3fd1a34959879d7e59e63027286627f2", size = 169737 }
 wheels = [
