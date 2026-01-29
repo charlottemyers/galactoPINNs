@@ -26,12 +26,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install uv
         uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.5.2"
 
       - name: Install (dev)
         run: |
-          uv sync --no-default-groups --group dev --locked
+          uv sync --group dev --locked
 
       - name: Pre-commit
         run: |
@@ -50,14 +57,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.5.2"
+
       - name: Install (dev)
         run: |
-          uv sync --no-default-groups --group dev --locked
+          uv sync --group dev --locked
 
       - name: Run tests
         run: |
