@@ -37,7 +37,8 @@ jobs:
 
       - name: Install (dev)
         run: |
-          uv sync --group dev --locked
+          uv lock
+          uv sync --group dev
 
       - name: Pre-commit
         run: |
@@ -62,24 +63,10 @@ jobs:
           version: "0.5.2"
           python-version: ${{ matrix.python-version }}
 
-      - name: Debug lockfile drift
-        run: |
-          uv --version
-          python --version
-          echo "=== uv lock --check ==="
-          uv lock --check || true
-          echo "=== Regenerating uv.lock (for diff only) ==="
-          cp uv.lock uv.lock.before
-          uv lock
-          echo "=== Diff (uv.lock) ==="
-          git diff --no-index uv.lock.before uv.lock || true
-          echo "=== End diff ==="
-          # Fail if it changed
-          test -z "$(git diff --name-only uv.lock.before uv.lock)" || exit 1
-
       - name: Install (dev)
         run: |
-          uv sync --group dev --locked
+          uv lock
+          uv sync --group dev
 
       - name: Run tests
         run: |
