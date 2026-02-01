@@ -60,16 +60,6 @@ def sample_log_uniform_r(
     ValueError
         If ``r_min <= 0``, ``r_max <= r_min``, or ``N <= 0``.
 
-    Examples
-    --------
-    >>> import jax.random as jr
-    >>> key = jr.PRNGKey(0)
-    >>> r = sample_log_uniform_r(key, 1.0, 100.0, N=5)
-    >>> r.shape
-    (5,)
-    >>> jnp.all((r >= 1.0) & (r <= 100.0))
-    Array(True, dtype=bool)
-
     """
     if N <= 0:
         raise ValueError("N must be positive.")
@@ -116,18 +106,6 @@ def sample_angles(
     ------
     ValueError
         If ``N <= 0``.
-
-    Examples
-    --------
-    >>> import jax.random as jr
-    >>> key = jr.PRNGKey(0)
-    >>> theta, phi = sample_angles(key, 10)
-    >>> theta.shape, phi.shape
-    ((10,), (10,))
-    >>> jnp.all((theta >= 0.0) & (theta <= 2.0 * jnp.pi))
-    Array(True, dtype=bool)
-    >>> jnp.all((phi >= 0.0) & (phi <= jnp.pi))
-    Array(True, dtype=bool)
 
     """
     if N <= 0:
@@ -1225,21 +1203,6 @@ def flatten_time_dict_by_time(
         - A single array of all concatenated positions, shape (N_total, D).
         - A single array of all concatenated accelerations, shape (N_total, D).
 
-    Examples
-    --------
-    >>> import jax.numpy as jnp
-    >>> data = {
-    ...     "train": {
-    ...         0.0: {"x": jnp.ones((2, 3)), "a": jnp.ones((2, 3))},
-    ...         1.0: {"x": jnp.zeros((3, 3)), "a": jnp.zeros((3, 3))},
-    ...     }
-    ... }
-    >>> x_flat, a_flat = flatten_time_dict_by_time(data, split="train")
-    >>> x_flat.shape
-    (5, 3)
-    >>> a_flat.shape
-    (5, 3)
-
     """
     time_batches = []
 
@@ -1264,15 +1227,6 @@ def acc_cart_to_cyl_like(a: Array) -> Array:
     -------
     out
         Array of shape (N, 4) with columns [a_rho, a_phi, a_z, a_mag].
-
-
-    Examples
-    --------
-    A simple vector along +x:
-
-    >>> import jax.numpy as jnp
-    >>> acc_cart_to_cyl_like(jnp.array([[3.0, 0.0, 4.0]])).tolist()
-    [[3.0, 0.0, 4.0, 5.0]]
 
     """
     a = jnp.asarray(a)

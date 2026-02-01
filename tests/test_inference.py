@@ -1,5 +1,6 @@
 """Tests for NNX inference utilities."""
 
+import jax
 import jax.numpy as jnp
 from flax import nnx
 
@@ -28,6 +29,19 @@ class MockAnalyticPotential:
         r = jnp.linalg.norm(x, axis=-1, keepdims=True)
         return -x / (r**3 + 0.01)
 
+# Register mock classes as JAX pytrees for JIT compatibility
+jax.tree_util.register_pytree_node(
+    MockTransformer,
+    lambda obj: ((), None),
+    lambda aux, children: MockTransformer(),
+)
+
+jax.tree_util.register_pytree_node(
+    MockAnalyticPotential,
+    lambda obj: ((), None),
+    lambda aux, children: MockAnalyticPotential(),
+)
+
 
 def make_minimal_config() -> dict:
     """Create a minimal configuration for testing."""
@@ -41,6 +55,8 @@ def make_minimal_config() -> dict:
         "include_analytic": False,
         "ab_potential": MockAnalyticPotential(),
         "convert_to_spherical": True,
+        "trainable": False,
+        "enforce_boundary": False,
         "depth": 2,
         "width": 16,
         "nn_off": False,
@@ -127,9 +143,29 @@ class TestNNXModelProtocol:
         assert "acceleration" in result
 
     def test_model_has_config(self):
-        """Test that model has config attribute."""
+        """Test that model has config attribute with expected keys."""
         config = make_minimal_config()
         model = StaticModel(config, in_features=5, rngs=nnx.Rngs(0))
 
         assert hasattr(model, "config")
-        assert model.config is config
+
+        # Config is filtered (no ab_potential, no scale) and wrapped in nnx.Dict
+        # Check that essential keys are present
+        assert "r_s" in model.config
+        assert "x_transformer" in model.config
+        assert "u_transformer" in model.config
+        assert "a_transformer" in model.config
+        assert "include_analytic" in model.config
+        assert "convert_to_spherical" in model.config
+
+    def test_model_has_ab_potential(self):
+        """Test that model stores ab_potential separately."""
+        config = make_minimal_config()
+        model = StaticModel(config, in_features=5, rngs=nnx.Rngs(0))
+
+        assert hasattr(model, "ab_potential")
+        # ab_potential is wrapped in ExternalPytree, access via .value
+        assert model.ab_potential is not None
+        assert hasattr(model.ab_potential, "value")
+        assert hasattr(model.ab_potential.value, "potential")
+        assert hasattr(model.ab_potential.value, "acceleration")

@@ -7,7 +7,7 @@ __all__ = (
 )
 
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import Any, Literal
 
 import jax.numpy as jnp
 import jax.random as jr
@@ -21,7 +21,9 @@ def evaluate_performance(
     raw_datadict: Mapping[str, Any],
     num_test: int,
     *,
-    analytic_baseline: Any | None = None,
+    gauge_correct: Literal["reference", "median"] | None = None,
+    r_ref: float | None = None,
+    eps: float = 1e-10,
 ) -> dict[str, Any]:
     """Evaluate a static model on a validation set and compute error metrics.
 
@@ -46,9 +48,18 @@ def evaluate_performance(
         - "a_val": array-like, shape (N, 3), physical true acceleration
     num_test : int
         Number of validation samples to evaluate (uses the first `num_test` rows).
-    analytic_baseline : galax.potential.AbstractPotential, optional
-        An optional analytic potential to use for baseline error calculations.
-
+    gauge_correct : {"reference", "median"} or None, optional
+        Gauge correction method for potential errors:
+        - None: no gauge correction (default)
+        - "reference": compute errors on potential differences relative to a
+          reference radius `r_ref`.
+        - "median": subtract median offset between predicted and true potential.
+    r_ref : float, optional
+        Reference radius for gauge correction when `gauge_correct="reference"`.
+        Required if using reference-based correction.
+    eps : float, optional
+        Small constant for numerical stability in percent error calculations.
+        Default is 1e-10.
 
     Required config keys (model.config)
     -----------------------------------
@@ -69,86 +80,105 @@ def evaluate_performance(
         - "true_u", "predicted_u": physical potentials, shape (num_test,)
         - "true_a", "predicted_a": physical accelerations, shape (num_test, 3)
         - "pot_percent_error": percent potential error, shape (num_test,)
+          (gauge-corrected if `gauge_correct` is specified)
         - "acc_percent_error": percent acceleration error, shape (num_test,)
         If analytic baseline is enabled:
         - "analytic_baseline": analytic baseline potential at t=0
         - "ab_pot_error", "ab_acc_error": baseline percent errors
-        - "residual_pot": ab_potential - predicted_u
-        - "corrected_pot_percent_error": percent error after applying mean
-          residual correction
+
+    Raises
+    ------
+    ValueError
+        If `gauge_correct="reference"` but `r_ref` is not provided.
 
     """
+    # --- Validate gauge correction arguments ---
+    if gauge_correct == "reference" and r_ref is None:
+        raise ValueError("r_ref must be provided when gauge_correct='reference'")
+
+    # --- Extract validation data ---
+    x_val = raw_datadict["x_val"][:num_test]
     true_pot = raw_datadict["u_val"][:num_test]
     true_acc = raw_datadict["a_val"][:num_test]
 
     config = model.config
-    r_eval = jnp.linalg.norm(raw_datadict["x_val"][:num_test], axis=1)
-    scaled_x_val = config["x_transformer"].transform(raw_datadict["x_val"][:num_test])
-    output = apply_model(model, scaled_x_val, analytic_potential = analytic_baseline)
+    analytic_baseline = (
+        model.ab_potential.value
+        if model.ab_potential is not None and config.get("include_analytic", True)
+        else None
+    )
+
+    # --- Compute radii ---
+    r_eval = jnp.linalg.norm(x_val, axis=1)
+
+    # --- Run model prediction ---
+    scaled_x_val = config["x_transformer"].transform(x_val)
+    output = apply_model(model, scaled_x_val)
     predicted_pot = config["u_transformer"].inverse_transform(output["u_pred"])
     predicted_acc = config["a_transformer"].inverse_transform(output["a_pred"])
+
+    # --- Acceleration error (no gauge ambiguity) ---
     acc_percent_error = (
         100
         * jnp.linalg.norm(predicted_acc - true_acc, axis=1)
-        / jnp.linalg.norm(true_acc, axis=1)
+        / (jnp.linalg.norm(true_acc, axis=1) + eps)
     )
-    pot_percent_error = 100 * jnp.abs((true_pot - predicted_pot) / true_pot)
 
-    fiducial_acc = None
-    fiducial_pot = None
-    fiducial_acc_error = None
-    fiducial_pot_error = None
+    # --- Potential error (with optional gauge correction) ---
+    if gauge_correct is None:
+        # No correction
+        pot_percent_error = (
+            100 * jnp.abs((true_pot - predicted_pot) / (jnp.abs(true_pot) + eps))
+        )
 
+    elif gauge_correct == "reference":
+        # Gauge-invariant: compare potential differences from reference point
+        i_ref = int(jnp.argmin(jnp.abs(r_eval - r_ref)))
+        du_true = true_pot - true_pot[i_ref]
+        du_pred = predicted_pot - predicted_pot[i_ref]
+        pot_percent_error = 100.0 * jnp.abs((du_true - du_pred) / (jnp.abs(du_true) + eps))
+
+    elif gauge_correct == "median":
+        # Median offset correction
+        offset = jnp.median(predicted_pot - true_pot)
+        predicted_pot_corrected = predicted_pot - offset
+        pot_percent_error = (
+            100 * jnp.abs((true_pot - predicted_pot_corrected) / (jnp.abs(true_pot) + eps))
+        )
+
+    else:
+        raise ValueError(f"Unknown gauge_correct='{gauge_correct}'")
+
+    # --- Analytic baseline comparison ---
     if analytic_baseline is not None:
-        analytic_baseline_potential = analytic_baseline.potential(
-            raw_datadict["x_val"][:num_test], t=0
-        )
-        analytic_baseline_acc = analytic_baseline.acceleration(
-            raw_datadict["x_val"][:num_test], t=0
-        )
+        analytic_baseline_potential = analytic_baseline.potential(x_val, t=0)
+        analytic_baseline_acc = analytic_baseline.acceleration(x_val, t=0)
 
         ab_pot_error = 100 * jnp.abs(
-            (analytic_baseline_potential - true_pot) / true_pot
+            (analytic_baseline_potential - true_pot) / (jnp.abs(true_pot) + eps)
         )
         ab_acc_error = (
             100
             * jnp.linalg.norm(analytic_baseline_acc - true_acc, axis=1)
-            / jnp.linalg.norm(true_acc, axis=1)
+            / (jnp.linalg.norm(true_acc, axis=1) + eps)
         )
-
-        residual_pot = analytic_baseline_potential - predicted_pot
-        average_residual_pot = jnp.mean(residual_pot)
-        corrected_potential = predicted_pot + average_residual_pot
-        corrected_pot_percent_error = 100 * jnp.abs(
-            (corrected_potential - true_pot) / true_pot
-        )
-
     else:
         analytic_baseline_potential = None
         ab_pot_error = None
         ab_acc_error = None
-        residual_pot = None
-        corrected_potential = None
-        corrected_pot_percent_error = None
 
     return {
         "r_eval": r_eval,
-        "x_val": raw_datadict["x_val"][:num_test],
+        "x_val": x_val,
         "true_a": true_acc,
         "predicted_a": predicted_acc,
         "true_u": true_pot,
         "predicted_u": predicted_pot,
         "acc_percent_error": acc_percent_error,
         "pot_percent_error": pot_percent_error,
-        "residual_pot": residual_pot,
-        "corrected_pot_percent_error": corrected_pot_percent_error,
         "analytic_baseline": analytic_baseline_potential,
         "ab_pot_error": ab_pot_error,
         "ab_acc_error": ab_acc_error,
-        "fiducial_acc": fiducial_acc,
-        "fiducial_pot": fiducial_pot,
-        "fiducial_pot_error": fiducial_pot_error,
-        "fiducial_acc_error": fiducial_acc_error,
         "avg_percent_error": jnp.mean(acc_percent_error),
     }
 
@@ -159,7 +189,9 @@ def evaluate_performance_node(
     raw_datadict: Mapping[str, Any],
     num_test: int,
     *,
-    analytic_baseline: Any | None = None,
+    gauge_correct: Literal["reference", "median"] | None = None,
+    r_ref: float | None = None,
+    eps: float = 1e-10,
 ) -> dict[str, Any]:
     """Evaluate a time-dependent model at a single evaluation time.
 
@@ -179,9 +211,18 @@ def evaluate_performance_node(
         A nested dictionary mapping split -> time -> data arrays.
     num_test : int
         Number of validation samples to evaluate from the `t_eval` time slice.
-    analytic_baseline : galax.potential.AbstractPotential, optional
-        An optional analytic potential for baseline error calculations and to
-        pass to the model's forward pass.
+    gauge_correct : {"reference", "median"} or None, optional
+        Gauge correction method for potential errors:
+        - None: no gauge correction (default)
+        - "reference": compute errors on potential differences relative to a
+          reference radius `r_ref`.
+        - "median": subtract median offset between predicted and true potential.
+    r_ref : float, optional
+        Reference radius for gauge correction when `gauge_correct="reference"`.
+        Required if using reference-based correction.
+    eps : float, optional
+        Small constant for numerical stability in percent error calculations.
+        Default is 1e-10.
 
     Returns
     -------
@@ -190,66 +231,114 @@ def evaluate_performance_node(
         Includes predicted and true values, error metrics, and optional
         baseline comparison metrics.
 
+    Raises
+    ------
+    ValueError
+        If `gauge_correct="reference"` but `r_ref` is not provided.
+
     """
+    # --- Validate gauge correction arguments ---
+    if gauge_correct == "reference" and r_ref is None:
+        raise ValueError("r_ref must be provided when gauge_correct='reference'")
+
+    # --- Extract validation data ---
     val_data = raw_datadict["val"][t_eval]
     x_val = val_data["x"][:num_test]
-
-    config = model.config
-    r_eval = jnp.linalg.norm(x_val, axis=1)
-
     true_pot = val_data["u"][:num_test]
     true_acc = val_data["a"][:num_test]
 
+    config = model.config
+
+    # --- Compute radii ---
+    r_eval = jnp.linalg.norm(x_val, axis=1)
+
+    # --- Build scaled input [t, x, y, z] ---
     x_scaled = config["x_transformer"].transform(x_val)
     t_scaled = config["t_transformer"].transform(t_eval) * jnp.ones((x_val.shape[0], 1))
     tx_scaled = jnp.concatenate([t_scaled, x_scaled], axis=1)
 
-    output = apply_model(model, tx_scaled, analytic_potential = analytic_baseline)
+    # --- Get analytic baseline (unwrap ExternalPytree if present) ---
+    analytic_baseline = (
+        model.ab_potential.value
+        if model.ab_potential is not None and config.get("include_analytic", True)
+        else None
+    )
 
+    # --- Run model prediction ---
+    output = apply_model(model, tx_scaled)
     predicted_pot = config["u_transformer"].inverse_transform(output["u_pred"])
     predicted_acc = config["a_transformer"].inverse_transform(output["a_pred"])
 
+    # --- Acceleration norms ---
     predicted_acc_norm = jnp.linalg.norm(predicted_acc, axis=1, keepdims=True)
     true_acc_norm = jnp.linalg.norm(true_acc, axis=1, keepdims=True)
 
+    # --- Acceleration error (no gauge ambiguity) ---
     acc_percent_error = (
         100
         * jnp.linalg.norm(predicted_acc - true_acc, axis=1)
-        / jnp.linalg.norm(true_acc, axis=1)
+        / (jnp.linalg.norm(true_acc, axis=1) + eps)
     )
-    pot_percent_error = 100 * jnp.abs((true_pot - predicted_pot) / true_pot)
 
+    # --- Potential error (with optional gauge correction) ---
+    if gauge_correct is None:
+        # No correction
+        pot_percent_error = (
+            100 * jnp.abs((true_pot - predicted_pot) / (jnp.abs(true_pot) + eps))
+        )
+
+    elif gauge_correct == "reference":
+        # Gauge-invariant: compare potential differences from reference point
+        i_ref = int(jnp.argmin(jnp.abs(r_eval - r_ref)))
+        du_true = true_pot - true_pot[i_ref]
+        du_pred = predicted_pot - predicted_pot[i_ref]
+        pot_percent_error = 100.0 * jnp.abs((du_true - du_pred) / (jnp.abs(du_true) + eps))
+
+    elif gauge_correct == "median":
+        # Median offset correction
+        offset = jnp.median(predicted_pot - true_pot)
+        predicted_pot_corrected = predicted_pot - offset
+        pot_percent_error = (
+            100 * jnp.abs((true_pot - predicted_pot_corrected) / (jnp.abs(true_pot) + eps))
+        )
+
+    else:
+        raise ValueError(f"Unknown gauge_correct='{gauge_correct}'")
+
+    # --- Analytic baseline comparison ---
     if analytic_baseline is not None:
         analytic_baseline_potential = analytic_baseline.potential(x_val, t=t_eval)
         analytic_baseline_acc = analytic_baseline.acceleration(x_val, t=t_eval)
         analytic_baseline_0 = analytic_baseline.potential(x_val, t=0)
         analytic_baseline_acc_norm = jnp.linalg.norm(analytic_baseline_acc, axis=1)
+
         ab_pot_error = 100 * jnp.abs(
-            (analytic_baseline_potential - true_pot) / true_pot
+            (analytic_baseline_potential - true_pot) / (jnp.abs(true_pot) + eps)
         )
-        ab0_pot_error = 100 * jnp.abs((analytic_baseline_0 - true_pot) / true_pot)
+        ab0_pot_error = 100 * jnp.abs(
+            (analytic_baseline_0 - true_pot) / (jnp.abs(true_pot) + eps)
+        )
         ab_acc_error = (
             100
             * jnp.linalg.norm(analytic_baseline_acc - true_acc, axis=1)
-            / jnp.linalg.norm(true_acc, axis=1)
+            / (jnp.linalg.norm(true_acc, axis=1) + eps)
         )
 
         residual_pot = analytic_baseline_potential - predicted_pot
         average_residual_pot = jnp.mean(residual_pot)
         corrected_potential = predicted_pot + average_residual_pot
         corrected_pot_percent_error = 100 * jnp.abs(
-            (corrected_potential - true_pot) / true_pot
+            (corrected_potential - true_pot) / (jnp.abs(true_pot) + eps)
         )
     else:
         analytic_baseline_potential = None
+        analytic_baseline_acc_norm = None
+        analytic_baseline_0 = None
         ab_pot_error = None
+        ab0_pot_error = None
         ab_acc_error = None
-        residual_pot = None
         corrected_potential = None
         corrected_pot_percent_error = None
-        analytic_baseline_acc_norm = None
-        ab0_pot_error = None
-        analytic_baseline_0 = None
 
     return {
         "r_eval": r_eval,
@@ -261,7 +350,6 @@ def evaluate_performance_node(
         "predicted_u": predicted_pot,
         "acc_percent_error": acc_percent_error,
         "pot_percent_error": pot_percent_error,
-        "residual_pot": residual_pot,
         "corrected_pot_percent_error": corrected_pot_percent_error,
         "corrected_potential": corrected_potential,
         "analytic_baseline": analytic_baseline_potential,
@@ -271,7 +359,6 @@ def evaluate_performance_node(
         "ab0_pot_error": ab0_pot_error,
         "analytic_baseline_0": analytic_baseline_0,
     }
-
 
 def bnn_performance(
     predictive: Callable[[Array, Array], Mapping[str, Array]],

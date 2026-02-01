@@ -16,7 +16,6 @@ def test_import_layers():
     assert hasattr(layers, "SmoothMLP")
     assert hasattr(layers, "CartesianToModifiedSphericalLayer")
     assert hasattr(layers, "ScaleNNPotentialLayer")
-    assert hasattr(layers, "FuseModelsLayer")
 
 
 def test_import_models():
