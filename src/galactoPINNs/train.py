@@ -83,7 +83,6 @@ def train_step_static(
     x: Array,
     a_true: Array,
     *,
-    analytic_potential: GalaxPotential | None = None,
     lambda_rel: float = 1.0,
     orbit_q: Array | None = None,
     orbit_p: Array | None = None,
@@ -142,8 +141,6 @@ def train_step_static(
     target
         Loss configuration. One of:
         ``"acceleration"``, ``"orbit_energy"``, or ``"mixed"``.
-    analytic_potential
-        An optional analytic potential to be passed to the model during calls.
 
     Returns
     -------
@@ -167,7 +164,7 @@ def train_step_static(
         m = nnx.merge(graphdef, train_state, frozen_state)
 
         # -------- acceleration loss --------
-        out: dict[str, Array] = m(x, analytic_potential=analytic_potential)
+        out: dict[str, Array] = m(x)
         a_pred = out["acceleration"]  # (N, 3)
 
         diff = a_pred - a_true
@@ -187,7 +184,7 @@ def train_step_static(
 
             q_flat = orbit_q_scaled.reshape(B * T, 3)  # (B*T, 3)
             outp: dict[str, Array] = m(
-                q_flat, mode="potential", analytic_potential=analytic_potential
+                q_flat, mode="potential"
             )
             Phi_flat = outp["potential"]               # (B*T,)
             Phi = Phi_flat.reshape(B, T)               # (B, T)
@@ -225,7 +222,6 @@ def train_step_node(
     tx_cart: Array,
     a_true: Array,
     *,
-    analytic_potential: GalaxPotential | None = None,
     lambda_rel: float = 1.0,
 ) -> Array:
     """Optimization step for NODE with acceleration training objective.
@@ -263,8 +259,6 @@ def train_step_node(
         Weight applied to the relative-error component of the loss. Larger
         values emphasize fractional error in regions where ``||a_true||`` is
         small.
-    analytic_potential
-        An optional analytic potential to be passed to the model during calls.
 
     Returns
     -------
@@ -287,7 +281,7 @@ def train_step_node(
             Scalar loss (shape ``()``).
 
         """
-        outputs: dict[str, Array] = model(tx_cart, analytic_potential=analytic_potential)
+        outputs: dict[str, Array] = model(tx_cart)
         a_pred = outputs["acceleration"]  # (N, 3)
 
         diff = a_pred - a_true
@@ -308,7 +302,6 @@ def train_model_static(
     x_train: Array,
     a_train: Array,
     num_epochs: int,
-    analytic_potential: GalaxPotential | None = None,
     *,
     target: StaticTarget = "acceleration",
     log_every: int = 100,
@@ -340,8 +333,6 @@ def train_model_static(
         True accelerations at ``x_train``, shape ``(N, 3)`` in scaled units.
     num_epochs
         Total number of epochs to train if ``train_dict`` is not provided.
-    analytic_potential
-        An optional analytic potential to be passed to the model during calls.
     target
         Default loss target when ``train_dict`` is not provided. One of
         ``"acceleration"``, ``"orbit_energy"``, or ``"mixed"``.
@@ -401,7 +392,6 @@ def train_model_static(
                 orbit_p=orbit_p,
                 lambda_E=lambda_E,
                 std_weight=std_weight,
-                analytic_potential = analytic_potential,
             )
             if log_every > 0 and (epoch % log_every == 0):
                 log.info("Epoch %d, Loss: %.6f", epoch + 1, float(loss))
@@ -418,7 +408,6 @@ def train_model_node(
     x_train: Array,
     a_train: Array,
     num_epochs: int,
-    analytic_potential: GalaxPotential | None = None,
     *,
     lambda_rel: float = 1.0,
     log_every: int = 1000,
@@ -440,8 +429,6 @@ def train_model_node(
         Training accelerations.
     num_epochs
         The number of epochs to train for.
-    analytic_potential
-        An optional analytic potential to be passed to the model during calls.
     lambda_rel
         Weight for the relative-error term in the loss function.
     log_every
@@ -457,7 +444,7 @@ def train_model_node(
     losses = []
 
     for epoch in range(num_epochs):
-        loss = train_step_node(model, optimizer, x_train, a_train, lambda_rel = lambda_rel, analytic_potential = analytic_potential)
+        loss = train_step_node(model, optimizer, x_train, a_train, lambda_rel = lambda_rel)
         if epoch % log_every == 0:
             log.info("Epoch %d, Loss: %.6f", epoch, loss)
         epochs.append(epoch)

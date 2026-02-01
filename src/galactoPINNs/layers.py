@@ -1,9 +1,7 @@
 """Neural network layers for physics-informed models."""
 
 __all__ = (
-    #"AnalyticModelLayer",
     "CartesianToModifiedSphericalLayer",
-    "FuseModelsLayer",
     "FuseandBoundary",
     "ScaleNNPotentialLayer",
     "SmoothMLP",
@@ -12,12 +10,17 @@ __all__ = (
 
 import functools as ft
 from collections.abc import Callable, Mapping
-from typing import Any, Protocol, TypeAlias, cast
+from typing import Any, Protocol, TypeAlias, Union
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array
+
+ScaleSpec = Union[str, Array, None]  # for type hints  # noqa: UP007
+
+class ExternalPytree(nnx.Variable):
+    """Variable wrapper for external pytrees (like equinox modules)."""
 
 ActFn = Callable[[Array], Array]
 
@@ -61,37 +64,6 @@ ScaleSpec = str | _HasPotential
 #######
 # Utilities
 #######
-def _radius(x: Array) -> Array:
-    """Compute the Euclidean radius of Cartesian coordinates.
-
-    Parameters
-    ----------
-    x
-        Cartesian coordinates. Supported shapes:
-        - ``(3,)`` for a single point
-        - ``(N, 3)`` for a batch of points
-
-    Returns
-    -------
-    r
-        Euclidean radius:
-        - scalar array if ``x`` has shape ``(3,)``
-        - array of shape ``(N,)`` if ``x`` has shape ``(N, 3)``
-
-    Raises
-    ------
-    ValueError
-        If ``x`` does not have a supported shape.
-
-    """
-    x = jnp.asarray(x)
-
-    if x.ndim > 2:
-        msg = f"_radius expects x with ndim 1 or 2, got ndim={x.ndim}, shape={x.shape}."
-        raise ValueError(msg)
-
-    return jnp.linalg.norm(x, axis=-1)
-
 
 def _as_batch(x: Array) -> Array:
     """Ensure a leading batch dimension.
@@ -260,194 +232,138 @@ class CartesianToModifiedSphericalLayer(nnx.Module):
 
 
 class ScaleNNPotentialLayer(nnx.Module):
-    """Apply an analytic, radius-dependent prefactor to a proxy potential.
+    """Apply an analytic, radius-dependent prefactor to a proxy potential."""
 
-    This layer is intended for architectures where the NN predicts a scaled proxy
-    potential ``u_nn`` and an additional analytic factor is applied to enforce or
-    approximate known radial behavior .
-
-    The layer supports several modes controlled by ``config["scale"]``:
-    - ``"one"``: no scaling (prefactor = 1)
-    - ``"power"``: prefactor = (1/r)^power
-    - ``"nfw"``: prefactor = log(1 + r/r_s) / r   (with r_s scaled via x_transformer)
-    - external object: if ``config["scale"]`` is an object with a callable
-      ``.potential(x, t=...)`` (i.e. a Galax potential), use |Phi(x)| to build a
-      dimensionless scaling factor
-
-    Parameters
-    ----------
-    config
-        Configuration mapping controlling scaling behavior.
-
-        Required keys:
-
-        - x_transformer
-            Object with ``.transform(...)`` used for scaling parameters such as ``r_s``.
-        - r_s
-            Physical scale radius (float).
-
-        Optional keys:
-
-        - scale
-            One of:
-            - string mode: {"one", "power", "nfw"}
-            - an external potential-like object (i.e. Galax potential)
-              with a callable ``.potential`` method
-
-        - power
-            Exponent for ``scale="power"``. Default 1.0.
-
-        - scale_r_ref
-            Reference radius used to normalize external potential scaling. If
-            provided, scaling is normalized by |Phi(r_ref)| along each point's
-            radial direction.
-
-        - scale_eps_frac
-            Fractional epsilon for stabilization when normalizing external
-            potential.
-
-        - scale_clip_min, scale_clip_max
-            Clamps applied to the dimensionless scale factor. Defaults 1e-3,
-            1e3.
-
-        - scale_reciprocal
-            If True, uses 1/|Phi| (after normalization), which tends to grow
-            with r for |Phi| ~ 1/r. If False, uses |Phi| directly. Default True.
-
-    """
-
-    def __init__(self, config: Mapping[str, Any]) -> None:
-        """Initialize the scaling layer with configuration."""
-        self.config = config
-        self._scale_fn = self._build_scale_fn(config)
-
-    def _build_scale_fn(
-        self, cfg: Mapping[str, Any]
-    ) -> Callable[[Array, Array, float, Any], Array]:
-        """Build the scale function based on config['scale'].
-
-        Returns a callable (x_cart, r, r_s, t) -> scale_external.
-        """
-        scale: ScaleSpec = cfg.get("scale", "one")
-        x_transformer = cfg["x_transformer"]
-
-        match scale:
-            case "one":
-                return lambda x_cart, r, r_s, t: jnp.ones_like(r)  # noqa: ARG005
-
-            case "power":
-                power = float(cfg.get("power", 1.0))
-
-                def _power_scale(x_cart: Array, r: Array, r_s: float, t: Any) -> Array:
-                    del r, r_s, t  # unused
-                    r_here = jnp.linalg.norm(x_cart, axis=-1)
-                    return jnp.power(1.0 / r_here, power)
-
-                return _power_scale
-
-            case "nfw":
-
-                def _nfw_scale(x_cart: Array, r: Array, r_s: float, t: Any) -> Array:
-                    del r, t  # unused
-                    r_s_scaled = x_transformer.transform(r_s)
-                    r_scaled = jnp.linalg.norm(x_cart, axis=-1)
-                    return jnp.log(1.0 + r_scaled / r_s_scaled) / r_scaled
-
-                return _nfw_scale
-
-            case _ if hasattr(scale, "potential") and callable(scale.potential):
-                # External potential scaling
-                r_ref = cfg.get("scale_r_ref", None)
-                eps_frac = float(cfg.get("scale_eps_frac", 1e-6))
-                clip_min = float(cfg.get("scale_clip_min", 1e-3))
-                clip_max = float(cfg.get("scale_clip_max", 1e3))
-                reciprocal = bool(cfg.get("scale_reciprocal", True))
-                ext_potential = cast("_HasPotential", scale)
-
-                def _external_scale(
-                    x_cart: Array, r: Array, r_s: float, t: Any
-                ) -> Array:
-                    del r_s  # unused
-                    xB = _as_batch(x_cart)
-                    r_safe = jnp.maximum(r, 1e-12)
-
-                    u = ext_potential.potential(xB, t=t).squeeze()
-                    s_raw = jnp.abs(u)
-
-                    if r_ref is None:
-                        s_norm = s_raw
-                    else:
-                        x_dir = xB / jnp.atleast_1d(r_safe)[:, None]
-                        x_ref = x_dir * r_ref
-                        u_ref = ext_potential.potential(x_ref, t=t).squeeze()
-                        s_ref = jnp.abs(u_ref)
-                        eps = eps_frac * jnp.maximum(s_ref, 1e-12)
-                        s_norm = (s_raw + eps) / (s_ref + eps)
-
-                    s_out = jnp.where(
-                        reciprocal, 1.0 / jnp.maximum(s_norm, 1e-12), s_norm
-                    )
-                    return jnp.clip(s_out, clip_min, clip_max)
-
-                return _external_scale
-
-            case _:
-                # Default / unknown: no scaling
-                return lambda x_cart, r, r_s, t: jnp.ones_like(r)  # noqa: ARG005
-
-    @staticmethod
-    def modified_radial_coords(r: Array, clip: float) -> tuple[Array, Array]:
-        """Compute clipped radius and clipped inverse-radius.
+    def __init__(
+        self,
+        config: Mapping[str, Any],
+        external_scale: ExternalPytree | None = None,
+    ) -> None:
+        """Initialize the scaling layer with configuration.
 
         Parameters
         ----------
-        r
-            Radius array.
-        clip
-            Maximum clip value applied to both r and 1/r.
-
-        Returns
-        -------
-        r_i
-            Clipped radius, ``clip(r, 0, clip)``.
-        r_e
-            Clipped inverse radius, ``clip(1/r, 0, clip)``.
-
+        config
+            Configuration dict. The "scale" key can be:
+            - str: "one", "power", "nfw" for built-in modes
+            - Array: pre-computed scale values (stored directly)
+            - A galax potential object: will be ignored here, use external_scale instead
+        external_scale
+            An ExternalPytree-wrapped galax potential for dynamic scaling.
+            If provided and config["scale"] is not a string, this is used.
         """
-        r_inv = jnp.divide(1.0, r)
-        r_i = jnp.clip(r, 0.0, clip)
-        r_e = jnp.clip(r_inv, 0.0, clip)
-        return r_i, r_e
+        scale_val = config.get("scale", "one")
+
+        if isinstance(scale_val, str):
+            self._scale_mode: str = scale_val
+            self._precomputed_scale: Array | None = None
+        elif isinstance(scale_val, (jnp.ndarray, jax.Array)):
+            # Pre-computed array
+            self._scale_mode = "precomputed"
+            self._precomputed_scale = scale_val
+        else:
+            self._scale_mode = "external"
+            self._precomputed_scale = None
+
+        # Store external potential
+        self.external_scale = external_scale
+
+        # Clean config - remove non-serializable objects
+        config_clean = {
+            k: v for k, v in config.items()
+            if k not in ("ab_potential",)
+            and not (k == "scale" and not isinstance(v, str))
+        }
+        self.config = config_clean
 
     def __call__(
-        self, x_cart: Array, u_nn: Array, r_s_learned: float | None = None, t: Any = 0.0
+        self,
+        x_cart: Array,
+        u_nn: Array,
+        *,
+        r_s_learned: float | None = None,
+        t: Any = 0,
     ) -> Array:
-        """Apply radius-dependent scaling to a proxy NN potential.
+        """Apply scaling to the NN potential."""
+        r = jnp.linalg.norm(x_cart, axis=-1)
+        r_s = r_s_learned if r_s_learned is not None else self.config.get("r_s", 1.0)
 
-        Parameters
-        ----------
-        x_cart
-            Cartesian positions, shape ``(3,)`` or ``(N, 3)``.
-        u_nn
-            Neural network proxy potential to be scaled.
-        r_s_learned
-            Optional learned scale radius; overrides ``config["r_s"]``.
-        t
-            Time for evaluating external potentials (if used).
+        scale = self._compute_scale(x_cart, r, r_s, t)
+        return scale * u_nn
 
-        Returns
-        -------
-        Array
-            Scaled potential values.
 
-        """
-        r_s: float = self.config["r_s"] if r_s_learned is None else r_s_learned
-        r = _radius(x_cart)
+    def _compute_scale(
+        self,
+        x_cart: Array,
+        r: Array,
+        r_s: float,
+        t: Any,
+    ) -> Array:
+        """Compute the scale factor based on mode."""
+        match self._scale_mode:
+            case "one":
+                return jnp.ones_like(r)
 
-        scale_external = self._scale_fn(x_cart, r, r_s, t)
+            case "power":
+                power = float(self.config.get("power", 1.0))
+                r_here = jnp.linalg.norm(x_cart, axis=-1)
+                return jnp.power(1.0 / r_here, power)
 
-        scaled = u_nn * scale_external
-        return scaled[:, 0] if scaled.ndim > 1 else scaled
+            case "nfw":
+                x_transformer = self.config["x_transformer"]
+                r_s_scaled = x_transformer.transform(r_s)
+                r_scaled = jnp.linalg.norm(x_cart, axis=-1)
+                return jnp.log(1.0 + r_scaled / r_s_scaled) / r_scaled
+
+            case "precomputed":
+                if self._precomputed_scale is None:
+                    raise ValueError("Precomputed scale is None")
+                return self._precomputed_scale
+
+            case "external":
+                if self.external_scale is None:
+                    raise ValueError(
+                        "scale mode is 'external' but no external_scale provided"
+                    )
+                ext_potential = self.external_scale.value
+                return self._external_scale_impl(x_cart, r, t, ext_potential)
+
+            case _:
+                # Default fallback
+                return jnp.ones_like(r)
+
+    def _external_scale_impl(
+        self,
+        x_cart: Array,
+        r: Array,
+        t: Any,
+        ext_potential: Any,
+    ) -> Array:
+        """Compute scale from external potential."""
+        r_ref = self.config.get("scale_r_ref", None)
+        eps_frac = float(self.config.get("scale_eps_frac", 1e-6))
+        clip_min = float(self.config.get("scale_clip_min", 1e-3))
+        clip_max = float(self.config.get("scale_clip_max", 1e3))
+        reciprocal = bool(self.config.get("scale_reciprocal", True))
+
+        xB = _as_batch(x_cart)
+        r_safe = jnp.maximum(r, 1e-12)
+
+        u = ext_potential.potential(xB, t=t).squeeze()
+        s_raw = jnp.abs(u)
+
+        if r_ref is None:
+            s_norm = s_raw
+        else:
+            x_dir = xB / jnp.atleast_1d(r_safe)[:, None]
+            x_ref = x_dir * r_ref
+            u_ref = ext_potential.potential(x_ref, t=t).squeeze()
+            s_ref = jnp.abs(u_ref)
+            eps = eps_frac * jnp.maximum(s_ref, 1e-12)
+            s_norm = (s_raw + eps) / (s_ref + eps)
+
+        s_out = jnp.where(reciprocal, 1.0 / jnp.maximum(s_norm, 1e-12), s_norm)
+        return jnp.clip(s_out, clip_min, clip_max)
 
 
 class TrainableGalaxPotential(nnx.Module):
@@ -553,34 +469,6 @@ class TrainableGalaxPotential(nnx.Module):
         phi = pot.potential(positions, t=0)
         r_s_out = jnp.asarray(built_params["r_s"])
         return phi, r_s_out
-
-
-class FuseModelsLayer(nnx.Module):
-    """A simple layer that fuses an NN and an analytic potential by addition.
-
-    This layer implements the most basic form of a hybrid model, where the total
-    potential is the linear sum of a known analytic component and a flexible
-    neural network component.
-    """
-
-    def __call__(self, nn_potential: Array, analytic_potential: Array) -> Array:
-        """Fuse NN and analytic potentials by simple addition.
-
-        Parameters
-        ----------
-        nn_potential
-            Neural network potential component.
-        analytic_potential
-            Analytic (baseline) potential component.
-
-        Returns
-        -------
-        Array
-            Sum of both potentials.
-
-        """
-        return nn_potential + analytic_potential
-
 
 class FuseandBoundary(nnx.Module):
     """Fuse a neural-network potential with an analytic potential.

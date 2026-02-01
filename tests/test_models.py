@@ -1,5 +1,6 @@
 """Tests for NNX model implementations."""
 
+import jax
 import jax.numpy as jnp
 from flax import nnx
 
@@ -29,6 +30,18 @@ class MockAnalyticPotential:
         r = jnp.linalg.norm(x, axis=-1, keepdims=True)
         return -x / (r**3 + 0.01)
 
+# Register mock classes as JAX pytrees for JIT compatibility
+jax.tree_util.register_pytree_node(
+    MockTransformer,
+    lambda obj: ((), None),
+    lambda aux, children: MockTransformer(),
+)
+
+jax.tree_util.register_pytree_node(
+    MockAnalyticPotential,
+    lambda obj: ((), None),
+    lambda aux, children: MockAnalyticPotential(),
+)
 
 def make_minimal_config(*, include_analytic: bool = False) -> dict:
     """Create a minimal configuration for testing."""
@@ -42,6 +55,8 @@ def make_minimal_config(*, include_analytic: bool = False) -> dict:
         "include_analytic": include_analytic,
         "ab_potential": MockAnalyticPotential(),
         "convert_to_spherical": True,
+        "trainable": False,
+        "enforce_boundary": False,
         "depth": 2,
         "width": 16,
         "nn_off": False,
@@ -56,10 +71,13 @@ class TestStaticModel:
         config = make_minimal_config()
         model = StaticModel(config, in_features=5, rngs=nnx.Rngs(0))
 
-        assert model.config is config
+        # Config is filtered and wrapped, so check contents not identity
+        assert model.config is not None
+        assert "r_s" in model.config
         assert model.cart_to_sph_layer is not None
         assert model.scale_layer is not None
-        assert model.fuse_layer is not None
+        # fuse_layer was removed - now using direct addition
+        assert model.fuse_boundary_layer is not None
         assert model.mlp is not None
 
     def test_init_nn_off(self):
@@ -106,7 +124,20 @@ class TestStaticModel:
         x = jnp.array([[1.0, 2.0, 3.0]])
         potential = model.compute_potential(x)
 
-        assert potential.shape == (1,)
+        # compute_potential now calls .squeeze(), so single input -> scalar
+        assert potential.shape == ()
+        assert jnp.isfinite(potential)
+
+    def test_compute_potential_batch(self):
+        """Test compute_potential method with batch input."""
+        config = make_minimal_config()
+        model = StaticModel(config, in_features=5, rngs=nnx.Rngs(0))
+
+        x = jnp.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        potential = model.compute_potential(x)
+
+        # Batch input -> 1D array after squeeze
+        assert potential.shape == (2,)
         assert jnp.isfinite(potential).all()
 
     def test_compute_laplacian(self):
@@ -144,6 +175,7 @@ class TestStaticModel:
             x = jnp.array([[1.0, 2.0, 3.0]])
             outputs = model(x, mode="potential")
             return jnp.sum(outputs["potential"] ** 2)
+
         grads = nnx.grad(loss_fn)(model)
         assert grads is not None
 
@@ -162,10 +194,11 @@ class TestStaticModel:
 
     def test_reproducible_with_same_seed(self):
         """Test that same seed produces same model outputs."""
-        config = make_minimal_config()
+        config1 = make_minimal_config()
+        config2 = make_minimal_config()
 
-        model1 = StaticModel(config, in_features=5, rngs=nnx.Rngs(42))
-        model2 = StaticModel(config, in_features=5, rngs=nnx.Rngs(42))
+        model1 = StaticModel(config1, in_features=5, rngs=nnx.Rngs(42))
+        model2 = StaticModel(config2, in_features=5, rngs=nnx.Rngs(42))
 
         x = jnp.array([[1.0, 2.0, 3.0]])
 
@@ -176,17 +209,17 @@ class TestStaticModel:
 
     def test_different_seeds_different_outputs(self):
         """Test that different seeds produce different model outputs."""
-        config = make_minimal_config()
+        config1 = make_minimal_config()
+        config2 = make_minimal_config()
 
-        model1 = StaticModel(config, in_features=5, rngs=nnx.Rngs(0))
-        model2 = StaticModel(config, in_features=5, rngs=nnx.Rngs(1))
+        model1 = StaticModel(config1, in_features=5, rngs=nnx.Rngs(0))
+        model2 = StaticModel(config2, in_features=5, rngs=nnx.Rngs(1))
 
         x = jnp.array([[1.0, 2.0, 3.0]])
 
         out1 = model1(x, mode="potential")["potential"]
         out2 = model2(x, mode="potential")["potential"]
 
-        # Different seeds should produce different weights -> different outputs
         assert not jnp.allclose(out1, out2)
 
 
@@ -198,7 +231,6 @@ class TestStaticModelIntegration:
         config = make_minimal_config()
         model = StaticModel(config, in_features=5, rngs=nnx.Rngs(0))
 
-        # Process single points through vmap
         x_batch = jnp.array([[[1.0, 0.0, 0.0]], [[0.0, 1.0, 0.0]], [[0.0, 0.0, 1.0]]])
 
         @nnx.vmap(in_axes=(0,))

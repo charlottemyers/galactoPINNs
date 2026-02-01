@@ -53,8 +53,6 @@ class ModelPotential(AbstractPotential):
     params: Any = eqx.field()
     # Static configuration (transformers, etc.)
     config: dict = eqx.field(static=True)
-    # The analytic potential, if any, to be passed to the model
-    analytic_potential: Any | None = eqx.field(static=True, default=None)
 
 
     _: KW_ONLY
@@ -105,7 +103,7 @@ class ModelPotential(AbstractPotential):
 
 
 def make_galax_potential(
-    model: nnx.Module, analytic_baseline_potential: GalaxPotential | None = None, *, units: u.AbstractUnitSystem = unitsystems.galactic  # noqa: E501
+    model: nnx.Module, units: u.AbstractUnitSystem = unitsystems.galactic  # noqa: E501
 ) -> ModelPotential:
     """Wrap a trained NNX model as a Galax `AbstractPotential`.
 
@@ -120,7 +118,6 @@ def make_galax_potential(
         out, _ = caller(
             x_scaled,
             mode="potential",
-            analytic_potential=analytic_baseline_potential,
         )
         return out["potential"]
 
@@ -129,8 +126,7 @@ def make_galax_potential(
         caller = nnx.call((graph_def, st))
         out, _ = caller(
             x_scaled,
-            mode="acceleration",
-            analytic_potential=analytic_baseline_potential,
+            mode="acceleration"
         )
         return out["acceleration"]
 

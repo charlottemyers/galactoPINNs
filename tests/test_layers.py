@@ -6,7 +6,6 @@ from flax import nnx
 
 from galactoPINNs.layers import (
     CartesianToModifiedSphericalLayer,
-    FuseModelsLayer,
     ScaleNNPotentialLayer,
     SmoothMLP,
 )
@@ -206,42 +205,6 @@ class TestScaleNNPotentialLayer:
         u_nn = jnp.array([0.5])
         result = apply_scale(layer, x_cart, u_nn)
         assert jnp.isfinite(result).all()
-
-
-class TestFuseModelsLayer:
-    """Tests for FuseModelsLayer."""
-
-    def test_init(self):
-        """Test layer initialization."""
-        layer = FuseModelsLayer()
-        assert layer is not None
-
-    def test_fusion(self):
-        """Test that fusion adds two potential components."""
-        layer = FuseModelsLayer()
-
-        nn_potential = jnp.array([1.0, 2.0, 3.0])
-        analytic_potential = jnp.array([0.5, 0.5, 0.5])
-
-        result = layer(nn_potential, analytic_potential)
-
-        expected = nn_potential + analytic_potential
-        assert jnp.allclose(result, expected)
-
-    def test_jit_compatible(self):
-        """Test JIT compatibility."""
-        layer = FuseModelsLayer()
-
-        @jax.jit
-        def fuse(u_nn, u_analytic):
-            return layer(u_nn, u_analytic)
-
-        u_nn = jnp.array([1.0, 2.0])
-        u_analytic = jnp.array([0.1, 0.2])
-        result = fuse(u_nn, u_analytic)
-
-        assert jnp.allclose(result, u_nn + u_analytic)
-
 
 # Helper classes for testing
 

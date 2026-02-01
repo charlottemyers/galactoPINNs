@@ -11,13 +11,22 @@ from jaxtyping import Array
 from galactoPINNs.layers import (
     CartesianToModifiedSphericalLayer,
     FuseandBoundary,
-    FuseModelsLayer,
     ScaleNNPotentialLayer,
     SmoothMLP,
     TrainableGalaxPotential,
 )
 
 Mode = Literal["full", "potential", "acceleration", "density"]
+
+
+class ExternalPytree(nnx.Variable):
+    """Variable wrapper for external pytrees (like equinox modules).
+
+    This allows galax potentials (which are equinox modules containing JAX arrays)
+    to be stored as attributes in NNX modules without triggering pytree inspection errors.
+    Access the wrapped object via the `.value` attribute.
+    """
+    pass
 
 
 class StaticOutputs(TypedDict, total=False):
@@ -34,8 +43,9 @@ try:
     from galax.potential import AbstractPotential as GalaxPotential
 except Exception:  # noqa: BLE001
     class GalaxPotential(Protocol):
-        def potential(self,    positions: Any, *, t: Any = ...) -> Any: ...
+        def potential(self, positions: Any, *, t: Any = ...) -> Any: ...
         def acceleration(self, positions: Any, *, t: Any = ...) -> Any: ...
+
 
 # ----------------------------
 # Static model
@@ -55,12 +65,13 @@ class StaticModel(nnx.Module):
         A dictionary containing the configuration for the model's architecture
         and behavior. Key options include:
 
+        - ``"ab_potential"``: A galax potential object for the analytic baseline.
+        - ``"scale"``: Scaling mode - either a string ("one", "power", "nfw"),
+          a precomputed array, or a galax potential object.
         - ``"include_analytic"`` (bool): If True, add the analytic baseline
           potential to the NN potential.
         - ``"trainable"`` (bool): If True, use a ``TrainableGalaxPotential``
           layer for the analytic component.
-        - ``"analytic_only"`` (bool): If True, the model output is solely the
-          analytic potential.
         - ``"x_transformer"``, ``"u_transformer"``, ``"a_transformer"``: Objects
           for transforming coordinates and potential between physical and scaled
           units.
@@ -88,25 +99,63 @@ class StaticModel(nnx.Module):
         rngs: nnx.Rngs,
     ) -> None:
         """Initialize the static model layers."""
-        self.config = config
+        # --- Handle analytic baseline potential ---
+        # Galax potentials are equinox modules and must be wrapped in ExternalPytree
+        raw_ab_potential = config.get("ab_potential", None)
+        if raw_ab_potential is not None:
+            self.ab_potential = ExternalPytree(raw_ab_potential)
+        else:
+            self.ab_potential = None
+
+        # --- Prepare cleaned config dicts ---
+        config_without_ab = {
+            k: v for k, v in config.items()
+            if k != "ab_potential"
+        }
+        config_without_externals = {
+            k: v for k, v in config.items()
+            if k not in ("ab_potential", "scale")
+        }
+
+        self.config = config_without_externals
         self.trainable_analytic_layer = trainable_analytic_layer
 
-        # Initialize coordinate transform layer
+        # --- Initialize coordinate transform layer ---
         self.cart_to_sph_layer = CartesianToModifiedSphericalLayer(
             clip=config.get("clip", 1.0)
         )
 
-        # Initialize scaling and fusion layers
-        self.scale_layer = ScaleNNPotentialLayer(config=config)
-        self.fuse_layer = FuseModelsLayer()
-        self.fuse_boundary_layer = FuseandBoundary(config=config)
+        # --- Determine external scale potential for ScaleNNPotentialLayer ---
+        # scale can be: string mode, precomputed array, or galax potential object
+        raw_scale = config.get("scale", "one")
 
-        # Initialize MLP if not disabled
+        if isinstance(raw_scale, str):
+            # String mode ("one", "power", "nfw") - handled internally by ScaleNNPotentialLayer
+            wrapped_scale_potential = None
+        elif isinstance(raw_scale, (jnp.ndarray, jax.Array)):
+            # Precomputed array - handled internally by ScaleNNPotentialLayer
+            wrapped_scale_potential = None
+        else:
+            if raw_scale is raw_ab_potential:
+                # Reuse the already-wrapped ab_potential
+                wrapped_scale_potential = self.ab_potential
+            else:
+                wrapped_scale_potential = ExternalPytree(raw_scale)
+
+        self.scale_layer = ScaleNNPotentialLayer(
+            config=config_without_ab,
+            external_scale=wrapped_scale_potential,
+        )
+
+        # --- Initialize fusion/boundary layer ---
+        self.fuse_boundary_layer = FuseandBoundary(config=config_without_externals)
+
+        # --- Initialize MLP ---
         self.nn_off = config.get("nn_off", False)
         if not self.nn_off:
             depth = config.get("depth", 4)
             width = config.get("width", 128)
-            act = config.get("activation", None)
+            activation = config.get("activation", None)
 
             mlp_kwargs: dict[str, Any] = {
                 "in_features": in_features,
@@ -114,8 +163,8 @@ class StaticModel(nnx.Module):
                 "depth": depth,
                 "rngs": rngs,
             }
-            if act is not None:
-                mlp_kwargs["act"] = act  # must be callable
+            if activation is not None:
+                mlp_kwargs["act"] = activation
             self.mlp = SmoothMLP(**mlp_kwargs)
         else:
             self.mlp = None
@@ -135,8 +184,7 @@ class StaticModel(nnx.Module):
             Potential values. Shape is ``(N,)``, or ``(N, 1)`` for batched input.
 
         """
-        return self(cart_x, mode="potential")["potential"]
-
+        return self(cart_x, mode="potential")["potential"].squeeze()
 
     def compute_laplacian(self, cart_x: Array) -> Array:
         """Compute the Laplacian of the potential.
@@ -157,24 +205,19 @@ class StaticModel(nnx.Module):
         trace. This is substantially more expensive than gradients.
 
         """
-
         def potential_fn(x: Array) -> Array:
-            # Ensure scalar output for hessian()
-            # This now correctly calls the potential computation from __call__
             return self(x, mode="potential")["potential"].squeeze()
 
         def laplacian_single(x: Array) -> Array:
-            hess = jax.hessian(potential_fn)(x)  # (3,3)
+            hess = jax.hessian(potential_fn)(x)  # (3, 3)
             return jnp.trace(hess)
 
-        laplacian_fn = jax.vmap(laplacian_single)
-        return laplacian_fn(cart_x)
+        return jax.vmap(laplacian_single)(cart_x)
 
     def __call__(
         self,
         cart_x: Array,
         mode: Mode = "full",
-        analytic_potential: GalaxPotential | None = None,
     ) -> StaticOutputs:
         """Forward pass for the static model.
 
@@ -185,14 +228,10 @@ class StaticModel(nnx.Module):
             (N, 3) for a batch. Assumed to be in the model's scaled space.
         mode
             Controls what is computed/returned:
-            - "full": return at least potential and acceleration (and any aux outputs).
-            - "potential": compute/return only the potential pathway.
+            - "full": return potential, acceleration, and auxiliary outputs.
+            - "potential": compute/return only the potential.
             - "acceleration": compute/return acceleration.
             - "density": compute/return potential, acceleration, and Laplacian.
-        analytic_potential : galax.potential.AbstractPotential, optional
-            An external, non-trainable analytic potential object. This is only
-            used if ``config["include_analytic"]`` is True and
-            ``config["trainable"]`` is False.
 
         Returns
         -------
@@ -200,71 +239,74 @@ class StaticModel(nnx.Module):
             A dict-like object containing keys "potential" and "acceleration".
 
         """
-        outputs: dict[str, Any] = {}
+        aux_outputs: dict[str, Any] = {}
 
+        # --- Coordinate transformation ---
         if self.config.get("convert_to_spherical", True):
-            x = self.cart_to_sph_layer(cart_x)
+            x_transformed = self.cart_to_sph_layer(cart_x)
         else:
-            x = cart_x
+            x_transformed = cart_x
 
-        u_nn = 0.0 if self.nn_off or self.mlp is None else self.mlp(x)
+        # --- Neural network potential ---
+        u_nn = 0.0 if self.nn_off or self.mlp is None else self.mlp(x_transformed)
 
+        # --- Analytic baseline potential ---
         analytic_potential_scaled = 0.0
         r_s_learned = self.config["r_s"]
+
         if self.config.get("include_analytic", False):
-            # 1. Evaluate the external analytic potential in physical units
+            # Transform to physical coordinates
             x_phys = self.config["x_transformer"].inverse_transform(cart_x)
             u_phys = 0.0
-            if analytic_potential is not None:
-                u_phys = analytic_potential.potential(x_phys, t=0) # Assuming t=0
+
+            if self.ab_potential is not None and not self.config.get("trainable", False):
+                u_phys = self.ab_potential.value.potential(x_phys, t=0)
             elif self.config.get("trainable", False):
                 u_phys, r_s_learned = self.trainable_analytic_layer(x_phys)
 
-            # 2. Transform to scaled units
-            analytic_potential_scaled = self.config["u_transformer"].transform(
-                    u_phys
-                )
+            # Transform potential to scaled units
+            analytic_potential_scaled = self.config["u_transformer"].transform(u_phys)
 
-        scaled_potential = self.scale_layer(cart_x, u_nn, r_s_learned=r_s_learned)
-        fused_potential = self.fuse_layer(scaled_potential, analytic_potential_scaled)
-        fuse_boundary_potential = self.fuse_boundary_layer(cart_x, scaled_potential, analytic_potential_scaled)
+        # --- Combine potentials ---
+        scaled_nn_potential = self.scale_layer(cart_x, u_nn, r_s_learned=r_s_learned)
+        fused_potential = scaled_nn_potential + analytic_potential_scaled
+        boundary_potential = self.fuse_boundary_layer(
+            cart_x, scaled_nn_potential, analytic_potential_scaled
+        )
 
-
-        if self.config.get("analytic_only", False):
-            potential = analytic_potential_scaled
-        elif self.config.get("enforce_boundary", False):
-            potential = fuse_boundary_potential
+        # --- Select final potential based on config ---
+        if self.config.get("enforce_boundary", False):
+            potential = boundary_potential
         elif self.config.get("include_analytic", True):
             potential = fused_potential
         else:
-            potential = scaled_potential
+            potential = scaled_nn_potential
 
-        outputs["final"] = potential
+        aux_outputs["final"] = potential
 
+        # --- Return early if only potential requested ---
         if mode == "potential":
             return {"potential": potential}
 
-        def potential_for_grad(x_arg: Array) -> Array:
-            return self(x_arg, mode="potential", analytic_potential=analytic_potential)[
-                "potential"
-            ].squeeze()
+        # --- Compute acceleration via autodiff ---
+        acceleration = -jax.vmap(jax.grad(self.compute_potential))(cart_x)
 
-        acceleration = -jax.vmap(jax.grad(potential_for_grad))(cart_x)
 
+        # --- Compute Laplacian if density mode ---
         if mode == "density":
             def laplacian_single(x_arg: Array) -> Array:
-                hess = jax.hessian(potential_for_grad)(x_arg)
+                hess = jax.hessian(self.compute_potential)(x_arg)
                 return jnp.trace(hess)
 
             laplacian = jax.vmap(laplacian_single)(cart_x)
             return {
-                "laplacian": laplacian,
-                "acceleration": acceleration,
                 "potential": potential,
+                "acceleration": acceleration,
+                "laplacian": laplacian,
             }
 
         return {
-            "acceleration": acceleration,
             "potential": potential,
-            "outputs": outputs,
+            "acceleration": acceleration,
+            "outputs": aux_outputs,
         }

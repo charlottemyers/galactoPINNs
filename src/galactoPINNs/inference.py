@@ -22,8 +22,6 @@ def apply_model(
     model_or_params: _NNXModelLike | Params,
     x_or_apply_fn: Array | ApplyFn,
     x_scaled: Array | None = None,
-    *,
-    analytic_potential: Any | None = None,
 ) -> dict[str, Any]:
     """Apply a model to scaled inputs and return standardized outputs.
 
@@ -43,8 +41,6 @@ def apply_model(
         In functional mode, the model's functional `apply` method.
     x_scaled
         In functional mode, the scaled input array. Must be provided.
-    analytic_potential : optional
-        An external analytic potential to be passed to the model's call.
 
     Returns
     -------
@@ -52,7 +48,6 @@ def apply_model(
         Dictionary with standardized keys: "u_pred", "a_pred", "outputs".
 
     """
-    # Check if the second argument is a function to determine the mode.
     if callable(x_or_apply_fn):  # Functional Mode
         params = model_or_params
         apply_fn = x_or_apply_fn
@@ -61,7 +56,7 @@ def apply_model(
             raise ValueError(
                 "In functional mode, `x_scaled` must be provided as the third argument."
             )
-        predictions = apply_fn(params, x, analytic_potential=analytic_potential)
+        predictions = apply_fn(params, x)
 
     else:  # Object Mode
         model = model_or_params
@@ -70,7 +65,7 @@ def apply_model(
             raise ValueError(
                 "In object mode, do not provide the third positional argument `x_scaled`."
             )
-        predictions = model(x, analytic_potential=analytic_potential)
+        predictions = model(x)
 
     return {
         "u_pred": predictions["potential"],
