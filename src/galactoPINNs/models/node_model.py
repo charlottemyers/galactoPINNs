@@ -494,9 +494,14 @@ class NODEModel(nnx.Module):
             if self.ab_potential is not None:
                 # Transform to physical coordinates
                 x_phys = self.config["x_transformer"].inverse_transform(x_cart)
+                t_phys = self.config["t_transformer"].inverse_transform(tx_cart[:, 0])
 
                 # Evaluate analytic potential (access wrapped value)
-                u_phys = self.ab_potential.value.potential(x_phys, t=t)
+
+                # u_phys = self.ab_potential.value.potential(x_phys, t=t)
+                def potential_fn(pos, t):
+                    return self.ab_potential.value.potential(pos, t)  # .ustrip("kpc2/Myr2")
+                u_phys = jax.vmap(potential_fn)(x_phys, t_phys)
 
                 # Transform potential to scaled units
                 analytic_potential_scaled = self.config["u_transformer"].transform(u_phys)

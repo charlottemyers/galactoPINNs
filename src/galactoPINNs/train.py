@@ -13,7 +13,7 @@ __all__ = (
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal, Protocol
-
+import jax
 import jax.numpy as jnp
 import optax
 from flax import nnx
@@ -23,16 +23,6 @@ log = logging.getLogger(__name__)
 
 StaticTarget = Literal["acceleration", "orbit_energy", "mixed"]
 TrainStepFn = Callable[..., Array]
-
-# --- Typing for the analytic potential ---
-try:
-    from galax.potential import AbstractPotential as GalaxPotential
-except Exception:  # noqa: BLE001
-    # fallback: duck-typed "potential-like" object
-    class GalaxPotential(Protocol):
-        def potential(self,    positions: Any, *, t: Any = ...) -> Any: ...
-        def acceleration(self, positions: Any, *, t: Any = ...) -> Any: ...
-
 
 
 def create_optimizer(
@@ -76,7 +66,8 @@ def get_model_params(model: nnx.Module) -> dict[str, Any]:
 
 #############
 
-@nnx.jit(static_argnames=("target",))
+
+@nnx.jit(static_argnames=("target", "ramp_kind", "balance_grads"))
 def train_step_static(
     model: nnx.Module,
     optimizer: nnx.Optimizer,
@@ -87,8 +78,18 @@ def train_step_static(
     orbit_q: Array | None = None,
     orbit_p: Array | None = None,
     lambda_E: float = 5.0,
-    std_weight: float = 10.0,
-    target: Literal["acceleration", "orbit_energy", "mixed"] = "acceleration",
+    target: Literal[
+        "acceleration",
+        "orbit_energy",
+        "mixed",
+        "mixed_dev_from_initial",
+    ] = "acceleration",
+    # --- ramp / balancing  ---
+    step: int = 0,
+    total_steps: int = 1,
+    ramp_kind: Literal["linear", "cosine", "sigmoid"] = "cosine",
+    ramp_sharp: float = 10.0,       # only used when ramp_kind="sigmoid"
+    balance_grads: bool = True,
 ) -> Array:
     """Perform one optimizer step for a static potential model.
 
@@ -97,21 +98,31 @@ def train_step_static(
     via the optimizer. The loss target is controlled by ``target``:
 
     - ``"acceleration"``: matches predicted accelerations to ``a_true`` at input
-    positions ``x``.
+      positions ``x``.
     - ``"orbit_energy"``: penalizes non-conservation of total specific energy
-    along pre-computed orbit trajectories.
-    - ``"mixed"``: uses a weighted sum of the orbit-energy loss and the
-    acceleration loss.
+      along pre-computed orbit trajectories (std of energy only).
+    - ``"mixed"``: weighted sum of the orbit-energy loss and the acceleration
+      loss, with a warm-up ramp on ``lambda_E`` and optional gradient-norm
+      balancing.
+    - ``"mixed_dev_from_initial"``: same as ``"mixed"`` but uses a fractional
+      energy-drift loss (relative to the initial energy) instead of the
+      std-based loss.
 
     Notes
     -----
     - This function is JIT-compiled using ``nnx.jit``.
     - The model and optimizer are mutated in place (NNX pattern).
+    - ``lambda_E`` is ramped from 0 → ``lambda_E`` over training using the
+      schedule selected by ``ramp_kind``.
+    - When ``balance_grads=True`` the energy-loss gradient tree is rescaled so
+      that its L2 norm matches that of the acceleration-loss gradient tree
+      before combining, preventing one term from dominating purely due to
+      magnitude differences.
     - The implementation assumes the model returns a dict containing:
         - ``"acceleration"`` when called as ``model(x)``
-        - ``"potential"`` when called as ``model(q_flat, mode="potential")``
-    - Orbit arrays ``orbit_q`` and ``orbit_p`` are expected to already be in the
-    model's scaled / nondimensional coordinates/velocities
+        - ``"potential"``    when called as ``model(q_flat, mode="potential")``
+    - Orbit arrays ``orbit_q`` and ``orbit_p`` are expected to already be in
+      the model's scaled / nondimensional coordinates/velocities.
 
     Parameters
     ----------
@@ -120,100 +131,154 @@ def train_step_static(
     optimizer
         NNX optimizer wrapping the model parameters.
     x
-        Batch of input positions. Shape ``(N, 3)`` (scaled coordinates).
+        Batch of input positions, shape ``(N, 3)`` (scaled coordinates).
     a_true
-        True accelerations at ``x``. Shape ``(N, 3)`` (scaled accelerations).
+        True accelerations at ``x``, shape ``(N, 3)`` (scaled accelerations).
     lambda_rel
-        Weight applied to a relative-error term in the acceleration loss.
-        Larger values emphasize fractional error in regions where |a_true| is small.
+        Weight for the relative-error term in the acceleration loss.
     orbit_q
-        Orbit positions over time for orbit-energy training.
-        Required if ``target`` is ``"orbit_energy"`` or ``"mixed"``.
-        Shape ``(B, T, 3)``.
+        Orbit positions over time, shape ``(B, T, 3)``.
+        Required when ``target`` is not ``"acceleration"``.
     orbit_p
-        Orbit momenta (assuming unit test mass) over time for orbit-energy training.
-        Required if ``target`` is ``"orbit_energy"`` or ``"mixed"``.
-        Shape ``(B, T, 3)``.
+        Orbit momenta (unit test mass) over time, shape ``(B, T, 3)``.
+        Required when ``target`` is not ``"acceleration"``.
     lambda_E
-        Weight applied to the orbit-energy loss when ``target="mixed"``.
+        Maximum weight applied to the orbit-energy loss (reached at the end of
+        the ramp).
     std_weight
-        Weight applied to the within-orbit energy standard deviation term.
+        Weight applied to the within-orbit energy standard-deviation term.
+        Only used by the ``"orbit_energy"`` and ``"mixed"`` targets.
     target
-        Loss configuration. One of:
-        ``"acceleration"``, ``"orbit_energy"``, or ``"mixed"``.
+        Loss configuration; one of ``"acceleration"``, ``"orbit_energy"``,
+        ``"mixed"``, ``"mixed_dev_from_initial"``.
+    step
+        Current training step (0-indexed). Used to compute ramp progress.
+    total_steps
+        Total number of training steps. Used to compute ramp progress.
+    ramp_kind
+        Schedule shape for ramping ``lambda_E``:
+        ``"linear"``, ``"cosine"``, or ``"sigmoid"``.
+    ramp_sharp
+        Sharpness parameter for the sigmoid ramp (ignored otherwise).
+    balance_grads
+        If ``True``, rescale the energy-loss gradient tree so its L2 norm
+        matches that of the acceleration-loss gradient tree before summing.
 
     Returns
     -------
     loss
-        A scalar JAX array (shape ``()``) containing the loss value for this step.
+        Scalar JAX array (shape ``()``) containing the combined loss for this
+        step.
 
     Raises
     ------
     ValueError
-        If ``target`` requires orbit inputs but ``orbit_q`` or ``orbit_p`` is None.
-
+        If ``target`` requires orbit inputs but ``orbit_q`` or ``orbit_p``
+        is ``None``.
     """
-    if target in ("orbit_energy", "mixed") and (orbit_q is None or orbit_p is None):
+    if target != "acceleration" and (orbit_q is None or orbit_p is None):
         raise ValueError(f"target='{target}' requires orbit_q and orbit_p (got None).")
 
-    # Extract trainable and frozen parts of the model
+    # ------------------------------------------------------------------
+    # Training ramp helper
+    # ------------------------------------------------------------------
+    def _ramp(progress: Array) -> Array:
+        p = jnp.clip(progress, 0.0, 1.0)
+        if ramp_kind == "linear":
+            return p
+        elif ramp_kind == "cosine":
+            return 0.5 * (1.0 - jnp.cos(jnp.pi * p))
+        else:  # "sigmoid"
+            return jax.nn.sigmoid(ramp_sharp * (p - 0.5))
+
+    progress = jnp.asarray(step, dtype=jnp.float32) / jnp.maximum(
+        1.0, jnp.asarray(total_steps - 1, dtype=jnp.float32)
+    )
+    wE = lambda_E * _ramp(progress)   # effective energy weight this step
+
+    # ------------------------------------------------------------------
+    # Split model into trainable vs frozen state (NNX pattern)
+    # ------------------------------------------------------------------
     graphdef, train_state, frozen_state = nnx.split(model, optimizer.wrt, ...)
 
-    def loss_fn(train_state: nnx.State) -> Array:
-        # Reconstruct full model for forward pass
-        m = nnx.merge(graphdef, train_state, frozen_state)
-
-        # -------- acceleration loss --------
-        out: dict[str, Array] = m(x)
-        a_pred = out["acceleration"]  # (N, 3)
-
-        diff = a_pred - a_true
-        diff_norm = jnp.linalg.norm(diff, axis=1)       # (N,)
-        a_true_norm = jnp.linalg.norm(a_true, axis=1)   # (N,)
+    # ------------------------------------------------------------------
+    # Per-objective loss functions (take train_state, return scalar)
+    # ------------------------------------------------------------------
+    def _acc_loss(ts: nnx.State) -> Array:
+        m = nnx.merge(graphdef, ts, frozen_state)
+        a_pred = m(x)["acceleration"]          # (N, 3)
+        diff      = a_pred - a_true
+        diff_norm = jnp.linalg.norm(diff,   axis=1)   # (N,)
+        true_norm = jnp.linalg.norm(a_true, axis=1)   # (N,)
         eps = 1e-10
-        acc_loss = jnp.mean(diff_norm + lambda_rel * (diff_norm / (a_true_norm + eps)))
+        return jnp.mean(diff_norm + lambda_rel * (diff_norm / (true_norm + eps)))
 
-        if target == "acceleration":
-            return acc_loss
+    def _orbit_energy(ts: nnx.State, oq: Array, op: Array) -> Array:
+        """Return total specific energy E(t), shape ``(B, T)``."""
+        m = nnx.merge(graphdef, ts, frozen_state)
+        B, T, _ = oq.shape
+        T_ke    = 0.5 * jnp.sum(op ** 2, axis=-1)          # (B, T)
+        q_flat  = oq.reshape(B * T, 3)
+        Phi     = m(q_flat, mode="potential")["potential"].reshape(B, T)
+        return T_ke + Phi
 
-        # -------- orbit-energy loss helpers --------
-        def orbit_energy(orbit_q_scaled: Array, orbit_p_scaled: Array) -> Array:
-            """E(t) = 0.5||v||^2 + Phi(q). Returns (B, T)."""
-            B, T, _ = orbit_q_scaled.shape
-            T_ke = 0.5 * jnp.sum(orbit_p_scaled**2, axis=-1)  # (B, T)
+    def _E_loss_std(ts: nnx.State) -> Array:
+        """Std-only energy-conservation loss (Linen `orbit_E_loss`)."""
+        assert orbit_q is not None and orbit_p is not None
+        E = _orbit_energy(ts, orbit_q, orbit_p)             # (B, T)
+        std_E = jnp.std(E - jnp.mean(E, axis=1, keepdims=True), axis=1)
+        return jnp.mean(std_E ** 2)
 
-            q_flat = orbit_q_scaled.reshape(B * T, 3)  # (B*T, 3)
-            outp: dict[str, Array] = m(
-                q_flat, mode="potential"
-            )
-            Phi_flat = outp["potential"]               # (B*T,)
-            Phi = Phi_flat.reshape(B, T)               # (B, T)
-            return T_ke + Phi
+    def _E_loss_dev_from_initial(ts: nnx.State) -> Array:
+        """Fractional energy drift relative to E(t=0)."""
+        assert orbit_q is not None and orbit_p is not None
+        E  = _orbit_energy(ts, orbit_q, orbit_p)            # (B, T)
+        E0 = E[:, 0:1]                                      # (B, 1)
+        return jnp.mean(((E - E0) / (jnp.abs(E0) + 1e-8)) ** 2)
 
-        def orbit_E_loss(orbit_q_scaled: Array, orbit_p_scaled: Array) -> Array:
-            """mean_b[ (E_T - E_0)^2 + std_weight * std_t(E - mean_t E)^2 ]."""
-            E = orbit_energy(orbit_q_scaled, orbit_p_scaled)  # (B, T)
-            delta_E = E[:, -1] - E[:, 0]                      # (B,)
+    # ------------------------------------------------------------------
+    # Gradient-norm helper
+    # ------------------------------------------------------------------
+    def _tree_l2(tree: nnx.State) -> Array:
+        leaves = jax.tree_util.tree_leaves(tree)
+        return jnp.sqrt(sum(jnp.sum(l * l) for l in leaves))
 
-            E_centered = E - jnp.mean(E, axis=1, keepdims=True)
-            std_E = jnp.std(E_centered, axis=1)               # (B,)
+    # ------------------------------------------------------------------
+    # Compute loss + gradients
+    # ------------------------------------------------------------------
+    if target == "acceleration":
+        loss, grads = nnx.value_and_grad(_acc_loss)(train_state)
 
-            return jnp.mean(delta_E**2 + std_weight * std_E**2)
+    elif target == "orbit_energy":
+        # Pure energy loss (no acceleration term)
+        loss, grads = nnx.value_and_grad(_E_loss_std)(train_state)
 
-        # dispatch
-        assert orbit_q is not None
-        assert orbit_p is not None
-        E_loss = orbit_E_loss(orbit_q, orbit_p)
+    else:
+        # "mixed" or "mixed_dev_from_initial" — compute both grad trees
+        loss_a, grad_a = nnx.value_and_grad(_acc_loss)(train_state)
 
-        if target == "orbit_energy":
-            return E_loss
+        if target == "mixed_dev_from_initial":
+            loss_e, grad_e = nnx.value_and_grad(_E_loss_dev_from_initial)(train_state)
+        else:  # "mixed"
+            loss_e, grad_e = nnx.value_and_grad(_E_loss_std)(train_state)
 
-        # target == "mixed"
-        return acc_loss + lambda_E * E_loss
+        # Optional gradient-norm balancing
+        if balance_grads:
+            na    = _tree_l2(grad_a) + 1e-12
+            ne    = _tree_l2(grad_e) + 1e-12
+            scale = jax.lax.stop_gradient(na / ne)
+        else:
+            scale = 1.0
 
-    loss, grads = nnx.value_and_grad(loss_fn)(train_state)
+        loss  = loss_a + wE * loss_e
+        grads = jax.tree_util.tree_map(
+            lambda ga, ge: ga + wE * scale * ge,
+            grad_a, grad_e,
+        )
+
     optimizer.update(model, grads)
     return loss
+
 
 @nnx.jit
 def train_step_node(
@@ -312,14 +377,23 @@ def train_model_static(
     lambda_E: float = 5.0,
     std_weight: float = 10.0,
     train_dict: Mapping[StaticTarget, int] | None = None,
+    ramp_kind: Literal["linear", "cosine", "sigmoid"] = "cosine",
+    ramp_sharp: float = 10.0,
+    balance_grads: bool = True,
 ) -> dict[str, Any]:
     """Train a static potential model for a specified number of epochs.
 
     This function is a simple training driver that repeatedly calls
-    :func:`train_step_static` on the full training arrays
+    :func:`train_step_static` on the full training arrays.
     It supports either:
       - a single training objective for ``num_epochs`` (via ``target``), or
       - a staged schedule of objectives (via ``train_dict``).
+
+    The ramp and gradient-balancing parameters are forwarded directly to
+    :func:`train_step_static`. The ramp progress is computed globally across
+    all stages so that ``lambda_E`` reaches its full value only at the very
+    last step of the entire training run, regardless of how many stages are
+    used.
 
     Parameters
     ----------
@@ -328,14 +402,15 @@ def train_model_static(
     tx
         Optax optimizer transformation used to update parameters.
     x_train
-        Training positions, typically shape ``(N, 3)`` in scaled coordinates.
+        Training positions, shape ``(N, 3)`` in scaled coordinates.
     a_train
         True accelerations at ``x_train``, shape ``(N, 3)`` in scaled units.
     num_epochs
         Total number of epochs to train if ``train_dict`` is not provided.
     target
         Default loss target when ``train_dict`` is not provided. One of
-        ``"acceleration"``, ``"orbit_energy"``, or ``"mixed"``.
+        ``"acceleration"``, ``"orbit_energy"``, ``"mixed"``, or
+        ``"mixed_dev_from_initial"``.
     log_every
         Print a progress line every ``log_every`` epochs.
     lambda_rel
@@ -344,28 +419,36 @@ def train_model_static(
         Optional pre-initialized ``nnx.Optimizer``. If not provided, a new
         optimizer is created from the model and ``tx``.
     orbit_q
-        Scaled orbit positions used for orbit-energy loss. Required when any
-        stage uses ``"orbit_energy"`` or ``"mixed"``. Expected shape ``(B, T, 3)``.
+        Scaled orbit positions for orbit-energy loss, shape ``(B, T, 3)``.
+        Required when any stage uses a non-acceleration target.
     orbit_p
-        Scaled orbit velocities/momenta used for orbit-energy loss. Required when any
-        stage uses ``"orbit_energy"`` or ``"mixed"``. Expected shape ``(B, T, 3)``.
+        Scaled orbit momenta for orbit-energy loss, shape ``(B, T, 3)``.
+        Required when any stage uses a non-acceleration target.
     lambda_E
-        Weight for the orbit-energy loss component when target is ``"mixed"``.
+        Maximum weight for the orbit-energy loss component (reached at end of
+        the ramp).
     std_weight
-        Weight for the within-orbit energy standard deviation term.
+        Weight for the within-orbit energy standard-deviation term.
     train_dict
-        Optional staged training schedule mapping targets to epoch counts, e.g.:
-            ``{"acceleration": 2000, "mixed": 1000}``
+        Optional staged training schedule mapping targets to epoch counts, e.g.
+        ``{"acceleration": 2000, "mixed": 1000}``.
+    ramp_kind
+        Schedule shape for ramping ``lambda_E`` from 0 to its full value:
+        ``"linear"``, ``"cosine"``, or ``"sigmoid"``.
+    ramp_sharp
+        Sharpness parameter for the sigmoid ramp (ignored for other kinds).
+    balance_grads
+        If ``True``, rescale the energy-loss gradient tree so its L2 norm
+        matches the acceleration-loss gradient tree before summing.
 
     Returns
     -------
     out : dict
         Dictionary with:
-        - ``"model"``: the trained model
-        - ``"optimizer"``: the final optimizer state
-        - ``"epochs"``: list of epoch indices completed per stage (ints)
-        - ``"losses"``: list of final loss values per stage (JAX scalars)
-
+        - ``"model"``:     the trained model (mutated in place).
+        - ``"optimizer"``: the final optimizer state.
+        - ``"epochs"``:    list of final epoch indices completed per stage.
+        - ``"losses"``:    list of final loss values per stage (JAX scalars).
     """
     epochs: list[int] = []
     losses: list[Array] = []
@@ -376,6 +459,10 @@ def train_model_static(
     schedule: Mapping[StaticTarget, int] = (
         train_dict if train_dict is not None else {target: num_epochs}
     )
+
+    # Total steps across all stages
+    total_steps: int = int(sum(schedule.values()))
+    global_step: int = 0
 
     for stage_target, n_epochs in schedule.items():
         log.info("Training for %d epochs on target: %s", n_epochs, stage_target)
@@ -392,7 +479,15 @@ def train_model_static(
                 orbit_p=orbit_p,
                 lambda_E=lambda_E,
                 std_weight=std_weight,
+                # ramp / balancing
+                step=global_step,
+                total_steps=total_steps,
+                ramp_kind=ramp_kind,
+                ramp_sharp=ramp_sharp,
+                balance_grads=balance_grads,
             )
+            global_step += 1
+
             if log_every > 0 and (epoch % log_every == 0):
                 log.info("Epoch %d, Loss: %.6f", epoch + 1, float(loss))
 
@@ -520,18 +615,17 @@ def train_model_with_trainable_analytic_layer(
         If ``trainable_analytic_layer`` is not present in the model.
 
     """
-    # Log at start
     if log_every > 0:
         log.info("Training for %d epochs...", num_epochs)
 
-    # Training loop - train_step is already JIT-compiled
+    # Training loop
     loss = jnp.array(0.0)  # Initialize for type checker
     for epoch in range(num_epochs):
         loss = train_step(model, optimizer, x_train, a_train, lambda_rel=lambda_rel)
         if log_every > 0 and (epoch % log_every == 0):
             log.info("Epoch %d, Loss: %.6f", epoch + 1, float(loss))
 
-    # Extract final analytic params (only once at the end, not every epoch)
+    # Extract final analytic params
     final_analytic_params = None
     analytic_layer = model.trainable_analytic_layer
     if analytic_layer is not None:

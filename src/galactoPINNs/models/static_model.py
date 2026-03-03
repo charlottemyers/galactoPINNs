@@ -26,6 +26,7 @@ class ExternalPytree(nnx.Variable):
     to be stored as attributes in NNX modules without triggering pytree inspection errors.
     Access the wrapped object via the `.value` attribute.
     """
+
     pass
 
 
@@ -100,9 +101,10 @@ class StaticModel(nnx.Module):
     ) -> None:
         """Initialize the static model layers."""
         # --- Handle analytic baseline potential ---
-        # Galax potentials are equinox modules and must be wrapped in ExternalPytree
         raw_ab_potential = config.get("ab_potential", None)
-        if raw_ab_potential is not None:
+        if isinstance(raw_ab_potential, ExternalPytree):
+            self.ab_potential = raw_ab_potential
+        elif raw_ab_potential is not None:
             self.ab_potential = ExternalPytree(raw_ab_potential)
         else:
             self.ab_potential = None
@@ -126,7 +128,6 @@ class StaticModel(nnx.Module):
         )
 
         # --- Determine external scale potential for ScaleNNPotentialLayer ---
-        # scale can be: string mode, precomputed array, or galax potential object
         raw_scale = config.get("scale", "one")
 
         if isinstance(raw_scale, str):
@@ -136,11 +137,15 @@ class StaticModel(nnx.Module):
             # Precomputed array - handled internally by ScaleNNPotentialLayer
             wrapped_scale_potential = None
         else:
-            if raw_scale is raw_ab_potential:
-                # Reuse the already-wrapped ab_potential
+            # raw_scale is an external potential-like object
+            if isinstance(raw_scale, ExternalPytree):
+                wrapped_scale_potential = raw_scale
+            elif raw_scale is raw_ab_potential:
                 wrapped_scale_potential = self.ab_potential
             else:
                 wrapped_scale_potential = ExternalPytree(raw_scale)
+
+
 
         self.scale_layer = ScaleNNPotentialLayer(
             config=config_without_ab,
@@ -169,22 +174,34 @@ class StaticModel(nnx.Module):
         else:
             self.mlp = None
 
-    def compute_potential(self, cart_x: Array) -> Array:
+
+    def compute_potential(
+    self,
+    cart_x: Array,
+    *,
+    trainable_analytic_layer: TrainableGalaxPotential | None = None,
+    ) -> Array:
         """Evaluate the model potential at Cartesian position(s).
 
         Parameters
         ----------
         cart_x
-            Input positions. Typically shape ``(3,)`` for a single point or
-            ``(N, 3)`` for a batch.
+            Input positions, shape ``(N, 3)`` for a batch or ``(3,)`` for a
+            single point. Assumed to be in the model's scaled space.
+        trainable_analytic_layer
+            Optional trainable analytic layer to use in place of
+            ``self.trainable_analytic_layer``. Required when
+            ``config["trainable"]`` is ``True`` and the layer is passed
+            externally (e.g. during SVI).
 
         Returns
         -------
         potential
-            Potential values. Shape is ``(N,)``, or ``(N, 1)`` for batched input.
+            Squeezed potential values, shape ``(N,)`` for batched input.
 
         """
-        return self(cart_x, mode="potential")["potential"].squeeze()
+        return self(cart_x, mode="potential", trainable_analytic_layer=trainable_analytic_layer)["potential"].squeeze()
+
 
     def compute_laplacian(self, cart_x: Array) -> Array:
         """Compute the Laplacian of the potential.
@@ -218,6 +235,7 @@ class StaticModel(nnx.Module):
         self,
         cart_x: Array,
         mode: Mode = "full",
+        trainable_analytic_layer: TrainableGalaxPotential | None = None,  # <-- ADD
     ) -> StaticOutputs:
         """Forward pass for the static model.
 
@@ -252,7 +270,7 @@ class StaticModel(nnx.Module):
 
         # --- Analytic baseline potential ---
         analytic_potential_scaled = 0.0
-        r_s_learned = self.config["r_s"]
+        r_s_learned = self.config.get("r_s", 1.0)
 
         if self.config.get("include_analytic", False):
             # Transform to physical coordinates
@@ -262,7 +280,10 @@ class StaticModel(nnx.Module):
             if self.ab_potential is not None and not self.config.get("trainable", False):
                 u_phys = self.ab_potential.value.potential(x_phys, t=0)
             elif self.config.get("trainable", False):
-                u_phys, r_s_learned = self.trainable_analytic_layer(x_phys)
+                layer = trainable_analytic_layer if trainable_analytic_layer is not None else self.trainable_analytic_layer
+                if layer is None:
+                    raise ValueError("config['trainable']=True but no trainable_analytic_layer was provided.")
+                u_phys, r_s_learned = layer(x_phys)
 
             # Transform potential to scaled units
             analytic_potential_scaled = self.config["u_transformer"].transform(u_phys)
@@ -289,8 +310,10 @@ class StaticModel(nnx.Module):
             return {"potential": potential}
 
         # --- Compute acceleration via autodiff ---
-        acceleration = -jax.vmap(jax.grad(self.compute_potential))(cart_x)
+        def pot_single(x1: Array) -> Array:
+            return self.compute_potential(x1[None, :], trainable_analytic_layer=trainable_analytic_layer).squeeze()
 
+        acceleration = -jax.vmap(jax.grad(pot_single))(cart_x)
 
         # --- Compute Laplacian if density mode ---
         if mode == "density":
