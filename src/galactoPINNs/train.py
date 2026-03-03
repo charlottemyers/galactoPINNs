@@ -145,9 +145,6 @@ def train_step_static(
     lambda_E
         Maximum weight applied to the orbit-energy loss (reached at the end of
         the ramp).
-    std_weight
-        Weight applied to the within-orbit energy standard-deviation term.
-        Only used by the ``"orbit_energy"`` and ``"mixed"`` targets.
     target
         Loss configuration; one of ``"acceleration"``, ``"orbit_energy"``,
         ``"mixed"``, ``"mixed_dev_from_initial"``.
@@ -375,7 +372,6 @@ def train_model_static(
     orbit_q: Array | None = None,
     orbit_p: Array | None = None,
     lambda_E: float = 5.0,
-    std_weight: float = 10.0,
     train_dict: Mapping[StaticTarget, int] | None = None,
     ramp_kind: Literal["linear", "cosine", "sigmoid"] = "cosine",
     ramp_sharp: float = 10.0,
@@ -427,8 +423,6 @@ def train_model_static(
     lambda_E
         Maximum weight for the orbit-energy loss component (reached at end of
         the ramp).
-    std_weight
-        Weight for the within-orbit energy standard-deviation term.
     train_dict
         Optional staged training schedule mapping targets to epoch counts, e.g.
         ``{"acceleration": 2000, "mixed": 1000}``.
@@ -478,7 +472,6 @@ def train_model_static(
                 orbit_q=orbit_q,
                 orbit_p=orbit_p,
                 lambda_E=lambda_E,
-                std_weight=std_weight,
                 # ramp / balancing
                 step=global_step,
                 total_steps=total_steps,
