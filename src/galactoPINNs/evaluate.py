@@ -8,6 +8,7 @@ __all__ = (
 
 from collections.abc import Callable, Mapping
 from typing import Any, Literal
+from galactoPINNs.models.static_model import StaticModel
 
 import jax.numpy as jnp
 import jax.random as jr
@@ -431,3 +432,191 @@ def bnn_performance(
         "a_samples": a_post_phys,
         "u_samples": u_post_phys,
     }
+
+
+
+
+def svi_performance(
+    predictive: Callable,
+    x_test: Array,
+    config: Mapping[str, Any],
+    net_template: StaticModel,
+    analytic_param_dists: Mapping[str, Mapping[str, Any]] | None = None,
+    composite_form: Callable | None = None,
+) -> dict[str, Array]:
+    """Evaluate posterior predictive statistics on a test set.
+
+    Transforms ``x_test`` to scaled coordinates, draws posterior predictive
+    samples for the potential and acceleration via ``predictive``, then
+    maps the samples back to physical units and computes per-point means
+    and standard deviations.
+
+    Parameters
+    ----------
+    predictive
+        A :class:`~numpyro.infer.Predictive` object wrapping :func:`model_svi`,
+        called to draw posterior samples.
+    x_test
+        Test positions in physical units, shape ``(N, 3)`` in ``kpc``.
+    config
+        Model configuration dictionary. Must contain ``"x_transformer"``,
+        ``"u_transformer"``, and ``"a_transformer"`` with ``.transform()``
+        and ``.inverse_transform()`` methods.
+    net_template
+        Instantiated :class:`~galactoPINNs.models.static_model.StaticModel`
+        forwarded to ``predictive``.
+    analytic_param_dists
+        Nested mapping of parameter name to prior keyword arguments,
+        forwarded to ``predictive``. May be ``None`` when
+        ``config["trainable"]`` is ``False``.
+    composite_form
+        Callable that constructs a trainable analytic layer from sampled
+        parameters. May be ``None`` when ``config["trainable"]`` is ``False``.
+
+    Returns
+    -------
+    metrics
+        Dictionary containing:
+
+        - ``"u_mean"``: posterior mean potential in physical units, shape ``(N,)``.
+        - ``"a_mean"``: posterior mean acceleration in physical units, shape ``(N, 3)``.
+        - ``"u_std"``: posterior std of potential in physical units, shape ``(N,)``.
+        - ``"a_std"``: posterior std of acceleration in physical units, shape ``(N, 3)``.
+        - ``"u_samples"``: full posterior potential samples in physical units, shape ``(S, N)``.
+        - ``"a_samples"``: full posterior acceleration samples in physical units, shape ``(S, N, 3)``.
+
+    """
+    x_test_scaled = config["x_transformer"].transform(x_test)
+
+    pred = predictive(
+        jr.PRNGKey(2),
+        x_test_scaled,
+        a_obs=None,
+        config=config,
+        net_template=net_template,
+        analytic_param_dists=analytic_param_dists,
+        composite_form=composite_form,
+    )
+
+    u_post_phys = config["u_transformer"].inverse_transform(pred["potential"])
+    a_post_phys = config["a_transformer"].inverse_transform(pred["acceleration"])
+
+    u_mean = u_post_phys.mean(axis=0)
+    a_mean = a_post_phys.mean(axis=0)
+
+    u_std = u_post_phys.std(axis=0)
+    a_std = a_post_phys.std(axis=0)
+
+    return {
+        "u_mean": u_mean,
+        "a_mean": a_mean,
+        "u_std": u_std,
+        "a_std": a_std,
+        "a_samples": a_post_phys,
+        "u_samples": u_post_phys,
+    }
+
+
+def gauge_invariant_rel_resid(
+    true_u: Array,
+    pred_u: Array,
+    ny: int,
+    nx: int,
+    iy_ref: int | None = None,
+    ix_ref: int | None = None,
+    *,
+    mode: str = "delta_ref",
+    ref_point: str = "center",
+    eps: float = 1e-12,
+) -> tuple[Array, Array, Array]:
+    """Compute a gauge-invariant relative residual map between true and predicted potentials.
+
+    Gravitational potentials are defined only up to an additive constant, so
+    naive relative residuals are gauge-dependent. This function removes the
+    gauge ambiguity via one of two strategies before computing the residual,
+    and returns the result as a percentage.
+
+    Parameters
+    ----------
+    true_u
+        True potential values, shape ``(N,)`` or ``(ny, nx)``, to be reshaped
+        to ``(ny, nx)``.
+    pred_u
+        Predicted potential values, same shape convention as ``true_u``.
+    ny
+        Number of grid points along the y-axis.
+    nx
+        Number of grid points along the x-axis.
+    iy_ref
+        Row index of the reference point used in ``"delta_ref"`` mode. If
+        ``None``, falls back to ``ref_point``.
+    ix_ref
+        Column index of the reference point used in ``"delta_ref"`` mode. If
+        ``None``, falls back to ``ref_point``.
+    mode
+        Gauge-removal strategy. Options:
+
+        - ``"delta_ref"``: subtract the value at a reference point from both
+          fields before computing the residual.
+        - ``"median_offset"`` (or ``"median"``): subtract the median of
+          ``pred_u - true_u`` from the prediction before computing the
+          residual.
+
+        Default ``"delta_ref"``.
+    ref_point
+        Reference point selection when ``iy_ref``/``ix_ref`` are not provided
+        and ``mode="delta_ref"``. Currently only ``"center"`` is supported,
+        which uses ``(ny // 2, nx // 2)``. Default ``"center"``.
+    eps
+        Small value added to the denominator to avoid division by zero.
+        Default ``1e-12``.
+
+    Returns
+    -------
+    true_u_xy
+        True potential reshaped to ``(ny, nx)``.
+    pred_u_xy_gauged
+        Gauge-corrected predicted potential, shape ``(ny, nx)``. Equal to
+        ``pred_u_xy`` in ``"delta_ref"`` mode and ``pred_u_xy - C`` in
+        ``"median_offset"`` mode.
+    rel_resid
+        Percentage relative residual map, shape ``(ny, nx)``.
+
+    Raises
+    ------
+    ValueError
+        If ``mode="delta_ref"`` and neither ``iy_ref``/``ix_ref`` nor
+        ``ref_point="center"`` are provided, or if an unknown ``mode`` is
+        given.
+
+    """
+    true_u_xy = jnp.asarray(true_u).reshape((ny, nx))
+    pred_u_xy = jnp.asarray(pred_u).reshape((ny, nx))
+
+    mode = (mode or "delta_ref").lower()
+
+    if mode == "delta_ref":
+        if iy_ref is None or ix_ref is None:
+            if ref_point == "center":
+                iy_ref, ix_ref = ny // 2, nx // 2
+            else:
+                raise ValueError("Provide iy_ref/ix_ref or set ref_point='center'.")
+
+        true_ref = true_u_xy[iy_ref, ix_ref]
+        pred_ref = pred_u_xy[iy_ref, ix_ref]
+
+        dtrue = true_u_xy - true_ref
+        dpred = pred_u_xy - pred_ref
+
+        rel_resid = 100 * (dtrue - dpred) / (jnp.abs(dtrue) + eps)
+        return true_u_xy, pred_u_xy, rel_resid
+
+    elif mode in ("median_offset", "median"):
+        C = jnp.median(pred_u_xy - true_u_xy)
+        pred_gf = pred_u_xy - C
+
+        rel_resid = 100 * (true_u_xy - pred_gf) / (jnp.abs(true_u_xy) + eps)
+        return true_u_xy, pred_gf, rel_resid
+
+    else:
+        raise ValueError(f"Unknown mode '{mode}'. Use 'delta_ref' or 'median_offset'.")

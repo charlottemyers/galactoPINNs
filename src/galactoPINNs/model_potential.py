@@ -37,7 +37,7 @@ except Exception:  # noqa: BLE001
 class ModelPotential(AbstractPotential):
     """A galax-compatible potential backed by a pure NNX potential function.
 
-    This class is a wrapper that makes a trained neural network model, represented
+    This class is a wrapper that makes a trained galactoPINN model, represented
     by a pure function and its parameters, compatible with the `galax` library.
     It handles the transformation from physical units to the model's scaled
     units and back.
@@ -110,14 +110,16 @@ def make_galax_potential(
     This function extracts pure functions and parameters from the NNX model
     to create a fully-decoupled, JAX-compatible Galax potential.
     """
-    # 1. Split the model into its static definition and trained parameters
+    # Split the model into its static definition and trained parameters
     graph_def, state0 = nnx.split(model)
+    _tal = getattr(model, "trainable_analytic_layer", None)
 
     def potential_fn(st: Any, x_scaled: Array) -> Array:
         caller = nnx.call((graph_def, st))
         out, _ = caller(
             x_scaled,
             mode="potential",
+            trainable_analytic_layer=_tal,
         )
         return out["potential"]
 
@@ -126,14 +128,15 @@ def make_galax_potential(
         caller = nnx.call((graph_def, st))
         out, _ = caller(
             x_scaled,
-            mode="acceleration"
+            mode="acceleration",
+            trainable_analytic_layer=_tal,
         )
         return out["acceleration"]
 
     return ModelPotential(
             potential_fn=potential_fn,
             acceleration_fn=acceleration_fn,
-            params=state0,                      # params is an nnx.State
+            params=state0,
             config=model.config,
             units=units
             )

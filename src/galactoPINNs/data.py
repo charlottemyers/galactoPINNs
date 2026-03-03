@@ -999,28 +999,83 @@ class Transformer:
 def scale_data(
     data_dict: dict[str, Array],
     config: dict,
+    include_velocity: bool = False,
 ) -> tuple[dict[str, Array], dict[str, UniformScaler]]:
-    """Non-dimensionalize input using scale information.
+    r"""Non-dimensionalize input data using characteristic scales derived from the training set.
 
-    Let u_star = max(|u_train|) or max(|u_train - u_analytic|) if include_analytic.
-    Then:
-        t_star = sqrt(r_s^2 / u_star)
-        a_star = r_s / t_star^2
-        x_star = r_s
+    Derives a characteristic potential scale ``u_star``, then computes
+    consistent time, acceleration, position, and velocity scales:
 
-    Scaling is implemented via UniformScaler in constant-scaling mode:
-        x_scaled = x / x_star
-        a_scaled = a / a_star
-        u_scaled = u / u_star
+    .. math::
+
+        u^* = \\max|u_{\\mathrm{train}}| \\quad
+        (\\text{or } \\max|u_{\\mathrm{train}} - u_{\\mathrm{analytic}}|
+        \\text{ if } \\texttt{include\\_analytic})
+
+    .. math::
+
+        t^* = \\sqrt{r_s^2 / u^*}, \\quad
+        a^* = r_s / t^{*2}, \\quad
+        x^* = r_s, \\quad
+        v^* = r_s / t^*
+
+    Scaling is applied via :class:`UniformScaler` in constant-scaling mode:
+
+    .. math::
+
+        x_{\\mathrm{scaled}} = x / x^*, \\quad
+        a_{\\mathrm{scaled}} = a / a^*, \\quad
+        u_{\\mathrm{scaled}} = u / u^*, \\quad
+        v_{\\mathrm{scaled}} = v / v^*
+
+    Parameters
+    ----------
+    data_dict
+        Dictionary containing at minimum the keys ``"x_train"``, ``"a_train"``,
+        ``"u_train"``, ``"x_val"``, ``"a_val"``, and ``"u_val"``, each as
+        arrays in physical units (``kpc``, ``kpc/Myr^2``, ``kpc^2/Myr^2``).
+    config
+        Configuration dictionary. Relevant keys:
+
+        - ``"r_s"`` *(required)*: characteristic length scale in ``kpc``.
+        - ``"x_transformer"``, ``"a_transformer"``, ``"u_transformer"``,
+          ``"v_transformer"``: pre-constructed :class:`UniformScaler` instances.
+          Defaults to ``UniformScaler(feature_range=(-1, 1))`` for each.
+        - ``"include_analytic"`` (bool): if ``True``, ``u_star`` is computed
+          from the residual ``u_train - u_analytic`` rather than ``u_train``
+          directly.
+        - ``"ab_potential"``: analytic galax potential object, required when
+          ``config["include_analytic"]`` is ``True``.
+        - ``"orbit_p"``: orbit velocity array used to fit ``v_transformer``,
+          required when ``include_velocity`` is ``True``.
+    include_velocity
+        If ``True`` and ``config["orbit_p"]`` is not ``None``, fit and return
+        a velocity transformer ``"v"`` keyed in the transformers dict, scaled
+        by ``v_star = r_s / t_star``. Default ``False``.
 
     Returns
     -------
-    scaled_data_dict, transformers
+    scaled
+        Dictionary of scaled arrays with keys ``"x_train"``, ``"a_train"``,
+        ``"u_train"``, ``"r_train"``, ``"x_val"``, ``"a_val"``, ``"u_val"``,
+        ``"r_val"``, and ``"t_star"``.
+    transformers
+        Dictionary of fitted :class:`UniformScaler` objects with keys ``"x"``,
+        ``"a"``, ``"u"``, and optionally ``"v"`` when ``include_velocity`` is
+        ``True`` and orbit velocities are present in ``config``.
+
+    Raises
+    ------
+    ValueError
+        If the computed ``u_star`` is not positive.
 
     """
     x_transformer = config.get("x_transformer", UniformScaler(feature_range=(-1, 1)))
     a_transformer = config.get("a_transformer", UniformScaler(feature_range=(-1, 1)))
     u_transformer = config.get("u_transformer", UniformScaler(feature_range=(-1, 1)))
+    if include_velocity:
+        v_transformer = config.get("v_transformer", UniformScaler(feature_range=(-1, 1)))
+
 
     r_s = float(config["r_s"])  # kpc
 
@@ -1043,6 +1098,7 @@ def scale_data(
     t_star = jnp.sqrt(r_s**2 / u_star)
     a_star = r_s / (t_star**2)
     x_star = r_s
+    v_star = r_s / t_star
 
     # Fit constant scaling factors (1/x_star etc.)
     x_transformer.fit(data_dict["x_train"], scaler=1.0 / x_star)
@@ -1068,8 +1124,23 @@ def scale_data(
         "a_val": a_val,
         "u_val": u_val,
         "r_val": r_val,
+
+        "t_star": t_star,
     }
-    transformers = {"x": x_transformer, "a": a_transformer, "u": u_transformer}
+
+    if include_velocity and config.get("orbit_p", None) is not None:
+        v_transformer.fit(config["orbit_p"], scaler=1 / v_star)
+        transformers = {
+        "x": x_transformer,
+        "a": a_transformer,
+        "u": u_transformer,
+        "v": v_transformer}
+    else:
+        transformers = {
+            "x": x_transformer,
+            "a": a_transformer,
+            "u": u_transformer}
+
     return scaled, transformers
 
 
