@@ -4,6 +4,7 @@ import copy
 from collections.abc import Callable, Mapping
 from typing import Any
 
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpyro
@@ -182,12 +183,18 @@ def model_svi(
     )
 
     if config.get("trainable", False):
-        out = bnn(x, trainable_analytic_layer=trainable_analytic_layer)
-    else:
-        out = bnn(x)
 
-    a_pred = out["acceleration"]
-    u_pred = out["potential"]
+        def _pot_fn(xi: Array, /) -> Array:
+            return bnn(
+                xi[None, :], trainable_analytic_layer=trainable_analytic_layer
+            ).squeeze()
+    else:
+
+        def _pot_fn(xi: Array, /) -> Array:
+            return bnn(xi[None, :]).squeeze()
+
+    u_pred, grads = jax.vmap(jax.value_and_grad(_pot_fn))(x)
+    a_pred = -grads
     numpyro.deterministic("acceleration", a_pred)
     numpyro.deterministic("potential", u_pred)
 
@@ -217,11 +224,11 @@ def model_svi(
             q_flat = orbit_q_sub.reshape(B * T, 3)
 
             if config.get("trainable", False):
-                phi = bnn(q_flat, trainable_analytic_layer=trainable_analytic_layer)[
-                    "potential"
-                ].reshape(B, T)
+                phi = bnn(
+                    q_flat, trainable_analytic_layer=trainable_analytic_layer
+                ).reshape(B, T)
             else:
-                phi = bnn(q_flat)["potential"].reshape(B, T)
+                phi = bnn(q_flat).reshape(B, T)
 
             E = T_ke + phi  # (B, T)
 

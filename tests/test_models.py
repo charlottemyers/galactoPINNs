@@ -80,31 +80,29 @@ class TestStaticModel:
         assert model.nn_off is True
 
     def test_forward_potential_mode(self):
-        """Test forward pass in potential-only mode."""
+        """Test forward pass returns potential."""
         config = make_minimal_config()
         model = StaticModel(config, in_features=5, rngs=nnx.Rngs(0))
 
         x = jnp.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
-        outputs = model(x, mode="potential")
+        potential = model(x)
 
-        assert "potential" in outputs
-        assert outputs["potential"].shape == (2,)
-        assert jnp.isfinite(outputs["potential"]).all()
+        assert potential.shape == (2,)
+        assert jnp.isfinite(potential).all()
 
     def test_forward_full_mode(self):
-        """Test forward pass in full mode (potential + acceleration)."""
+        """Test forward pass for potential and acceleration."""
         config = make_minimal_config()
         model = StaticModel(config, in_features=5, rngs=nnx.Rngs(0))
 
         x = jnp.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
-        outputs = model(x, mode="full")
+        potential = model(x)
+        acceleration = model.acceleration(x)
 
-        assert "potential" in outputs
-        assert "acceleration" in outputs
-        assert outputs["potential"].shape == (2,)
-        assert outputs["acceleration"].shape == (2, 3)
-        assert jnp.isfinite(outputs["potential"]).all()
-        assert jnp.isfinite(outputs["acceleration"]).all()
+        assert potential.shape == (2,)
+        assert acceleration.shape == (2, 3)
+        assert jnp.isfinite(potential).all()
+        assert jnp.isfinite(acceleration).all()
 
     def test_compute_potential(self):
         """Test compute_potential method."""
@@ -148,13 +146,12 @@ class TestStaticModel:
 
         @nnx.jit
         def forward(model, x):
-            return model(x, mode="potential")
+            return model(x)
 
         x = jnp.array([[1.0, 0.0, 0.0]])
-        outputs = forward(model, x)
+        potential = forward(model, x)
 
-        assert "potential" in outputs
-        assert jnp.isfinite(outputs["potential"]).all()
+        assert jnp.isfinite(potential).all()
 
     def test_grad_compatible(self):
         """Test that gradients can be computed through the model."""
@@ -163,8 +160,7 @@ class TestStaticModel:
 
         def loss_fn(model):
             x = jnp.array([[1.0, 2.0, 3.0]])
-            outputs = model(x, mode="potential")
-            return jnp.sum(outputs["potential"] ** 2)
+            return jnp.sum(model(x) ** 2)
 
         grads = nnx.grad(loss_fn)(model)
         assert grads is not None
@@ -175,12 +171,11 @@ class TestStaticModel:
         model = StaticModel(config, in_features=5, rngs=nnx.Rngs(0))
 
         x = jnp.array([[1.0, 0.0, 0.0]])
-        outputs = model(x, mode="full")
+        potential = model(x)
+        acceleration = model.acceleration(x)
 
-        assert "potential" in outputs
-        assert "acceleration" in outputs
-        assert jnp.isfinite(outputs["potential"]).all()
-        assert jnp.isfinite(outputs["acceleration"]).all()
+        assert jnp.isfinite(potential).all()
+        assert jnp.isfinite(acceleration).all()
 
     def test_reproducible_with_same_seed(self):
         """Test that same seed produces same model outputs."""
@@ -192,8 +187,8 @@ class TestStaticModel:
 
         x = jnp.array([[1.0, 2.0, 3.0]])
 
-        out1 = model1(x, mode="potential")["potential"]
-        out2 = model2(x, mode="potential")["potential"]
+        out1 = model1(x)
+        out2 = model2(x)
 
         assert jnp.allclose(out1, out2)
 
@@ -207,8 +202,8 @@ class TestStaticModel:
 
         x = jnp.array([[1.0, 2.0, 3.0]])
 
-        out1 = model1(x, mode="potential")["potential"]
-        out2 = model2(x, mode="potential")["potential"]
+        out1 = model1(x)
+        out2 = model2(x)
 
         assert not jnp.allclose(out1, out2)
 
@@ -225,7 +220,7 @@ class TestStaticModelIntegration:
 
         @nnx.vmap(in_axes=(0,))
         def forward_single(x):
-            return model(x, mode="potential")["potential"]
+            return model(x)
 
         potentials = forward_single(x_batch)
         assert potentials.shape == (3, 1)
@@ -238,7 +233,7 @@ class TestStaticModelIntegration:
         @nnx.jit
         def compute_loss_and_grad(model, x):
             def loss_fn(m):
-                return jnp.mean(m(x, mode="potential")["potential"] ** 2)
+                return jnp.mean(m(x) ** 2)
 
             loss, grads = nnx.value_and_grad(loss_fn)(model)
             return loss, grads

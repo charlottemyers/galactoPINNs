@@ -126,10 +126,11 @@ class TestNNXModelProtocol:
         assert callable(model)
 
         x = jnp.array([[1.0, 2.0, 3.0]])
-        result = model(x, mode="full")
+        potential = model(x)
+        acceleration = model.acceleration(x)
 
-        assert "potential" in result
-        assert "acceleration" in result
+        assert jnp.isfinite(potential).all()
+        assert jnp.isfinite(acceleration).all()
 
     def test_model_has_config(self):
         """Test that model has config attribute with expected keys."""

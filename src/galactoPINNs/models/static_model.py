@@ -1,7 +1,7 @@
 """Static gravitational potential model implementations."""
 
 from collections.abc import Mapping
-from typing import Any, Literal, TypedDict
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -16,17 +16,6 @@ from galactoPINNs.layers import (
     SmoothMLP,
     TrainableGalaxPotential,
 )
-
-Mode = Literal["full", "potential", "acceleration", "density"]
-
-
-class StaticOutputs(TypedDict, total=False):
-    """Standardized outputs returned by StaticModel.__call__."""
-
-    potential: Array
-    acceleration: Array
-    laplacian: Array
-    outputs: dict[str, Any]
 
 
 class StaticModel(nnx.Module):
@@ -158,7 +147,7 @@ class StaticModel(nnx.Module):
 
     def compute_potential(
         self,
-        cart_x: Array,
+        x_cart: Array,
         *,
         trainable_analytic_layer: TrainableGalaxPotential | None = None,
     ) -> Array:
@@ -166,7 +155,7 @@ class StaticModel(nnx.Module):
 
         Parameters
         ----------
-        cart_x
+        x_cart
             Input positions, shape ``(N, 3)`` for a batch or ``(3,)`` for a
             single point. Assumed to be in the model's scaled space.
         trainable_analytic_layer
@@ -181,16 +170,14 @@ class StaticModel(nnx.Module):
             Squeezed potential values, shape ``(N,)`` for batched input.
 
         """
-        return self(
-            cart_x, mode="potential", trainable_analytic_layer=trainable_analytic_layer
-        )["potential"].squeeze()
+        return self(x_cart, trainable_analytic_layer=trainable_analytic_layer).squeeze()
 
-    def compute_laplacian(self, cart_x: Array) -> Array:
+    def compute_laplacian(self, x_cart: Array) -> Array:
         """Compute the Laplacian of the potential.
 
         Parameters
         ----------
-        cart_x
+        x_cart
             Batched Cartesian positions, shape ``(N, 3)``.
 
         Returns
@@ -206,33 +193,27 @@ class StaticModel(nnx.Module):
         """
 
         def potential_fn(x: Array) -> Array:
-            return self(x, mode="potential")["potential"].squeeze()
+            return self(x[None, :]).squeeze()
 
         def laplacian_single(x: Array) -> Array:
             hess = jax.hessian(potential_fn)(x)  # (3, 3)
             return jnp.trace(hess)
 
-        return jax.vmap(laplacian_single)(cart_x)
+        return jax.vmap(laplacian_single)(x_cart)
 
     def __call__(
         self,
-        cart_x: Array,
-        mode: Mode = "full",
-        trainable_analytic_layer: TrainableGalaxPotential | None = None,  # <-- ADD
-    ) -> StaticOutputs:
-        """Forward pass for the static model.
+        x_cart: Array,
+        /,
+        trainable_analytic_layer: TrainableGalaxPotential | None = None,
+    ) -> Array:
+        """Compute the gravitational potential at the given positions.
 
         Parameters
         ----------
-        cart_x
-            Cartesian inputs. Typically shape (3,) for a single point or
-            (N, 3) for a batch. Assumed to be in the model's scaled space.
-        mode
-            Controls what is computed/returned:
-            - "full": return potential and acceleration.
-            - "potential": compute/return only the potential.
-            - "acceleration": compute/return acceleration.
-            - "density": compute/return potential, acceleration, and Laplacian.
+        x_cart
+            Cartesian inputs. Typically shape ``(N, 3)`` for a batch.
+            Assumed to be in the model's scaled space.
         trainable_analytic_layer
             Optional trainable analytic layer to use in place of
             ``self.trainable_analytic_layer``. Required when
@@ -241,18 +222,18 @@ class StaticModel(nnx.Module):
 
         Returns
         -------
-        outputs
-            A dict-like object containing keys "potential" and "acceleration".
+        potential
+            Potential values, shape ``(N,)``.
 
         """
         # --- Coordinate transformation ---
         if self.config.get("convert_to_spherical", True):
-            x_transformed = self.cart_to_sph_layer(cart_x)
+            x_in = self.cart_to_sph_layer(x_cart)
         else:
-            x_transformed = cart_x
+            x_in = x_cart
 
         # --- Neural network potential ---
-        u_nn = 0.0 if self.nn_off or self.mlp is None else self.mlp(x_transformed)
+        u_nn = 0.0 if self.nn_off or self.mlp is None else self.mlp(x_in)
 
         # --- Analytic baseline potential ---
         analytic_potential_scaled = 0.0
@@ -260,7 +241,7 @@ class StaticModel(nnx.Module):
 
         if self.config.get("include_analytic", False):
             # Transform to physical coordinates
-            x_phys = self.config["x_transformer"].inverse_transform(cart_x)
+            x_phys = self.config["x_transformer"].inverse_transform(x_cart)
             u_phys = 0.0
 
             if self.ab_potential is not None and not self.config.get(
@@ -284,10 +265,10 @@ class StaticModel(nnx.Module):
             analytic_potential_scaled = self.config["u_transformer"].transform(u_phys)
 
         # --- Combine potentials ---
-        scaled_nn_potential = self.scale_layer(cart_x, u_nn, r_s_learned=r_s_learned)
+        scaled_nn_potential = self.scale_layer(x_cart, u_nn, r_s_learned=r_s_learned)
         fused_potential = scaled_nn_potential + analytic_potential_scaled
         boundary_potential = self.fuse_boundary_layer(
-            cart_x, scaled_nn_potential, analytic_potential_scaled
+            x_cart, scaled_nn_potential, analytic_potential_scaled
         )
 
         # --- Select final potential based on config ---
@@ -298,19 +279,69 @@ class StaticModel(nnx.Module):
         else:
             potential = scaled_nn_potential
 
-        # --- Return early if only potential requested ---
-        if mode == "potential":
-            return {"potential": potential}
+        return potential
 
-        # --- Compute acceleration via autodiff ---
-        def pot_single(x1: Array) -> Array:
-            return self.compute_potential(
-                x1[None, :], trainable_analytic_layer=trainable_analytic_layer
-            ).squeeze()
+    def acceleration(
+        self,
+        x_cart: Array,
+        /,
+        trainable_analytic_layer: TrainableGalaxPotential | None = None,
+    ) -> Array:
+        """Compute the gravitational acceleration at the given positions.
 
-        acceleration = -jax.vmap(jax.grad(pot_single))(cart_x)
+        Parameters
+        ----------
+        x_cart
+            Cartesian inputs, shape ``(N, 3)``. Assumed to be in the model's
+            scaled space.
+        trainable_analytic_layer
+            Optional trainable analytic layer to use in place of
+            ``self.trainable_analytic_layer``.
 
-        return {
-            "potential": potential,
-            "acceleration": acceleration,
-        }
+        Returns
+        -------
+        acceleration
+            Acceleration vectors, shape ``(N, 3)``.
+
+        """
+        x_3d = x_cart[:, None, :]  # (N, 1, 3)
+        grads = jax.vmap(
+            jax.grad(lambda x, tal: self(x, tal).squeeze()),
+            in_axes=(0, None),
+        )(x_3d, trainable_analytic_layer)
+        return -grads[:, 0, :]
+
+    def potential_acceleration(
+        self,
+        x_cart: Array,
+        /,
+        trainable_analytic_layer: TrainableGalaxPotential | None = None,
+    ) -> tuple[Array, Array]:
+        """Compute the potential and acceleration jointly via ``value_and_grad``.
+
+        More efficient than calling :meth:`__call__` and :meth:`acceleration`
+        separately because the forward pass is only executed once.
+
+        Parameters
+        ----------
+        x_cart
+            Cartesian inputs, shape ``(N, 3)``. Assumed to be in the model's
+            scaled space.
+        trainable_analytic_layer
+            Optional trainable analytic layer to use in place of
+            ``self.trainable_analytic_layer``.
+
+        Returns
+        -------
+        potential
+            Potential values, shape ``(N,)``.
+        acceleration
+            Acceleration vectors, shape ``(N, 3)``.
+
+        """
+        x_3d = x_cart[:, None, :]  # (N, 1, 3)
+        potential_vals, grads = jax.vmap(
+            jax.value_and_grad(lambda x, tal: self(x, tal).squeeze()),
+            in_axes=(0, None),
+        )(x_3d, trainable_analytic_layer)
+        return potential_vals, -grads[:, 0, :]
