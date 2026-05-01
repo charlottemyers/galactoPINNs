@@ -3,25 +3,16 @@
 __all__ = ("apply_model",)
 
 from collections.abc import Callable, Mapping
-from typing import Any, Protocol
+from typing import Any, TypeAlias
 
 from jaxtyping import Array
 
-Params = Any
-ApplyFn = Callable[..., Mapping[str, Any]]
-
-##### Protocols and types #####
-
-
-class _NNXModelLike(Protocol):
-    """Protocol for NNX modules that can be called directly."""
-
-    def __call__(self, *args: Any, **kwargs: Any) -> Mapping[str, Any]: ...
+Params: TypeAlias = Any
 
 
 def apply_model(
-    model_or_params: _NNXModelLike | Params,
-    x_or_apply_fn: Array | ApplyFn,
+    model_or_params: Callable[..., Mapping[str, Any]] | Params,
+    x_or_apply_fn: Array | Callable[..., Mapping[str, Any]],
     x_scaled: Array | None = None,
 ) -> dict[str, Any]:
     """Apply a model to scaled inputs and return standardized outputs.
@@ -67,6 +58,7 @@ def apply_model(
                 "In object mode, do not provide the third "
                 "positional argument `x_scaled`."
             )
+            raise ValueError(msg)
         predictions = model(x)
 
     return {

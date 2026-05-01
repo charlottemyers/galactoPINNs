@@ -11,6 +11,8 @@ import numpy as np
 import unxt as u
 from jaxtyping import Array
 
+from .units import usys
+
 __all__ = (
     "Euclidean_distance",
     "compare_orbits",
@@ -327,7 +329,9 @@ def get_w0s_from_data(
         vc = true_potential.local_circular_velocity(w_dummy)
         r = np.linalg.norm(x_random)
         v_vec = vc * np.array([-x_random[1], x_random[0], 0.0]) / r
-        w0 = gc.PhaseSpacePosition(q=u.Q(x_random, "kpc"), p=v_vec)
+        w0 = gc.PhaseSpacePosition(
+            q=u.Q(x_random, usys["length"]), p=u.Q(v_vec, usys["velocity"])
+        )
         w0s.append(w0)
     return w0s
 
@@ -468,10 +472,10 @@ def compose_velocity_bound_safe(
     ang = jr.uniform(subkey, shape=(N, 1), minval=0.0, maxval=2.0 * jnp.pi)
     e_t = jnp.cos(ang) * e_t1 + jnp.sin(ang) * e_t2
 
-    qQ = u.Q(q_phys, "kpc")
+    qQ = u.Q(q_phys, usys["length"])
     v_circ = (
-        gp.local_circular_velocity(pot_for_vcirc, qQ, t=u.Q(0.0, "Gyr"))
-        .to_value("kpc/Myr")
+        gp.local_circular_velocity(pot_for_vcirc, qQ, t=u.Q(0.0, usys["time"]))
+        .ustrip(usys["velocity"])
         .reshape(N, 1)
     )
 
@@ -487,8 +491,8 @@ def compose_velocity_bound_safe(
     v = v * jnp.minimum(1.0, cap_vs_vcirc * v_circ / (speed + 1e-12))
 
     phi = (
-        pot_for_escape.potential(qQ, t=u.Q(0.0, "Gyr"))
-        .to_value("kpc2/Myr2")
+        pot_for_escape.potential(qQ, t=u.Q(0.0, usys["time"]))
+        .ustrip(usys)
         .reshape(N, 1)
     )
 
@@ -628,12 +632,12 @@ def integrate_orbit_batch(
 
     """
     B = q0_phys.shape[0]
-    ts_Q = u.Q(jnp.asarray(ts_myr), "Myr")
+    ts_Q = u.Q(ts_myr, usys["time"])
     q_list, p_list = [], []
     for b in range(B):
         w0 = gc.PhaseSpacePosition(
-            q=u.Q(q0_phys[b][None, :], "kpc"),
-            p=u.Q(v0_phys[b][None, :], "kpc/Myr"),
+            q=u.Q(q0_phys[b][None, :], usys["length"]),
+            p=u.Q(v0_phys[b][None, :], usys["velocity"]),
         )
         orb = gd.evaluate_orbit(true_pot, w0, ts_Q)
         q_list.append(get_raw_orbit_coords(orb, c="q")[0])

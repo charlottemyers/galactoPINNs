@@ -2,6 +2,7 @@
 
 __all__ = (
     "CartesianToModifiedSphericalLayer",
+    "ExternalPytree",
     "FuseandBoundary",
     "ScaleNNPotentialLayer",
     "SmoothMLP",
@@ -9,30 +10,18 @@ __all__ = (
 )
 
 import functools as ft
-from collections.abc import Callable, Mapping
-from typing import Any, Protocol, TypeAlias, Union
+from collections.abc import Mapping
+from typing import Any, Protocol
 
+import galax.potential as gp
 import jax
 import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array
 
-ScaleSpec = Union[str, Array, None]  # for type hints  # noqa: UP007
-
 
 class ExternalPytree(nnx.Variable):
     """Variable wrapper for external pytrees (like equinox modules)."""
-
-
-ActFn = Callable[[Array], Array]
-
-
-#######
-# Protocols and types
-#######
-
-TrainableInitKwargs: TypeAlias = Mapping[str, float]
-TrainableKeys: TypeAlias = tuple[str, ...]
 
 
 class ActivationFn(Protocol):
@@ -41,59 +30,6 @@ class ActivationFn(Protocol):
     def __call__(self, x: Array, /) -> Array: ...
 
 
-class _HasPotential(Protocol):
-    """Protocol for external analytic potential-like objects used for scaling."""
-
-    def potential(self, x: Array, *, t: Any = ...) -> Array: ...
-
-
-class _GalaxPotentialCtor(Protocol):
-    """Protocol for a Galax potential class/constructor."""
-
-    def __call__(self, *args: Any, **kwargs: Any) -> "_GalaxPotential": ...
-
-
-class _GalaxPotential(Protocol):
-    """Protocol for instantiated Galax potentials used here."""
-
-    def potential(self, positions: Any, *, t: Any = ...) -> Any: ...
-
-
-ScaleSpec = str | _HasPotential
-
-##############
-
-
-#######
-# Utilities
-#######
-
-
-def _as_batch(x: Array) -> Array:
-    """Ensure a leading batch dimension.
-
-    Parameters
-    ----------
-    x
-        Input array with shape ``(D,)`` or ``(N, D)``.
-
-    Returns
-    -------
-    x_batched
-        If ``x`` has shape ``(D,)``, returns ``(1, D)``.
-        If ``x`` already has shape ``(N, D)``, returns ``x`` unchanged.
-
-    """
-    x = jnp.asarray(x)
-    return x[None, :] if x.ndim == 1 else x
-
-
-##############
-
-
-#######
-# Layers
-#######
 class SmoothMLP(nnx.Module):
     """Multi-layer perceptron with a smooth activation.
 
@@ -131,7 +67,8 @@ class SmoothMLP(nnx.Module):
 
     """
 
-    hidden_layers: nnx.List
+    network: nnx.Sequential
+    act: ActivationFn
 
     def __init__(
         self,
@@ -143,21 +80,22 @@ class SmoothMLP(nnx.Module):
         rngs: nnx.Rngs,
     ) -> None:
         """Initialize the MLP layers."""
-        self.width = width
-        self.depth = depth
-        self.act = act
+        layers = [
+            layer
+            # Build the 1st hidden layer so the input dimension is clear.
+            for i in range(depth)
+            for layer in (
+                nnx.Linear(in_features if i == 0 else width, width, rngs=rngs),
+                # Repeat width -> width blocks for the remaining hidden layers.
+                act,
+            )
+        ]
+        output_in_features = width if depth > 0 else in_features
+        layers.append(nnx.Linear(output_in_features, 1, rngs=rngs))
+        self.network = nnx.Sequential(*layers)
 
-        layers = []
-        current_in = in_features
-        for _ in range(depth):
-            layers.append(nnx.Linear(current_in, width, rngs=rngs))
-            current_in = width
-        self.hidden_layers = nnx.List(layers)
-
-        # Output layer: width -> 1
-        self.output_layer = nnx.Linear(width, 1, rngs=rngs)
-
-    def __call__(self, x: Array) -> Array:
+    def __call__(self, x: Array, /) -> Array:
+        # Degenerate case: no hidden layers, just a linear readout.
         """Forward pass.
 
         Parameters
@@ -171,14 +109,11 @@ class SmoothMLP(nnx.Module):
             Scalar output per example. Shape is typically ``(N,)``.
 
         """
-        for layer in self.hidden_layers:
-            x = self.act(layer(x))
-        x = self.output_layer(x)
-        return jnp.squeeze(x, axis=-1)
+        return jnp.squeeze(self.network(x), axis=-1)
 
 
 @ft.partial(jax.jit, static_argnames=("clip",))
-def _cart2sph_one(x3: Array, clip: float) -> Array:
+def _cart2sph_one(x3: Array, /, *, clip: float) -> Array:
     """Convert a single 3D Cartesian point to modified spherical coords."""
     r = jnp.linalg.norm(x3)
     r_safe = jnp.maximum(r, jnp.finfo(x3.dtype).tiny)
@@ -351,7 +286,7 @@ class ScaleNNPotentialLayer(nnx.Module):
         clip_max = float(self.config.get("scale_clip_max", 1e3))
         reciprocal = bool(self.config.get("scale_reciprocal", True))
 
-        xB = _as_batch(x_cart)
+        xB = jnp.atleast_2d(x_cart)
         r_safe = jnp.maximum(r, 1e-12)
 
         u = ext_potential.potential(xB, t=t).squeeze()
@@ -407,9 +342,9 @@ class TrainableGalaxPotential(nnx.Module):
 
     def __init__(
         self,
-        PotClass: _GalaxPotentialCtor,
-        init_kwargs: TrainableInitKwargs,
-        trainable: TrainableKeys,
+        PotClass: type[gp.AbstractPotential],
+        init_kwargs: Mapping[str, float],
+        trainable: tuple[str, ...],
         *,
         rngs: nnx.Rngs | None = None,  # noqa: ARG002
     ) -> None:

@@ -183,7 +183,8 @@ def train_step_static(  # noqa: C901
 
     """
     if target != "acceleration" and (orbit_q is None or orbit_p is None):
-        raise ValueError(f"target='{target}' requires orbit_q and orbit_p (got None).")
+        msg = f"target='{target}' requires orbit_q and orbit_p (got None)."
+        raise ValueError(msg)
 
     # ------------------------------------------------------------------
     # Training ramp helper
@@ -233,16 +234,16 @@ def train_step_static(  # noqa: C901
 
     def _E_loss_std(ts: nnx.State) -> Array:
         """Std-only energy-conservation loss (Linen `orbit_E_loss`)."""
-        assert orbit_q is not None
-        assert orbit_p is not None
+        if orbit_q is None or orbit_p is None:
+            raise ValueError("Orbit coordinates and momenta must be provided.")
         E = _orbit_energy(ts, orbit_q, orbit_p)  # (B, T)
         std_E = jnp.std(E - jnp.mean(E, axis=1, keepdims=True), axis=1)
         return jnp.mean(std_E**2)
 
     def _E_loss_dev_from_initial(ts: nnx.State) -> Array:
         """Fractional energy drift relative to E(t=0)."""
-        assert orbit_q is not None
-        assert orbit_p is not None
+        if orbit_q is None or orbit_p is None:
+            raise ValueError("Orbit coordinates and momenta must be provided.")
         E = _orbit_energy(ts, orbit_q, orbit_p)  # (B, T)
         E0 = E[:, 0:1]  # (B, 1)
         return jnp.mean(((E - E0) / (jnp.abs(E0) + 1e-8)) ** 2)

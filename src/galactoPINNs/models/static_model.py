@@ -10,6 +10,7 @@ from jaxtyping import Array
 
 from galactoPINNs.layers import (
     CartesianToModifiedSphericalLayer,
+    ExternalPytree,
     FuseandBoundary,
     ScaleNNPotentialLayer,
     SmoothMLP,
@@ -19,15 +20,6 @@ from galactoPINNs.layers import (
 Mode = Literal["full", "potential", "acceleration", "density"]
 
 
-class ExternalPytree(nnx.Variable):
-    """Variable wrapper for external pytrees (like equinox modules).
-
-    This allows galax potentials (which are equinox modules containing JAX
-    arrays) to be stored as attributes in NNX modules without triggering pytree
-    inspection errors.  Access the wrapped object via the `.value` attribute.
-    """
-
-
 class StaticOutputs(TypedDict, total=False):
     """Standardized outputs returned by StaticModel.__call__."""
 
@@ -35,11 +27,6 @@ class StaticOutputs(TypedDict, total=False):
     acceleration: Array
     laplacian: Array
     outputs: dict[str, Any]
-
-
-# ----------------------------
-# Static model
-# ----------------------------
 
 
 class StaticModel(nnx.Module):
