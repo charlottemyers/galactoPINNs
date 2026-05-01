@@ -112,8 +112,8 @@ class SmoothMLP(nnx.Module):
         return jnp.squeeze(self.network(x), axis=-1)
 
 
-@ft.partial(jax.jit, static_argnames=("clip",))
-def _cart2sph_one(x3: Array, /, *, clip: float) -> Array:
+@ft.partial(jax.jit, static_argnums=(1,))
+def _cart2sph_one(x3: Array, clip: float) -> Array:
     """Convert a single 3D Cartesian point to modified spherical coords."""
     r = jnp.linalg.norm(x3)
     r_safe = jnp.maximum(r, jnp.finfo(x3.dtype).tiny)
@@ -146,11 +146,13 @@ class CartesianToModifiedSphericalLayer(nnx.Module):
 
     """
 
+    clip: float = 1.0
+
     def __init__(self, clip: float = 1.0) -> None:
         """Initialize the coordinate transformation layer."""
         self.clip = clip
 
-    def __call__(self, X_cart: Array) -> Array:
+    def __call__(self, X_cart: Array, /) -> Array:
         """Transform Cartesian coordinates to modified spherical representation.
 
         Parameters
@@ -166,7 +168,7 @@ class CartesianToModifiedSphericalLayer(nnx.Module):
 
         """
         X2 = jnp.atleast_2d(X_cart)  # (N, 3)
-        Y2 = jax.vmap(ft.partial(_cart2sph_one, clip=self.clip))(X2)  # (N, 5)
+        Y2 = jax.vmap(_cart2sph_one, in_axes=(0, None))(X2, self.clip)  # (N, 5)
         return jnp.squeeze(Y2, axis=0) if (X_cart.ndim == 1) else Y2
 
 

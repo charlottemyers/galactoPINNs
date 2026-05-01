@@ -122,9 +122,9 @@ def train_step_static(  # noqa: C901
       that its L2 norm matches that of the acceleration-loss gradient tree
       before combining, preventing one term from dominating purely due to
       magnitude differences.
-    - The implementation assumes the model returns a dict containing:
-        - ``"acceleration"`` when called as ``model(x)``
-        - ``"potential"``    when called as ``model(q_flat, mode="potential")``
+    - The implementation assumes the model exposes:
+        - ``.acceleration(x)`` for computing accelerations
+        - ``model(q_flat)`` for computing the potential
     - Orbit arrays ``orbit_q`` and ``orbit_p`` are expected to already be in
       the model's scaled / nondimensional coordinates/velocities.
 
@@ -213,7 +213,7 @@ def train_step_static(  # noqa: C901
     # ------------------------------------------------------------------
     def _acc_loss(ts: nnx.State) -> Array:
         m = nnx.merge(graphdef, ts, frozen_state)
-        a_pred = m(x)["acceleration"]  # (N, 3)
+        a_pred = m.acceleration(x)  # (N, 3)
         diff = a_pred - a_true
         diff_norm = jnp.linalg.norm(diff, axis=1)  # (N,)
         true_norm = jnp.linalg.norm(a_true, axis=1)  # (N,)
@@ -229,7 +229,7 @@ def train_step_static(  # noqa: C901
         B, T, _ = oq.shape
         T_ke = 0.5 * jnp.sum(op**2, axis=-1)  # (B, T)
         q_flat = oq.reshape(B * T, 3)
-        Phi = m(q_flat, mode="potential")["potential"].reshape(B, T)
+        Phi = m(q_flat).reshape(B, T)
         return T_ke + Phi
 
     def _E_loss_std(ts: nnx.State) -> Array:

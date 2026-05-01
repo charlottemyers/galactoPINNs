@@ -106,20 +106,18 @@ def make_galax_potential(
         caller = nnx.call((graph_def, st))
         out, _ = caller(
             x_scaled,
-            mode="potential",
             trainable_analytic_layer=_tal,
         )
-        return out["potential"]
+        return out
 
     def acceleration_fn(st: Any, x_scaled: Array) -> Array:
         """Pure acceleration function using the functional API."""
         caller = nnx.call((graph_def, st))
-        out, _ = caller(
+        out, _ = caller.acceleration(
             x_scaled,
-            mode="acceleration",
             trainable_analytic_layer=_tal,
         )
-        return out["acceleration"]
+        return out
 
     return ModelPotential(
         potential_fn=potential_fn,

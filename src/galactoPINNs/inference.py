@@ -49,20 +49,21 @@ def apply_model(
                 "In functional mode, `x_scaled` must be provided as the third argument."
             )
         predictions = apply_fn(params, x)
+        return {
+            "u_pred": predictions["potential"],
+            "a_pred": predictions["acceleration"],
+            "outputs": predictions.get("outputs", None),
+        }
 
-    else:  # Object Mode
-        model = model_or_params
-        x = x_or_apply_fn
-        if x_scaled is not None:
-            raise ValueError(
-                "In object mode, do not provide the third "
-                "positional argument `x_scaled`."
-            )
-            raise ValueError(msg)
-        predictions = model(x)
-
+    # Object Mode
+    model = model_or_params
+    x = x_or_apply_fn
+    if x_scaled is not None:
+        msg = "In object mode, do not provide the third positional argument `x_scaled`."
+        raise ValueError(msg)
+    u_pred, a_pred = model.potential_acceleration(x)
     return {
-        "u_pred": predictions["potential"],
-        "a_pred": predictions["acceleration"],
-        "outputs": predictions.get("outputs", None),
+        "u_pred": u_pred,
+        "a_pred": a_pred,
+        "outputs": None,
     }
