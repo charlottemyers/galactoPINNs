@@ -21,11 +21,11 @@ from typing import Any, Literal
 
 import coordinax as cx
 import equinox as eqx
+import galax.potential as gp
 import jax
 import jax.numpy as jnp
 import jax.random as jr
 import unxt as u
-from galax.potential import density
 from jaxtyping import Array, ArrayLike
 from unxt.quantity import AllowValue
 
@@ -183,11 +183,11 @@ def _estimate_density_upper_bound(
     mask = r_max >= R
 
     pos_grid = cx.CartesianPos3D(
-        x=u.Quantity(X[mask].ravel(), "kpc"),
-        y=u.Quantity(Y[mask].ravel(), "kpc"),
-        z=u.Quantity(Z[mask].ravel(), "kpc"),
+        x=u.Q(X[mask].ravel(), "kpc"),
+        y=u.Q(Y[mask].ravel(), "kpc"),
+        z=u.Q(Z[mask].ravel(), "kpc"),
     )
-    rho_grid = density(galax_pot, pos_grid, t=t).value
+    rho_grid = gp.density(galax_pot, pos_grid, t=t).value
     rho_max = float(jnp.max(rho_grid))
 
     # Inflate; prevents acceptance probability > 1 when grid misses maxima.
@@ -200,16 +200,16 @@ def _make_density_fn(galax_pot: Any, t: float) -> Callable[[Array], Array]:
     Returns a function that takes raw (N, 3) position arrays (in kpc)
     and returns density values, bypassing coordinax overhead in the hot path.
     """
-    t_q = u.Quantity(t, "Myr")
+    t_q = u.Q(t, "Myr")
 
     def _density_raw(xyz: Array) -> Array:
         """Evaluate density at positions xyz (N, 3) in kpc."""
         pos = cx.CartesianPos3D(
-            x=u.Quantity(xyz[:, 0], "kpc"),
-            y=u.Quantity(xyz[:, 1], "kpc"),
-            z=u.Quantity(xyz[:, 2], "kpc"),
+            x=u.Q(xyz[:, 0], "kpc"),
+            y=u.Q(xyz[:, 1], "kpc"),
+            z=u.Q(xyz[:, 2], "kpc"),
         )
-        return density(galax_pot, pos, t=t_q).value
+        return gp.density(galax_pot, pos, t=t_q).value
 
     return jax.jit(_density_raw)
 
@@ -460,14 +460,14 @@ def generate_static_data(
         Returns a function that takes raw (N, 3) position arrays (in kpc)
         and returns (positions, accelerations, potentials).
         """
-        t_q = u.Quantity(t, "Myr")
+        t_q = u.Q(t, "Myr")
 
         def _evaluate_raw(samples: Array) -> tuple[Array, Array, Array]:
             x, y, z = samples.T
             pos = cx.CartesianPos3D(
-                x=u.Quantity(x, "kpc"),
-                y=u.Quantity(y, "kpc"),
-                z=u.Quantity(z, "kpc"),
+                x=u.Q(x, "kpc"),
+                y=u.Q(y, "kpc"),
+                z=u.Q(z, "kpc"),
             )
             acc = potential.acceleration(pos, t=t_q)
             pot = potential.potential(pos, t=t_q).value
@@ -612,14 +612,14 @@ def generate_time_dep_data(
         potential: Any, t_myr: float
     ) -> Callable[[Array], tuple[Array, Array, Array]]:
         """Create a JIT-compiled evaluation function for a specific time."""
-        t_q = u.Quantity(t_myr, "Myr")
+        t_q = u.Q(t_myr, "Myr")
 
         def _evaluate_raw(samples: Array) -> tuple[Array, Array, Array]:
             x, y, z = samples.T
             pos = cx.CartesianPos3D(
-                x=u.Quantity(x, "kpc"),
-                y=u.Quantity(y, "kpc"),
-                z=u.Quantity(z, "kpc"),
+                x=u.Q(x, "kpc"),
+                y=u.Q(y, "kpc"),
+                z=u.Q(z, "kpc"),
             )
             acc = potential.acceleration(pos, t=t_q)
             pot = potential.potential(pos, t=t_q).ustrip("kpc2/Myr2")
@@ -999,9 +999,10 @@ class Transformer:
 def scale_data(
     data_dict: dict[str, Array],
     config: dict,
+    *,
     include_velocity: bool = False,
 ) -> tuple[dict[str, Array], dict[str, UniformScaler]]:
-    r"""Non-dimensionalize input data using characteristic scales derived from the training set.
+    r"""Non-dimensionalize input data using scales derived from the training set.
 
     Derives a characteristic potential scale ``u_star``, then computes
     consistent time, acceleration, position, and velocity scales:
@@ -1074,17 +1075,18 @@ def scale_data(
     a_transformer = config.get("a_transformer", UniformScaler(feature_range=(-1, 1)))
     u_transformer = config.get("u_transformer", UniformScaler(feature_range=(-1, 1)))
     if include_velocity:
-        v_transformer = config.get("v_transformer", UniformScaler(feature_range=(-1, 1)))
-
+        v_transformer = config.get(
+            "v_transformer", UniformScaler(feature_range=(-1, 1))
+        )
 
     r_s = float(config["r_s"])  # kpc
 
     if config.get("include_analytic", False):
         lf_potential = config["ab_potential"]
         pos = cx.CartesianPos3D(
-            x=u.Quantity(data_dict["x_train"][:, 0], "kpc"),
-            y=u.Quantity(data_dict["x_train"][:, 1], "kpc"),
-            z=u.Quantity(data_dict["x_train"][:, 2], "kpc"),
+            x=u.Q(data_dict["x_train"][:, 0], "kpc"),
+            y=u.Q(data_dict["x_train"][:, 1], "kpc"),
+            z=u.Q(data_dict["x_train"][:, 2], "kpc"),
         )
         u_analytic = lf_potential.potential(pos, 0).ustrip("kpc2/Myr2")
         u_residual = data_dict["u_train"] - u_analytic
@@ -1124,22 +1126,19 @@ def scale_data(
         "a_val": a_val,
         "u_val": u_val,
         "r_val": r_val,
-
         "t_star": t_star,
     }
 
-    if include_velocity and config.get("orbit_p", None) is not None:
+    if include_velocity and config.get("orbit_p") is not None:
         v_transformer.fit(config["orbit_p"], scaler=1 / v_star)
-        transformers = {
-        "x": x_transformer,
-        "a": a_transformer,
-        "u": u_transformer,
-        "v": v_transformer}
-    else:
         transformers = {
             "x": x_transformer,
             "a": a_transformer,
-            "u": u_transformer}
+            "u": u_transformer,
+            "v": v_transformer,
+        }
+    else:
+        transformers = {"x": x_transformer, "a": a_transformer, "u": u_transformer}
 
     return scaled, transformers
 
@@ -1193,11 +1192,11 @@ def scale_data_time(
     if config.get("include_analytic", False):
         analytic_baseline = config["ab_potential"]
         pos = cx.CartesianPos3D(
-            x=u.Quantity(x_concat[:, 0], "kpc"),
-            y=u.Quantity(x_concat[:, 1], "kpc"),
-            z=u.Quantity(x_concat[:, 2], "kpc"),
+            x=u.Q(x_concat[:, 0], "kpc"),
+            y=u.Q(x_concat[:, 1], "kpc"),
+            z=u.Q(x_concat[:, 2], "kpc"),
         )
-        t_quant = u.Quantity(t_concat, "Myr")
+        t_quant = u.Q(t_concat, "Myr")
         u_analytic = analytic_baseline.potential(pos, t_quant).ustrip("kpc2/Myr2")
         u_resid = u_concat - u_analytic
         u_star = float(jnp.max(jnp.abs(u_resid)))
@@ -1249,6 +1248,7 @@ def scale_data_time(
 # Misc helpers
 # -------------------------
 
+
 def flatten_time_dict_by_time(
     data_dict: dict[str, dict[float, dict[str, Array]]], split: str = "train"
 ) -> tuple[Array, Array]:
@@ -1277,12 +1277,16 @@ def flatten_time_dict_by_time(
     """
     time_batches = []
 
-    for t, d in data_dict[split].items():
+    for d in data_dict[split].values():
         x_t = d["x"]
         a_t = d["a"]
         time_batches.append((x_t, a_t))
-    x_train = jnp.concatenate([time_batches[i][0] for i in range(len(time_batches))], axis=0)
-    a_train = jnp.concatenate([time_batches[i][1] for i in range(len(time_batches))], axis=0)
+    x_train = jnp.concatenate(
+        [time_batches[i][0] for i in range(len(time_batches))], axis=0
+    )
+    a_train = jnp.concatenate(
+        [time_batches[i][1] for i in range(len(time_batches))], axis=0
+    )
     return x_train, a_train
 
 

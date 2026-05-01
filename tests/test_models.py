@@ -7,6 +7,7 @@ from flax import nnx
 from galactoPINNs.models.static_model import StaticModel
 
 
+@jax.tree_util.register_static
 class MockTransformer:
     """Mock transformer for testing."""
 
@@ -17,6 +18,7 @@ class MockTransformer:
         return x
 
 
+@jax.tree_util.register_static
 class MockAnalyticPotential:
     """Mock analytic potential for testing."""
 
@@ -30,18 +32,6 @@ class MockAnalyticPotential:
         r = jnp.linalg.norm(x, axis=-1, keepdims=True)
         return -x / (r**3 + 0.01)
 
-# Register mock classes as JAX pytrees for JIT compatibility
-jax.tree_util.register_pytree_node(
-    MockTransformer,
-    lambda obj: ((), None),
-    lambda aux, children: MockTransformer(),
-)
-
-jax.tree_util.register_pytree_node(
-    MockAnalyticPotential,
-    lambda obj: ((), None),
-    lambda aux, children: MockAnalyticPotential(),
-)
 
 def make_minimal_config(*, include_analytic: bool = False) -> dict:
     """Create a minimal configuration for testing."""

@@ -9,6 +9,7 @@ from galactoPINNs.models.static_model import StaticModel
 from galactoPINNs.train import create_optimizer, get_model_params, train_step_static
 
 
+@jax.tree_util.register_static
 class MockTransformer:
     """Mock transformer for testing."""
 
@@ -19,6 +20,7 @@ class MockTransformer:
         return x
 
 
+@jax.tree_util.register_static
 class MockAnalyticPotential:
     """Mock analytic potential for testing."""
 
@@ -29,20 +31,6 @@ class MockAnalyticPotential:
     def acceleration(self, x, *, t=0):
         r = jnp.linalg.norm(x, axis=-1, keepdims=True)
         return -x / (r**3 + 0.01)
-
-
-# Register mock classes as JAX pytrees for JIT compatibility
-jax.tree_util.register_pytree_node(
-    MockTransformer,
-    lambda obj: ((), None),
-    lambda aux, children: MockTransformer(),
-)
-
-jax.tree_util.register_pytree_node(
-    MockAnalyticPotential,
-    lambda obj: ((), None),
-    lambda aux, children: MockAnalyticPotential(),
-)
 
 
 def make_minimal_config() -> dict:

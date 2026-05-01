@@ -19,8 +19,10 @@ from jaxtyping import Array
 
 ScaleSpec = Union[str, Array, None]  # for type hints  # noqa: UP007
 
+
 class ExternalPytree(nnx.Variable):
     """Variable wrapper for external pytrees (like equinox modules)."""
+
 
 ActFn = Callable[[Array], Array]
 
@@ -56,6 +58,7 @@ class _GalaxPotential(Protocol):
 
     def potential(self, positions: Any, *, t: Any = ...) -> Any: ...
 
+
 ScaleSpec = str | _HasPotential
 
 ##############
@@ -64,6 +67,7 @@ ScaleSpec = str | _HasPotential
 #######
 # Utilities
 #######
+
 
 def _as_batch(x: Array) -> Array:
     """Ensure a leading batch dimension.
@@ -251,6 +255,7 @@ class ScaleNNPotentialLayer(nnx.Module):
         external_scale
             An ExternalPytree-wrapped galax potential for dynamic scaling.
             If provided and config["scale"] is not a string, this is used.
+
         """
         scale_val = config.get("scale", "one")
 
@@ -270,7 +275,8 @@ class ScaleNNPotentialLayer(nnx.Module):
 
         # Clean config - remove non-serializable objects
         config_clean = {
-            k: v for k, v in config.items()
+            k: v
+            for k, v in config.items()
             if k not in ("ab_potential",)
             and not (k == "scale" and not isinstance(v, str))
         }
@@ -290,7 +296,6 @@ class ScaleNNPotentialLayer(nnx.Module):
 
         scale = self._compute_scale(x_cart, r, r_s, t)
         return scale * u_nn
-
 
     def _compute_scale(
         self,
@@ -469,9 +474,10 @@ class TrainableGalaxPotential(nnx.Module):
         """
         built_params = self._get_built_params()
         pot = self.PotClass(**built_params, units="galactic")
-        phi = pot.potential(positions, t=0)
+        phi = pot.potential(positions, t=t)
         r_s_out = jnp.asarray(built_params["r_s"])
         return phi, r_s_out
+
 
 class FuseandBoundary(nnx.Module):
     """Fuse a neural-network potential with an analytic potential.

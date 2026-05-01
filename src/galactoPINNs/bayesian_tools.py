@@ -12,8 +12,9 @@ from flax import nnx
 from jaxtyping import Array
 from numpyro.contrib.module import random_nnx_module
 from numpyro.infer import SVI, Trace_ELBO, init_to_feasible
-from numpyro.infer.autoguide import AutoNormal, AutoLowRankMultivariateNormal
+from numpyro.infer.autoguide import AutoLowRankMultivariateNormal, AutoNormal
 from numpyro.optim import Adam
+
 from galactoPINNs.models.static_model import StaticModel
 
 
@@ -96,27 +97,31 @@ def model_svi(
 
     .. math::
 
-        \\mathcal{L}_{\\mathrm{acc}} = \\frac{1}{2\\sigma_a^2}
-        \\operatorname{E}\\left[\\|\\Delta a\\| +
-        \\lambda_{\\mathrm{rel}} \\frac{\\|\\Delta a\\|}{\\|a_{\\mathrm{obs}}\\|}\\right]
+        \mathcal{L}_{\mathrm{acc}} = \frac{1}{2\sigma_a^2}
+        \operatorname{E}\left[\|\Delta a\| +
+        \lambda_{\mathrm{rel}} \frac{\|\Delta a\|}{\|a_{\mathrm{obs}}\|}\right]
 
     The orbital energy loss penalises relative drift from the initial energy
     along each trajectory:
 
     .. math::
 
-        \\mathcal{L}_{\\mathrm{orbit}} = \\operatorname{E}\\left[
-        \\left(\\frac{E_t - E_0}{|E_0|}\\right)^2\\right]
+        \mathcal{L}_{\mathrm{orbit}} = \operatorname{E}\left[
+        \left(\frac{E_t - E_0}{|E_0|}\right)^2\right]
 
     """
     if config.get("trainable", False):
         log_m_halo = numpyro.sample(
             "log_m_halo",
-            dist.TruncatedNormal(scale=sigma_alpha, **analytic_param_dists["log_m_halo"]),
+            dist.TruncatedNormal(
+                scale=sigma_alpha, **analytic_param_dists["log_m_halo"]
+            ),
         )
         log_m_disk = numpyro.sample(
             "log_m_disk",
-            dist.TruncatedNormal(scale=sigma_alpha, **analytic_param_dists["log_m_disk"]),
+            dist.TruncatedNormal(
+                scale=sigma_alpha, **analytic_param_dists["log_m_disk"]
+            ),
         )
         log_rs = numpyro.sample(
             "log_rs",
@@ -124,18 +129,22 @@ def model_svi(
         )
         log_disk_a = numpyro.sample(
             "log_disk_a",
-            dist.TruncatedNormal(scale=sigma_alpha, **analytic_param_dists["log_disk_a"]),
+            dist.TruncatedNormal(
+                scale=sigma_alpha, **analytic_param_dists["log_disk_a"]
+            ),
         )
         log_disk_b = numpyro.sample(
             "log_disk_b",
-            dist.TruncatedNormal(scale=sigma_alpha, **analytic_param_dists["log_disk_b"]),
+            dist.TruncatedNormal(
+                scale=sigma_alpha, **analytic_param_dists["log_disk_b"]
+            ),
         )
 
-        halo_r_s  = jnp.exp(log_rs)
+        halo_r_s = jnp.exp(log_rs)
         halo_mass = jnp.exp(log_m_halo)
         disk_mass = jnp.exp(log_m_disk)
-        disk_a    = jnp.exp(log_disk_a)
-        disk_b    = jnp.exp(log_disk_b)
+        disk_a = jnp.exp(log_disk_a)
+        disk_b = jnp.exp(log_disk_b)
 
         analytic_kwargs: dict[str, Any] = {
             "init_disk_a": disk_a,
@@ -160,7 +169,7 @@ def model_svi(
                 ),
             )
             analytic_kwargs["init_bulge_mass"] = jnp.exp(log_bulge_mass)
-            analytic_kwargs["init_bulge_r_s"]  = jnp.exp(log_bulge_rs)
+            analytic_kwargs["init_bulge_r_s"] = jnp.exp(log_bulge_rs)
 
         trainable_analytic_layer = composite_form(**analytic_kwargs)
     else:
@@ -204,13 +213,13 @@ def model_svi(
             orbit_v_sub = orbit_p[idx]  # (n_sub, T, 3)
 
             B, T, _ = orbit_q_sub.shape
-            T_ke  = 0.5 * jnp.sum(orbit_v_sub**2, axis=-1)  # (B, T)
+            T_ke = 0.5 * jnp.sum(orbit_v_sub**2, axis=-1)  # (B, T)
             q_flat = orbit_q_sub.reshape(B * T, 3)
 
             if config.get("trainable", False):
-                phi = bnn(
-                    q_flat, trainable_analytic_layer=trainable_analytic_layer
-                )["potential"].reshape(B, T)
+                phi = bnn(q_flat, trainable_analytic_layer=trainable_analytic_layer)[
+                    "potential"
+                ].reshape(B, T)
             else:
                 phi = bnn(q_flat)["potential"].reshape(B, T)
 
@@ -221,6 +230,7 @@ def model_svi(
             L_orbit = jnp.mean(relative_drift**2)
             numpyro.factor("orbit_E_loss", -w_orbit * L_orbit)
 
+
 def make_guide_for_config(
     config: Mapping[str, Any],
     analytic_param_dists: Mapping[str, Mapping[str, Any]],
@@ -228,7 +238,7 @@ def make_guide_for_config(
     net_template: StaticModel,
     guide_type: str = "auto_normal",
     rank: int = 20,
-):
+) -> numpyro.infer.autoguide.AutoGuide:
     """Construct a variational guide for the model.
 
     Parameters
@@ -262,7 +272,9 @@ def make_guide_for_config(
     ``composite_form``, and ``net_template`` from ``**kw`` before forwarding
     to :func:`model_svi`, preventing duplicate-keyword errors when the guide
     is called with those keys present.
+
     """
+
     def _guided_model(x: Array, a_obs: Array | None = None, **kw: Any) -> None:
         kw.pop("config", None)
         kw.pop("analytic_param_dists", None)
@@ -280,20 +292,16 @@ def make_guide_for_config(
 
     if guide_type == "auto_normal":
         return AutoNormal(_guided_model, init_loc_fn=init_to_feasible)
-    elif guide_type == "low_rank":
+    if guide_type == "low_rank":
         return AutoLowRankMultivariateNormal(
             _guided_model,
             rank=rank,
             init_loc_fn=init_to_feasible,
         )
-    else:
-        raise ValueError(
-            f"Unknown guide_type '{guide_type}'. "
-            "Supported options are 'auto_normal' and 'low_rank'."
-        )
-
-
-
+    raise ValueError(
+        f"Unknown guide_type '{guide_type}'. "
+        "Supported options are 'auto_normal' and 'low_rank'."
+    )
 
 
 def make_svi(
@@ -314,7 +322,7 @@ def make_svi(
     composite_form: Callable | None = None,
     net_template: StaticModel | None = None,
 ) -> SVI:
-    """Construct an :class:`~numpyro.infer.SVI` object with :func:`model_svi` closed over config.
+    """Construct an ``SVI`` object with ``model_svi`` closed over config.
 
     Binds all hyperparameters and data into a ``_model`` closure, then wraps
     it with the provided guide and optimizer using the
@@ -397,6 +405,7 @@ def make_svi(
         )
 
     return SVI(_model, guide, optimizer, Trace_ELBO())
+
 
 def run_window(
     prev_result: Any,
@@ -530,10 +539,9 @@ def run_window(
 
     if warm_params is not None:
         return svi.run(rng_key, steps, x_train, a_train, init_params=warm_params)
-    elif prev_result is None:
+    if prev_result is None:
         return svi.run(rng_key, steps, x_train, a_train)
-    else:
-        return svi.run(rng_key, steps, x_train, a_train, init_params=prev_result.params)
+    return svi.run(rng_key, steps, x_train, a_train, init_params=prev_result.params)
 
 
 def draw_i(draws: dict[str, Array], i: int) -> dict[str, Array]:
@@ -561,9 +569,9 @@ def draw_i(draws: dict[str, Array], i: int) -> dict[str, Array]:
     """
     out = {}
     for k, v in draws.items():
-        if not (k.startswith("log_") or k.startswith("full_model/")):
+        if not k.startswith(("log_", "full_model/")):
             continue
-        v = jnp.asarray(v)
+        v = jnp.asarray(v)  # noqa: PLW2901
         out[k] = v if v.ndim == 0 else v[i]
     return out
 
@@ -589,11 +597,11 @@ def theta_from_draw_halo_disk(d: dict[str, Array]) -> dict[str, Array]:
 
     """
     return {
-        "r_s":       jnp.exp(d["log_rs"]),
+        "r_s": jnp.exp(d["log_rs"]),
         "halo_mass": jnp.exp(d["log_m_halo"]),
         "disk_mass": jnp.exp(d["log_m_disk"]),
-        "disk_a":    jnp.exp(d["log_disk_a"]),
-        "disk_b":    jnp.exp(d["log_disk_b"]),
+        "disk_a": jnp.exp(d["log_disk_a"]),
+        "disk_b": jnp.exp(d["log_disk_b"]),
     }
 
 
@@ -637,10 +645,8 @@ def parse_site_to_kp(site: str) -> tuple:
         ``("mlp", "layers", 0, "weight")``.
 
     """
-    s = site[len("full_model/"):]
-    parts = []
-    for part in s.split("."):
-        parts.append(int(part) if part.isdigit() else part)
+    s = site[len("full_model/") :]
+    parts = [int(part) if part.isdigit() else part for part in s.split(".")]
     return tuple(parts)
 
 
@@ -663,7 +669,7 @@ def _flatten_nested_dict(d: dict, prefix: tuple = ()) -> dict[tuple, Any]:
     """
     out = {}
     for k, v in d.items():
-        path = prefix + (k,)
+        path = (*prefix, k)
         if isinstance(v, dict):
             out.update(_flatten_nested_dict(v, path))
         else:
@@ -693,7 +699,6 @@ def _nested_from_flat(flat: dict[tuple, Any]) -> dict:
             d = d.setdefault(k, {})
         d[keys[-1]] = val
     return nested
-
 
 
 def make_net_for_draw(net_template: nnx.Module, draw: dict[str, Array]) -> nnx.Module:
@@ -726,7 +731,7 @@ def make_net_for_draw(net_template: nnx.Module, draw: dict[str, Array]) -> nnx.M
 
     pure = nnx.to_pure_dict(param_state)
     flat_pure = _flatten_nested_dict(pure)
-    valid = {normalize_kp(k) for k in flat_pure.keys()}
+    valid = {normalize_kp(k) for k in flat_pure}
 
     updates_flat = {}
     for name, val in draw.items():
@@ -747,7 +752,7 @@ def make_net_for_draw_with_analytic(
     config: Mapping[str, Any],
     composite_form: Callable,
 ) -> tuple[StaticModel, dict[str, Array]]:
-    """Instantiate a full model with both BNN weights and analytic parameters from a posterior draw.
+    """Instantiate a model with BNN weights and analytic params from a posterior draw.
 
     Converts log-space samples to physical parameters via
     :func:`theta_from_draw_halo_disk`, constructs a trainable analytic layer,

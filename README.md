@@ -91,13 +91,15 @@ import optax
 import jax.random as jr
 from flax import nnx
 
-net = StaticModel(train_config,rngs=nnx.Rngs(0))
+net = StaticModel(train_config, rngs=nnx.Rngs(0))
 x_train = scaled_data["x_train"]
 a_train = scaled_data["a_train"]
 
 tx = optax.adam(1e-3)
 rng = jr.PRNGKey(0)
-train_output = train_model_static(net, tx, x_train, a_train, 2000, analytic_potential=analytic_baseline_potential)
+train_output = train_model_static(
+    net, tx, x_train, a_train, 2000, analytic_potential=analytic_baseline_potential
+)
 ```
 
 Use the provided evaluation features to assess the acceleration and potential
@@ -109,7 +111,7 @@ acceleration/potential predictions and integrate orbits!
 from galactoPINNs.model_potential import make_galax_potential
 import unxt as u
 import galax.dynamics as gd
-from galax.coordinates import PhaseSpacePosition
+import galax.coordinates as gc
 import jax.numpy as np
 import jax.numpy as jnp
 
@@ -121,12 +123,12 @@ learned_potential = learned_galax_potential.potential(test_points, t=0)
 learned_acceleration = learned_galax_potential.acceleration(test_points, t=0)
 
 # integrate orbits in the learned potential
-w0 = PhaseSpacePosition(
-    q=u.Quantity(jnp.array([[10.0, 16.0, 0.0]]), "kpc"),
-    p=u.Quantity([[1, 0.0, 0.0]], "kpc/Myr"),
+w0 = gc.PhaseSpacePosition(
+    q=u.Q(jnp.array([[10.0, 16.0, 0.0]]), "kpc"),
+    p=u.Q([[1, 0.0, 0.0]], "kpc/Myr"),
 )
 
-ts = u.Quantity(jnp.linspace(0, 500.0, 500), "Myr")
+ts = u.Q(jnp.linspace(0, 500.0, 500), "Myr")
 
 learned_orbit = gd.evaluate_orbit(learned_galax_potential, w0, ts)
 ```

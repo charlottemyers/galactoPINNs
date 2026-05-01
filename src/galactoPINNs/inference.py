@@ -12,6 +12,7 @@ ApplyFn = Callable[..., Mapping[str, Any]]
 
 ##### Protocols and types #####
 
+
 class _NNXModelLike(Protocol):
     """Protocol for NNX modules that can be called directly."""
 
@@ -63,7 +64,8 @@ def apply_model(
         x = x_or_apply_fn
         if x_scaled is not None:
             raise ValueError(
-                "In object mode, do not provide the third positional argument `x_scaled`."
+                "In object mode, do not provide the third "
+                "positional argument `x_scaled`."
             )
         predictions = model(x)
 
