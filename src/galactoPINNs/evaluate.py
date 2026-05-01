@@ -153,7 +153,8 @@ def evaluate_performance(
         )
 
     else:
-        raise ValueError(f"Unknown gauge_correct='{gauge_correct}'")
+        msg = f"Unknown gauge_correct='{gauge_correct}'"
+        raise ValueError(msg)
 
     # --- Analytic baseline comparison ---
     if analytic_baseline is not None:
@@ -326,7 +327,8 @@ def evaluate_performance_node(
         )
 
     else:
-        raise ValueError(f"Unknown gauge_correct='{gauge_correct}'")
+        msg = f"Unknown gauge_correct='{gauge_correct}'"
+        raise ValueError(msg)
 
     # --- Analytic baseline comparison ---
     if analytic_baseline is not None:
@@ -500,18 +502,15 @@ def svi_performance(
     metrics
         Dictionary containing:
 
-        - ``"u_mean"``: posterior mean potential in physical units, shape
-          ``(N,)``.
-        - ``"a_mean"``: posterior mean acceleration in physical units, shape
-          ``(N, 3)``.
-        - ``"u_std"``: posterior std of potential in physical units, shape
-          ``(N,)``.
-        - ``"a_std"``: posterior std of acceleration in physical units, shape
-          ``(N, 3)``.
-        - ``"u_samples"``: full posterior potential samples in physical units,
-          shape ``(S, N)``.
+        - ``"u_mean"``: posterior mean potential in physical units, shape ``(N,)``.
+        - ``"a_mean"``: posterior mean acceleration in physical units, shape ``(N, 3)``.
+        - ``"u_std"``: posterior std of potential in physical units, shape ``(N,)``.
+        - ``"a_std"``: posterior std of acceleration in physical units,
+            shape ``(N, 3)``.
+        - ``"u_samples"``: full posterior potential samples in physical
+            units, shape ``(S, N)``.
         - ``"a_samples"``: full posterior acceleration samples in physical
-          units, shape ``(S, N, 3)``.
+            units, shape ``(S, N, 3)``.
 
     """
     x_test_scaled = config["x_transformer"].transform(x_test)
@@ -646,4 +645,5 @@ def gauge_invariant_rel_resid(
         rel_resid = 100 * (true_u_xy - pred_gf) / (jnp.abs(true_u_xy) + eps)
         return true_u_xy, pred_gf, rel_resid
 
-    raise ValueError(f"Unknown mode '{mode}'. Use 'delta_ref' or 'median_offset'.")
+    msg = f"Unknown mode '{mode}'. Use 'delta_ref' or 'median_offset'."
+    raise ValueError(msg)

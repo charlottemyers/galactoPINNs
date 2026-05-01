@@ -18,10 +18,7 @@ class TestSmoothMLP:
         """Test that SmoothMLP initializes with the correct number of layers."""
         mlp = SmoothMLP(in_features=3, width=16, depth=2, rngs=nnx.Rngs(0))
 
-        assert len(mlp.hidden_layers) == 2
-        assert mlp.output_layer is not None
-        assert mlp.width == 16
-        assert mlp.depth == 2
+        assert len(mlp.network.layers) == 5
 
     def test_forward_single_sample(self):
         """Test forward pass with a single sample."""
