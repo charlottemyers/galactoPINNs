@@ -258,13 +258,14 @@ class StaticModel(nnx.Module):
                         "config['trainable']=True but no "
                         "trainable_analytic_layer was provided."
                     )
-                u_phys, r_s_learned = layer(x_phys)
+                u_phys = layer(x_phys)
+                r_s_learned = layer.r_s
 
             # Transform potential to scaled units
             analytic_potential_scaled = self.config["u_transformer"].transform(u_phys)
 
         # --- Combine potentials ---
-        scaled_nn_potential = self.scale_layer(x_cart, u_nn, r_s_learned=r_s_learned)
+        scaled_nn_potential = self.scale_layer(x_cart, u_nn, r_s=r_s_learned)
         fused_potential = scaled_nn_potential + analytic_potential_scaled
         boundary_potential = self.fuse_boundary_layer(
             x_cart, scaled_nn_potential, analytic_potential_scaled

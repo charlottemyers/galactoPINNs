@@ -11,14 +11,16 @@ __all__ = (
 )
 
 import functools as ft
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any, Protocol
 
 import galax.potential as gp
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jaxtyping import Array
+from jaxtyping import Array, ScalarLike
+
+_MASS_KEYS: frozenset[str] = frozenset({"m", "m_tot"})
 
 
 class ExternalPytree(nnx.Variable):
@@ -175,174 +177,166 @@ class CartesianToModifiedSphericalLayer(nnx.Module):
         return Y2[(0 if X_cart.ndim == 1 else Ellipsis)]
 
 
+# --- Scale function implementations (module-level, bound via ft.partial) ---
+# Shared final signature after partial application: (x_cart, r, r_s, t) -> Array
+
+
+def _scale_one(x_cart: Array, r: Array, r_s: float, t: Any) -> Array:  # noqa: ARG001
+    return jnp.ones_like(r)
+
+
+def _scale_power(x_cart: Array, r: Array, r_s: float, t: Any, *, power: float) -> Array:  # noqa: ARG001
+    return jnp.power(1.0 / r, power)
+
+
+def _scale_nfw(
+    x_cart: Array,  # noqa: ARG001
+    r: Array,
+    r_s: float,
+    t: Any,  # noqa: ARG001
+    *,
+    x_transformer: Any,
+) -> Array:
+    r_s_scaled = x_transformer.transform(r_s)
+    return jnp.log(1.0 + r / r_s_scaled) / r
+
+
+def _scale_precomputed(*_: Any, precomputed: Array) -> Array:
+    return precomputed
+
+
+def _scale_external(
+    x_cart: Array,
+    r: Array,
+    r_s: float,  # noqa: ARG001
+    t: Any,
+    *,
+    external_scale: ExternalPytree,
+    r_ref: float | None,
+    eps_frac: float,
+    clip_min: float,
+    clip_max: float,
+    reciprocal: bool,
+) -> Array:
+    xB = jnp.atleast_2d(x_cart)
+    ext_potential = external_scale.value
+
+    u = ext_potential.potential(xB, t=t).squeeze()
+    s_raw = jnp.abs(u)
+
+    if r_ref is None:
+        s_norm = s_raw
+    else:
+        r_safe = jnp.maximum(r, 1e-12)
+        x_dir = xB / r_safe[:, None]
+        u_ref = ext_potential.potential(x_dir * r_ref, t=t).squeeze()
+        s_ref = jnp.abs(u_ref)
+        eps = eps_frac * jnp.maximum(s_ref, 1e-12)
+        s_norm = (s_raw + eps) / (s_ref + eps)
+
+    s_out = 1.0 / jnp.maximum(s_norm, 1e-12) if reciprocal else s_norm
+    return jnp.clip(s_out, clip_min, clip_max)
+
+
+# Type alias for the fully-bound scale callable.
+_ScaleFn = Callable[[Array, Array, float, Any], Array]
+
+
 class ScaleNNPotentialLayer(nnx.Module):
     """Apply an analytic, radius-dependent prefactor to a proxy potential."""
+
+    scale_fn: _ScaleFn
 
     def __init__(
         self,
         config: Mapping[str, Any],
         external_scale: ExternalPytree | None = None,
     ) -> None:
-        """Initialize the scaling layer with configuration.
+        """Initialize the scaling layer, resolving all config at construction time.
 
         Parameters
         ----------
         config
-            Configuration dict. The "scale" key can be:
-            - str: "one", "power", "nfw" for built-in modes
-            - Array: pre-computed scale values (stored directly)
-            - A galax potential object: will be ignored here, use external_scale instead
+            Configuration dict. The ``"scale"`` key selects the mode:
+            - ``str``: ``"one"``, ``"power"``, or ``"nfw"`` for built-in modes.
+            - ``Array``: pre-computed scale values used directly.
+            - Anything else: external potential mode; pass the wrapped object via
+              ``external_scale``.
         external_scale
-            An ExternalPytree-wrapped galax potential for dynamic scaling.
-            If provided and config["scale"] is not a string, this is used.
+            An ``ExternalPytree``-wrapped galax potential for dynamic scaling.
+            Required when ``config["scale"]`` is not a string or array.
 
         """
         scale_val = config.get("scale", "one")
 
         if isinstance(scale_val, str):
-            self._scale_mode: str = scale_val
-            self._precomputed_scale: Array | None = None
-        elif isinstance(scale_val, (jnp.ndarray, jax.Array)):
-            # Pre-computed array
-            self._scale_mode = "precomputed"
-            self._precomputed_scale = scale_val
+            mode = scale_val
+        elif isinstance(scale_val, jax.Array):
+            mode = "precomputed"
         else:
-            self._scale_mode = "external"
-            self._precomputed_scale = None
+            mode = "external"
 
-        # Store external potential
-        self.external_scale = external_scale
+        # Keep as a named attribute so NNX can track the Variable.
+        if mode == "external" and external_scale is None:
+            raise ValueError(
+                "scale mode is 'external' but no external_scale was provided."
+            )
 
-        # Clean config - remove non-serializable objects
-        config_clean = {
-            k: v
-            for k, v in config.items()
-            if k not in ("ab_potential",)
-            and not (k == "scale" and not isinstance(v, str))
-        }
-        self.config = config_clean
+        self._default_r_s: float = float(config.get("r_s", 1.0))
+
+        # Bind the correct implementation once — __call__ has zero branching.
+        match mode:
+            case "one":
+                self.scale_fn: _ScaleFn = _scale_one
+            case "power":
+                self.scale_fn = ft.partial(
+                    _scale_power, power=float(config.get("power", 1.0))
+                )
+            case "nfw":
+                self.scale_fn = ft.partial(
+                    _scale_nfw, x_transformer=config["x_transformer"]
+                )
+            case "precomputed":
+                self.scale_fn = ft.partial(_scale_precomputed, precomputed=scale_val)
+            case _:  # "external"
+                self.scale_fn = ft.partial(
+                    _scale_external,
+                    external_scale=external_scale,
+                    r_ref=config.get("scale_r_ref", None),
+                    eps_frac=float(config.get("scale_eps_frac", 1e-6)),
+                    clip_min=float(config.get("scale_clip_min", 1e-3)),
+                    clip_max=float(config.get("scale_clip_max", 1e3)),
+                    reciprocal=bool(config.get("scale_reciprocal", True)),
+                )
 
     def __call__(
-        self,
-        x_cart: Array,
-        /,
-        u_nn: Array,
-        *,
-        r_s_learned: float | None = None,
-        t: Any = 0,
+        self, x_cart: Array, u_nn: Array, /, *, r_s: float | None = None, t: Any = 0
     ) -> Array:
         """Apply scaling to the NN potential."""
         r = jnp.linalg.norm(x_cart, axis=-1)
-        r_s = r_s_learned if r_s_learned is not None else self.config.get("r_s", 1.0)
-
-        scale = self._compute_scale(x_cart, r, r_s, t)
-        return scale * u_nn
-
-    def _compute_scale(
-        self,
-        x_cart: Array,
-        r: Array,
-        r_s: float,
-        t: Any,
-    ) -> Array:
-        """Compute the scale factor based on mode."""
-        match self._scale_mode:
-            case "one":
-                return jnp.ones_like(r)
-
-            case "power":
-                power = float(self.config.get("power", 1.0))
-                r_here = jnp.linalg.norm(x_cart, axis=-1)
-                return jnp.power(1.0 / r_here, power)
-
-            case "nfw":
-                x_transformer = self.config["x_transformer"]
-                r_s_scaled = x_transformer.transform(r_s)
-                r_scaled = jnp.linalg.norm(x_cart, axis=-1)
-                return jnp.log(1.0 + r_scaled / r_s_scaled) / r_scaled
-
-            case "precomputed":
-                if self._precomputed_scale is None:
-                    raise ValueError("Precomputed scale is None")
-                return self._precomputed_scale
-
-            case "external":
-                if self.external_scale is None:
-                    raise ValueError(
-                        "scale mode is 'external' but no external_scale provided"
-                    )
-                ext_potential = self.external_scale.value
-                return self._external_scale_impl(x_cart, r, t, ext_potential)
-
-            case _:
-                # Default fallback
-                return jnp.ones_like(r)
-
-    def _external_scale_impl(
-        self,
-        x_cart: Array,
-        r: Array,
-        t: Any,
-        ext_potential: Any,
-    ) -> Array:
-        """Compute scale from external potential."""
-        r_ref = self.config.get("scale_r_ref", None)
-        eps_frac = float(self.config.get("scale_eps_frac", 1e-6))
-        clip_min = float(self.config.get("scale_clip_min", 1e-3))
-        clip_max = float(self.config.get("scale_clip_max", 1e3))
-        reciprocal = bool(self.config.get("scale_reciprocal", True))
-
-        xB = jnp.atleast_2d(x_cart)
-        r_safe = jnp.maximum(r, 1e-12)
-
-        u = ext_potential.potential(xB, t=t).squeeze()
-        s_raw = jnp.abs(u)
-
-        if r_ref is None:
-            s_norm = s_raw
-        else:
-            x_dir = xB / jnp.atleast_1d(r_safe)[:, None]
-            x_ref = x_dir * r_ref
-            u_ref = ext_potential.potential(x_ref, t=t).squeeze()
-            s_ref = jnp.abs(u_ref)
-            eps = eps_frac * jnp.maximum(s_ref, 1e-12)
-            s_norm = (s_raw + eps) / (s_ref + eps)
-
-        s_out = jnp.where(reciprocal, 1.0 / jnp.maximum(s_norm, 1e-12), s_norm)
-        return jnp.clip(s_out, clip_min, clip_max)
+        r_s_ = r_s if r_s is not None else self._default_r_s
+        return self.scale_fn(x_cart, r, r_s_, t) * u_nn
 
 
 class TrainableGalaxPotential(nnx.Module):
-    """NNX module that wraps a Galax potential class.
+    """NNX module that wraps a Galax potential class with trainable parameters.
 
-    Exposes selected constructor arguments as trainable NNX parameters. This
-    layer takes a Galax potential constructor, a dictionary of initialization
-    values, and a list/tuple of keys indicating which parameters should be
-    trainable. On each call, it constructs a Galax potential instance using
-    a mix of:
-      - learned parameters for keys in `trainable, and
-      - fixed values from `init_kwargs for all other keys.
-      For mass-like parameters (`"m" or "m_tot"), the module trains the base-10
-      logarithm and exponentiates during the forward pass to enforce positivity
-      and improve numerical conditioning.
+    Selected constructor arguments become trainable ``nnx.Param`` values; all
+    others are stored as fixed arrays. Mass-like parameters (``"m"`` or
+    ``"m_tot"``) are stored in log₁₀-space to enforce positivity and improve
+    numerical conditioning.
 
     Parameters
     ----------
     pot_cls
-        Galax potential constructor/class. Must be callable and return an object
-        with a `.potential(positions, t=...) method.
+        Galax potential constructor. Must return an object with a
+        ``.potential(positions, t=...)`` method.
     init_kwargs
-        Mapping from constructor-argument name to its initial (float) value.
+        Mapping from constructor-argument name to its initial value.
     trainable
-        Tuple of keys from `init_kwargs that should become trainable parameters.
+        Keys from ``init_kwargs`` that should become trainable parameters.
     rngs
-        Random number generator state (unused but kept for API consistency).
-
-    Returns
-    -------
-    phi, r_s
-        `phi is the potential evaluated at positions with t=0. The second return
-        value is `params["r_s"]`.
+        Unused; kept for API consistency.
 
     """
 
@@ -361,40 +355,30 @@ class TrainableGalaxPotential(nnx.Module):
         self.pot_cls = pot_cls
         self._trainable_keys = trainable
 
-        # Build parameters dict, then wrap in nnx.Dict for proper pytree handling
         params_dict: dict[str, nnx.Param | Array] = {}
         for name, val in init_kwargs.items():
             arr = jnp.asarray(val, dtype=jnp.float32)
-            match (name in trainable, name in ("m", "m_tot")):
-                case (True, True):
-                    # Train log10 of mass for positivity
-                    params_dict[f"log10_{name}"] = nnx.Param(jnp.log10(arr))
-                case (True, False):
-                    params_dict[name] = nnx.Param(arr)
-                case _:
-                    # Fixed parameters stored as plain arrays
-                    params_dict[name] = arr
+            if name in trainable and name in _MASS_KEYS:
+                params_dict[f"log10_{name}"] = nnx.Param(jnp.log10(arr))
+            elif name in trainable:
+                params_dict[name] = nnx.Param(arr)
+            else:
+                params_dict[name] = arr
 
         self._params = nnx.Dict(params_dict)
 
-    def _get_built_params(self) -> dict[str, Array]:
-        """Get the current parameter values, converting log-mass if needed."""
-        params: dict[str, Array] = {}
-        for name, val in self._params.items():
-            if name.startswith("log10_"):
-                # Convert back from log10
-                actual_name = name[6:]  # Remove "log10_" prefix
-                if isinstance(val, nnx.Param):
-                    params[actual_name] = jnp.power(10.0, val.value)
-                else:
-                    params[actual_name] = jnp.power(10.0, val)
-            elif isinstance(val, nnx.Param):
-                params[name] = val.value
+    def _build_kwargs(self) -> dict[str, Array]:
+        """Reconstruct potential kwargs, back-transforming log₁₀-encoded params."""
+        out: dict[str, Array] = {}
+        for key, var in self._params.items():
+            raw = var.value if isinstance(var, nnx.Variable) else var
+            if key.startswith("log10_"):
+                out[key[6:]] = jnp.power(10.0, raw)
             else:
-                params[name] = val
-        return params
+                out[key] = raw
+        return out
 
-    def __call__(self, positions: Array, t: Any = 0) -> tuple[Array, Array]:
+    def __call__(self, positions: Array, t: ScalarLike = 0) -> Array:
         """Evaluate the trainable potential at given positions.
 
         Parameters
@@ -402,22 +386,22 @@ class TrainableGalaxPotential(nnx.Module):
         positions
             Cartesian positions, shape ``(N, 3)``.
         t
-            Time at which to evaluate. Accepted for interface compatibility with
-            time-dependent subclasses; this static layer always evaluates at t=0.
+            Time at which to evaluate the potential. Default 0.
 
         Returns
         -------
-        phi
+        Array
             Potential values at positions.
-        r_s
-            The current scale radius parameter.
 
         """
-        built_params = self._get_built_params()
-        pot = self.pot_cls(**built_params, units="galactic")
-        phi = pot.potential(positions, t=t)
-        r_s_out = jnp.asarray(built_params["r_s"])
-        return phi, r_s_out
+        kwargs = self._build_kwargs()
+        pot = self.pot_cls(**kwargs, units="galactic")
+        return pot.potential(positions, t=t)
+
+    @property
+    def r_s(self) -> Array:
+        """Convenience property to access the current r_s value."""
+        return self._build_kwargs()["r_s"]
 
 
 class FuseandBoundary(nnx.Module):
@@ -512,7 +496,7 @@ class FuseandBoundary(nnx.Module):
 
         saturation: float = float(self.config.get("saturation", 1.0))
 
-        if bool(self.config.get("train_k", False)):
+        if self.config.get("train_k", False):
             min_k: float = float(self.config.get("min_k", 0.01))
             k_smooth: Array = jnp.maximum(min_k, jnp.exp(jnp.asarray(self.log_k)))
         else:
@@ -520,10 +504,7 @@ class FuseandBoundary(nnx.Module):
 
         r_trans: float = float(self.r_trans)
 
-        if positions.ndim == 1:
-            r: Array = jnp.linalg.norm(dimensional_positions)
-        else:
-            r = jnp.linalg.norm(dimensional_positions, axis=1)
+        r = jnp.linalg.norm(dimensional_positions, axis=-1)
 
         if self.config.get("radial_power", None) is not None:
             power: float = float(self.config["radial_power"])
