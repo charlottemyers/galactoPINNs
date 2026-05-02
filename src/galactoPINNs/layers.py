@@ -7,6 +7,7 @@ __all__ = (
     "ScaleNNPotentialLayer",
     "SmoothMLP",
     "TrainableGalaxPotential",
+    "ZeroPotential",
 )
 
 import functools as ft
@@ -68,7 +69,6 @@ class SmoothMLP(nnx.Module):
     """
 
     network: nnx.Sequential
-    act: ActivationFn
 
     def __init__(
         self,
@@ -82,7 +82,6 @@ class SmoothMLP(nnx.Module):
         """Initialize the MLP layers."""
         layers = [
             layer
-            # Build the 1st hidden layer so the input dimension is clear.
             for i in range(depth)
             for layer in (
                 nnx.Linear(in_features if i == 0 else width, width, rngs=rngs),
@@ -112,18 +111,17 @@ class SmoothMLP(nnx.Module):
         return jnp.squeeze(self.network(x), axis=-1)
 
 
-@ft.partial(jax.jit, static_argnums=(1,))
-def _cart2sph_one(x3: Array, clip: float) -> Array:
-    """Convert a single 3D Cartesian point to modified spherical coords."""
-    r = jnp.linalg.norm(x3)
-    r_safe = jnp.maximum(r, jnp.finfo(x3.dtype).tiny)
+class ZeroPotential(nnx.Module):
+    """A zero-output potential module used when the NN component is disabled.
 
-    r_inv = 1.0 / r_safe
-    r_i = jnp.clip(r, 0.0, clip)
-    r_e = jnp.clip(r_inv, 0.0, clip)
+    Matches the ``SmoothMLP`` calling convention: takes input ``x`` of shape
+    ``(N, D)`` and returns zeros of shape ``(N,)``.
 
-    stu = x3 / r_safe
-    return jnp.concatenate([jnp.array([r_i, r_e], dtype=x3.dtype), stu], axis=0)  # (5,)
+    """
+
+    def __call__(self, x: Array, /) -> Array:
+        """Return zeros matching the batch size of ``x``."""
+        return jnp.zeros(x.shape[:-1])
 
 
 class CartesianToModifiedSphericalLayer(nnx.Module):
@@ -168,8 +166,13 @@ class CartesianToModifiedSphericalLayer(nnx.Module):
 
         """
         X2 = jnp.atleast_2d(X_cart)  # (N, 3)
-        Y2 = jax.vmap(_cart2sph_one, in_axes=(0, None))(X2, self.clip)  # (N, 5)
-        return jnp.squeeze(Y2, axis=0) if (X_cart.ndim == 1) else Y2
+        r = jnp.linalg.norm(X2, axis=-1)  # (N,)
+        r_safe = jnp.maximum(r, jnp.finfo(X2.dtype).tiny)  # (N,)
+        r_i = jnp.clip(r, 0.0, self.clip)  # (N,)
+        r_e = jnp.clip(1.0 / r_safe, 0.0, self.clip)  # (N,)
+        stu = X2 / r_safe[:, None]  # (N, 3)
+        Y2 = jnp.concatenate([r_i[:, None], r_e[:, None], stu], axis=-1)  # (N, 5)
+        return Y2[(0 if X_cart.ndim == 1 else Ellipsis)]
 
 
 class ScaleNNPotentialLayer(nnx.Module):
@@ -222,6 +225,7 @@ class ScaleNNPotentialLayer(nnx.Module):
     def __call__(
         self,
         x_cart: Array,
+        /,
         u_nn: Array,
         *,
         r_s_learned: float | None = None,
@@ -324,7 +328,7 @@ class TrainableGalaxPotential(nnx.Module):
 
     Parameters
     ----------
-    PotClass
+    pot_cls
         Galax potential constructor/class. Must be callable and return an object
         with a `.potential(positions, t=...) method.
     init_kwargs
@@ -344,7 +348,7 @@ class TrainableGalaxPotential(nnx.Module):
 
     def __init__(
         self,
-        PotClass: type[gp.AbstractPotential],
+        pot_cls: type[gp.AbstractPotential],
         init_kwargs: Mapping[str, float],
         trainable: tuple[str, ...],
         *,
@@ -354,7 +358,7 @@ class TrainableGalaxPotential(nnx.Module):
         if "r_s" not in init_kwargs:
             raise KeyError("TrainableGalaxPotential requires 'r_s' in init_kwargs.")
 
-        self.PotClass = PotClass
+        self.pot_cls = pot_cls
         self._trainable_keys = trainable
 
         # Build parameters dict, then wrap in nnx.Dict for proper pytree handling
@@ -410,7 +414,7 @@ class TrainableGalaxPotential(nnx.Module):
 
         """
         built_params = self._get_built_params()
-        pot = self.PotClass(**built_params, units="galactic")
+        pot = self.pot_cls(**built_params, units="galactic")
         phi = pot.potential(positions, t=t)
         r_s_out = jnp.asarray(built_params["r_s"])
         return phi, r_s_out

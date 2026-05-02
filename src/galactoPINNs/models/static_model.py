@@ -15,6 +15,7 @@ from galactoPINNs.layers import (
     ScaleNNPotentialLayer,
     SmoothMLP,
     TrainableGalaxPotential,
+    ZeroPotential,
 )
 
 
@@ -59,10 +60,9 @@ class StaticModel(nnx.Module):
 
     # --- Configuration ---
     config: dict[str, Any]
-    nn_off: bool
     # --- Forward pass (call order) ---
     cart_to_sph_layer: CartesianToModifiedSphericalLayer
-    mlp: SmoothMLP | None
+    nn_potential: SmoothMLP | ZeroPotential
     ab_potential: ExternalPytree | None
     trainable_analytic_layer: TrainableGalaxPotential | None
     scale_layer: ScaleNNPotentialLayer
@@ -127,8 +127,7 @@ class StaticModel(nnx.Module):
         self.fuse_boundary_layer = FuseandBoundary(config=config_without_externals)
 
         # --- Initialize MLP ---
-        self.nn_off = config.get("nn_off", False)
-        if not self.nn_off:
+        if not config.get("nn_off", False):
             depth = config.get("depth", 4)
             width = config.get("width", 128)
             activation = config.get("activation", None)
@@ -141,9 +140,9 @@ class StaticModel(nnx.Module):
             }
             if activation is not None:
                 mlp_kwargs["act"] = activation
-            self.mlp = SmoothMLP(**mlp_kwargs)
+            self.nn_potential = SmoothMLP(**mlp_kwargs)
         else:
-            self.mlp = None
+            self.nn_potential = ZeroPotential()
 
     def compute_potential(
         self,
@@ -233,7 +232,7 @@ class StaticModel(nnx.Module):
             x_in = x_cart
 
         # --- Neural network potential ---
-        u_nn = 0.0 if self.nn_off or self.mlp is None else self.mlp(x_in)
+        u_nn = self.nn_potential(x_in)
 
         # --- Analytic baseline potential ---
         analytic_potential_scaled = 0.0

@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from galactoPINNs.layers import SmoothMLP, ZeroPotential
 from galactoPINNs.models.static_model import StaticModel
 
 
@@ -68,7 +69,7 @@ class TestStaticModel:
         assert model.scale_layer is not None
         # fuse_layer was removed - now using direct addition
         assert model.fuse_boundary_layer is not None
-        assert model.mlp is not None
+        assert isinstance(model.nn_potential, SmoothMLP)
 
     def test_init_nn_off(self):
         """Test initialization with NN disabled."""
@@ -76,8 +77,7 @@ class TestStaticModel:
         config["nn_off"] = True
         model = StaticModel(config, in_features=5, rngs=nnx.Rngs(0))
 
-        assert model.mlp is None
-        assert model.nn_off is True
+        assert isinstance(model.nn_potential, ZeroPotential)
 
     def test_forward_potential_mode(self):
         """Test forward pass returns potential."""
