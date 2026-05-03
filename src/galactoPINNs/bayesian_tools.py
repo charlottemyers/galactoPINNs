@@ -806,3 +806,166 @@ def make_net_for_draw_with_analytic(
     )
     net_i = make_net_for_draw(net_i, d)
     return net_i, theta
+
+
+def make_nets_batch(
+    net_template: nnx.Module,
+    draws: dict[str, Array],
+    n: int,
+) -> list[nnx.Module]:
+    """Build ``n`` model instances efficiently by pre-computing the draw→state mapping.
+
+    Compared with calling :func:`make_net_for_draw` in a loop, this function:
+
+    * Computes the ``site_name → key-path`` mapping **once** instead of ``n``
+      times.
+    * Deep-copies only the (smaller) :class:`~flax.nnx.Param` sub-state per
+      draw, rather than the full module.
+    * Reuses the non-param sub-state across all draws via
+      :func:`~flax.nnx.merge`, avoiding redundant copies of buffers and other
+      non-trainable variables.
+
+    Parameters
+    ----------
+    net_template
+        The base :class:`~flax.nnx.Module` whose architecture is used for all
+        draws.
+    draws
+        Batched posterior samples as returned by ``guide.sample_posterior``
+        vmapped over ``n`` keys.  Each value has a leading draw dimension of
+        size ``n``.
+    n
+        Number of draws to materialise.
+
+    Returns
+    -------
+    nets
+        List of ``n`` :class:`~flax.nnx.Module` instances, one per draw, each
+        with :class:`~flax.nnx.Param` values populated from ``draws``.
+
+    """
+    # Split template ONCE: graphdef (static), Param state, everything else.
+    # other_state_t is shared (read-only) across all merged nets.
+    graphdef, param_state_t, other_state_t = nnx.split(net_template, nnx.Param, ...)
+
+    # Compute site→keypath mapping ONCE.
+    pure_t = nnx.to_pure_dict(param_state_t)
+    flat_t = _flatten_nested_dict(pure_t)
+    valid_kps = {normalize_kp(k) for k in flat_t}
+    site_to_kp = {
+        name: normalize_kp(parse_site_to_kp(name))
+        for name in draws
+        if name.startswith("full_model/")
+        and normalize_kp(parse_site_to_kp(name)) in valid_kps
+    }
+
+    nets = []
+    for i in range(n):
+        flat_i = {kp: jnp.asarray(draws[name][i]) for name, kp in site_to_kp.items()}
+        # Deep-copy only the Param sub-state (much cheaper than a full module copy).
+        param_state_i = copy.deepcopy(param_state_t)
+        nnx.replace_by_pure_dict(param_state_i, _nested_from_flat(flat_i))
+        # Reconstruct module: new Param state + shared non-param state.
+        nets.append(nnx.merge(graphdef, param_state_i, other_state_t))
+
+    return nets
+
+
+def make_nets_with_analytic_batch(
+    draws: dict[str, Array],
+    n: int,
+    *,
+    config: Mapping[str, Any],
+    composite_form: Callable,
+) -> tuple[list[nnx.Module], list[dict[str, Array]]]:
+    """Build ``n`` model+analytic instances, pre-computing the BNN mapping once.
+
+    The analytic layer carries different physical parameters for each draw, so
+    a fresh :class:`~galactoPINNs.models.static_model.StaticModel` must be
+    constructed per draw.  This function amortises the cost of computing the
+    ``site_name → key-path`` mapping and the log→physical theta conversion by
+    doing both **once** outside the loop.
+
+    Parameters
+    ----------
+    draws
+        Batched posterior samples with a leading draw dimension of size ``n``.
+    n
+        Number of draws to materialise.
+    config
+        Model configuration dictionary forwarded to
+        :class:`~galactoPINNs.models.static_model.StaticModel`.
+    composite_form
+        Callable that constructs a trainable analytic layer from physical
+        parameter keyword arguments.
+
+    Returns
+    -------
+    nets
+        List of ``n`` :class:`~galactoPINNs.models.static_model.StaticModel`
+        instances with both analytic and BNN parameters set from ``draws``.
+    thetas
+        List of ``n`` physical-space parameter dicts as returned by
+        :func:`theta_from_draw_halo_disk`.
+
+    """
+    _log_keys = ("log_rs", "log_m_halo", "log_m_disk", "log_disk_a", "log_disk_b")
+
+    # Batch-vectorize the log→physical conversion (pure JAX, no Python loop).
+    thetas_batched: dict[str, Array] = jax.vmap(theta_from_draw_halo_disk)(
+        {k: draws[k] for k in _log_keys}
+    )
+    # Materialise as a list of scalar dicts for use in module constructors.
+    thetas = [{k: thetas_batched[k][i] for k in thetas_batched} for i in range(n)]
+
+    # Build ONE reference net (draw 0) to pre-compute the BNN site→keypath mapping.
+    theta0 = thetas[0]
+    ref_layer = composite_form(
+        init_halo_r_s=theta0["r_s"],
+        init_disk_a=theta0["disk_a"],
+        init_disk_b=theta0["disk_b"],
+        init_halo_mass=theta0["halo_mass"],
+        init_disk_mass=theta0["disk_mass"],
+    )
+    ref_net = StaticModel(
+        config=config, trainable_analytic_layer=ref_layer, rngs=nnx.Rngs(0)
+    )
+    param_state_ref = nnx.state(ref_net, nnx.Param)
+    pure_ref = nnx.to_pure_dict(param_state_ref)
+    flat_ref = _flatten_nested_dict(pure_ref)
+    valid_kps = {normalize_kp(k) for k in flat_ref}
+    # Only patch BNN weight sites; analytic params are set at construction time.
+    site_to_kp = {
+        name: normalize_kp(parse_site_to_kp(name))
+        for name in draws
+        if name.startswith("full_model/")
+        and normalize_kp(parse_site_to_kp(name)) in valid_kps
+    }
+
+    nets: list[nnx.Module] = [ref_net]
+    for i in range(1, n):
+        theta = thetas[i]
+        train_layer = composite_form(
+            init_halo_r_s=theta["r_s"],
+            init_disk_a=theta["disk_a"],
+            init_disk_b=theta["disk_b"],
+            init_halo_mass=theta["halo_mass"],
+            init_disk_mass=theta["disk_mass"],
+        )
+        net_i = StaticModel(
+            config=config, trainable_analytic_layer=train_layer, rngs=nnx.Rngs(0)
+        )
+        flat_i = {kp: jnp.asarray(draws[name][i]) for name, kp in site_to_kp.items()}
+        param_state_i = nnx.state(net_i, nnx.Param)
+        nnx.replace_by_pure_dict(param_state_i, _nested_from_flat(flat_i))
+        nnx.update(net_i, param_state_i)
+        nets.append(net_i)
+
+    # Also patch BNN weights for draw 0 (ref_net was built with draw 0 theta,
+    # but its BNN weights are still the random initialisation).
+    flat_0 = {kp: jnp.asarray(draws[name][0]) for name, kp in site_to_kp.items()}
+    param_state_0 = nnx.state(ref_net, nnx.Param)
+    nnx.replace_by_pure_dict(param_state_0, _nested_from_flat(flat_0))
+    nnx.update(ref_net, param_state_0)
+
+    return nets, thetas
