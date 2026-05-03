@@ -39,11 +39,9 @@ def make_minimal_config() -> dict:
         "u_transformer": MockTransformer(),
         "a_transformer": MockTransformer(),
         "r_s": 1.0,
-        "clip": 1.0,
         "scale": "one",
         "include_analytic": False,
         "ab_potential": MockAnalyticPotential(),
-        "convert_to_spherical": True,
         "trainable": False,
         "enforce_boundary": False,
         "depth": 2,
@@ -146,7 +144,6 @@ class TestNNXModelProtocol:
         assert "u_transformer" in model.config
         assert "a_transformer" in model.config
         assert "include_analytic" in model.config
-        assert "convert_to_spherical" in model.config
 
     def test_model_has_ab_potential(self):
         """Test that model stores ab_potential separately."""

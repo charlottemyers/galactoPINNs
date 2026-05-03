@@ -12,7 +12,6 @@ from jaxtyping import Array
 
 from galactoPINNs.layers import (
     MLP,
-    CartesianLayer,
     CartesianToModifiedSphericalLayer,
     ExternalPytree,
     FuseandBoundary,
@@ -46,10 +45,6 @@ class StaticModelConfig(TypedDict):
     width: NotRequired[int]
     activation: NotRequired[Callable[[Array], Array]]
 
-    # Input encoder configuration
-    convert_to_spherical: NotRequired[bool]
-    clip: NotRequired[float]
-
     # Neural network options
     nn_off: NotRequired[bool]
 
@@ -71,8 +66,6 @@ DEFAULT_STATIC_MODEL_CONFIG: Final[StaticModelConfig] = {
     "scale": "one",
     "include_analytic": False,
     "trainable": False,
-    "convert_to_spherical": True,
-    "clip": 1.0,
     "nn_off": False,
     "enforce_boundary": False,
     "depth": 4,
@@ -86,6 +79,9 @@ DEFAULT_STATIC_MODEL_CONFIG: Final[StaticModelConfig] = {
     "saturation": 1.0,
     "r_s": 1.0,
 }
+
+DEFAULT_INPUT_ENCODER: Final = CartesianToModifiedSphericalLayer(clip=1.0)
+EXCLUDED_CONFIG_KEYS: Final = frozenset({"ab_potential", "scale"})
 
 
 class StaticModel(nnx.Module):
@@ -115,7 +111,7 @@ class StaticModel(nnx.Module):
     # --- Configuration ---
     config: dict[str, Any]
     # --- Forward pass (call order) ---
-    input_encoder: nnx.Module
+    input_encoder: nnx.Module = DEFAULT_INPUT_ENCODER
     nn_potential: MLP | ZeroPotential
     ab_potential: ExternalPytree
     trainable_analytic_layer: TrainableGalaxPotential | None
@@ -125,6 +121,7 @@ class StaticModel(nnx.Module):
     def __init__(
         self,
         config: StaticModelConfig,
+        input_encoder: nnx.Module = DEFAULT_INPUT_ENCODER,
         in_features: int = 5,
         trainable_analytic_layer: TrainableGalaxPotential | None = None,
         *,
@@ -135,18 +132,10 @@ class StaticModel(nnx.Module):
         config = DEFAULT_STATIC_MODEL_CONFIG | config
 
         # --- Prepare cleaned config dicts ---
-        config_without_ab = {k: v for k, v in config.items() if k != "ab_potential"}
-        config_without_externals = {
-            k: v for k, v in config.items() if k not in ("ab_potential", "scale")
-        }
-
-        self.config = config_without_externals
+        self.config = {k: v for k, v in config.items() if k not in EXCLUDED_CONFIG_KEYS}
 
         # --- Initialize coordinate transform layer ---
-        if config["convert_to_spherical"]:
-            self.input_encoder = CartesianToModifiedSphericalLayer(clip=config["clip"])
-        else:
-            self.input_encoder = CartesianLayer()
+        self.input_encoder = input_encoder
 
         # --- Handle analytic baseline potential ---
         ab_pot = config.get("ab_potential", None)
@@ -178,11 +167,12 @@ class StaticModel(nnx.Module):
             wrapped_scale_potential = ExternalPytree(raw_scale)
 
         self.scale_layer = ScaleNNPotentialLayer(
-            config=config_without_ab, external_scale=wrapped_scale_potential
+            config={k: v for k, v in config.items() if k != "ab_potential"},
+            external_scale=wrapped_scale_potential,
         )
 
         # --- Initialize fusion/boundary layer ---
-        self.fuse_boundary_layer = FuseandBoundary(config=config_without_externals)
+        self.fuse_boundary_layer = FuseandBoundary(config=self.config)
 
         # --- Initialize MLP ---
         if config["nn_off"]:
