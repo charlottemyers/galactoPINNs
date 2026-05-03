@@ -124,11 +124,11 @@ learned_acceleration = learned_galax_potential.acceleration(test_points, t=0)
 
 # integrate orbits in the learned potential
 w0 = gc.PhaseSpacePosition(
-    q=u.Q(jnp.array([[10.0, 16.0, 0.0]]), "kpc"),
-    p=u.Q([[1, 0.0, 0.0]], "kpc/Myr"),
+    q=u.Quantity(jnp.array([[10.0, 16.0, 0.0]]), "kpc"),
+    p=u.Quantity([[1, 0.0, 0.0]], "kpc/Myr"),
 )
 
-ts = u.Q(jnp.linspace(0, 500.0, 500), "Myr")
+ts = u.Quantity(jnp.linspace(0, 500.0, 500), "Myr")
 
 learned_orbit = gd.evaluate_orbit(learned_galax_potential, w0, ts)
 ```

@@ -183,9 +183,9 @@ def _estimate_density_upper_bound(
     mask = r_max >= R
 
     pos_grid = cx.CartesianPos3D(
-        x=u.Q(X[mask].ravel(), "kpc"),
-        y=u.Q(Y[mask].ravel(), "kpc"),
-        z=u.Q(Z[mask].ravel(), "kpc"),
+        x=u.Quantity(X[mask].ravel(), "kpc"),
+        y=u.Quantity(Y[mask].ravel(), "kpc"),
+        z=u.Quantity(Z[mask].ravel(), "kpc"),
     )
     rho_grid = gp.density(galax_pot, pos_grid, t=t).value
     rho_max = float(jnp.max(rho_grid))
@@ -200,14 +200,14 @@ def _make_density_fn(galax_pot: Any, t: float) -> Callable[[Array], Array]:
     Returns a function that takes raw (N, 3) position arrays (in kpc)
     and returns density values, bypassing coordinax overhead in the hot path.
     """
-    t_q = u.Q(t, "Myr")
+    t_q = u.Quantity(t, "Myr")
 
     def _density_raw(xyz: Array) -> Array:
         """Evaluate density at positions xyz (N, 3) in kpc."""
         pos = cx.CartesianPos3D(
-            x=u.Q(xyz[:, 0], "kpc"),
-            y=u.Q(xyz[:, 1], "kpc"),
-            z=u.Q(xyz[:, 2], "kpc"),
+            x=u.Quantity(xyz[:, 0], "kpc"),
+            y=u.Quantity(xyz[:, 1], "kpc"),
+            z=u.Quantity(xyz[:, 2], "kpc"),
         )
         return gp.density(galax_pot, pos, t=t_q).value
 
@@ -460,14 +460,14 @@ def generate_static_data(
         Returns a function that takes raw (N, 3) position arrays (in kpc)
         and returns (positions, accelerations, potentials).
         """
-        t_q = u.Q(t, "Myr")
+        t_q = u.Quantity(t, "Myr")
 
         def _evaluate_raw(samples: Array) -> tuple[Array, Array, Array]:
             x, y, z = samples.T
             pos = cx.CartesianPos3D(
-                x=u.Q(x, "kpc"),
-                y=u.Q(y, "kpc"),
-                z=u.Q(z, "kpc"),
+                x=u.Quantity(x, "kpc"),
+                y=u.Quantity(y, "kpc"),
+                z=u.Quantity(z, "kpc"),
             )
             acc = potential.acceleration(pos, t=t_q)
             pot = potential.potential(pos, t=t_q).value
@@ -612,14 +612,14 @@ def generate_time_dep_data(
         potential: Any, t_myr: float
     ) -> Callable[[Array], tuple[Array, Array, Array]]:
         """Create a JIT-compiled evaluation function for a specific time."""
-        t_q = u.Q(t_myr, "Myr")
+        t_q = u.Quantity(t_myr, "Myr")
 
         def _evaluate_raw(samples: Array) -> tuple[Array, Array, Array]:
             x, y, z = samples.T
             pos = cx.CartesianPos3D(
-                x=u.Q(x, "kpc"),
-                y=u.Q(y, "kpc"),
-                z=u.Q(z, "kpc"),
+                x=u.Quantity(x, "kpc"),
+                y=u.Quantity(y, "kpc"),
+                z=u.Quantity(z, "kpc"),
             )
             acc = potential.acceleration(pos, t=t_q)
             pot = potential.potential(pos, t=t_q).ustrip("kpc2/Myr2")
@@ -1084,9 +1084,9 @@ def scale_data(
     if config.get("include_analytic", False):
         lf_potential = config["ab_potential"]
         pos = cx.CartesianPos3D(
-            x=u.Q(data_dict["x_train"][:, 0], "kpc"),
-            y=u.Q(data_dict["x_train"][:, 1], "kpc"),
-            z=u.Q(data_dict["x_train"][:, 2], "kpc"),
+            x=u.Quantity(data_dict["x_train"][:, 0], "kpc"),
+            y=u.Quantity(data_dict["x_train"][:, 1], "kpc"),
+            z=u.Quantity(data_dict["x_train"][:, 2], "kpc"),
         )
         u_analytic = lf_potential.potential(pos, 0).ustrip("kpc2/Myr2")
         u_residual = data_dict["u_train"] - u_analytic
@@ -1192,11 +1192,11 @@ def scale_data_time(
     if config.get("include_analytic", False):
         analytic_baseline = config["ab_potential"]
         pos = cx.CartesianPos3D(
-            x=u.Q(x_concat[:, 0], "kpc"),
-            y=u.Q(x_concat[:, 1], "kpc"),
-            z=u.Q(x_concat[:, 2], "kpc"),
+            x=u.Quantity(x_concat[:, 0], "kpc"),
+            y=u.Quantity(x_concat[:, 1], "kpc"),
+            z=u.Quantity(x_concat[:, 2], "kpc"),
         )
-        t_quant = u.Q(t_concat, "Myr")
+        t_quant = u.Quantity(t_concat, "Myr")
         u_analytic = analytic_baseline.potential(pos, t_quant).ustrip("kpc2/Myr2")
         u_resid = u_concat - u_analytic
         u_star = float(jnp.max(jnp.abs(u_resid)))
