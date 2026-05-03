@@ -1,11 +1,14 @@
-"""This module provides tools for orbit analysis and comparison in galactic dynamics."""
+"""Tools for orbit analysis and comparison in galactic dynamics."""
+
+from typing import Any
+
+import galax.coordinates as gc
 import galax.dynamics as gd
 import galax.potential as gp
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 import unxt as u
-from galax.coordinates import PhaseSpaceCoordinate, PhaseSpacePosition
 from jaxtyping import Array
 
 __all__ = (
@@ -119,7 +122,7 @@ def Euclidean_distance(orbit_q1: Array, orbit_q2: Array) -> Array:
 def compare_orbits_analytic(
     true_potential: gp.AbstractPotential,
     analytic_potential: gp.AbstractPotential,
-    w0: PhaseSpacePosition,
+    w0: gc.PhaseSpacePosition,
     ts: u.Quantity,
     true_orbit: gd.Orbit | None = None,
 ) -> dict:
@@ -148,7 +151,8 @@ def compare_orbits_analytic(
         - ``"true_orbit"``: reference orbit.
         - ``"learned_energy"``: energy along the analytic orbit.
         - ``"true_energy"``: energy along the true orbit.
-        - ``"true_energy_on_learned"``: true potential energy evaluated on the analytic orbit.
+        - ``"true_energy_on_learned"``: true potential energy evaluated on the
+          analytic orbit.
         - ``"distance_true_learned"``: per-timestep separation in ``kpc``.
         - ``"time_avg_error"``: time-averaged orbit separation in ``kpc``.
 
@@ -179,7 +183,7 @@ def compare_orbits_analytic(
 def compare_orbits(
     true_potential: gp.AbstractPotential,
     learned_galax_pot: gp.AbstractPotential,
-    w0: PhaseSpacePosition,
+    w0: gc.PhaseSpacePosition,
     ts: u.Quantity,
     true_orbit: gd.Orbit | None = None,
 ) -> dict:
@@ -208,9 +212,11 @@ def compare_orbits(
         - ``"true_orbit"``: reference orbit.
         - ``"learned_energy"``: energy along the learned orbit.
         - ``"true_energy"``: energy along the true orbit.
-        - ``"true_energy_on_learned"``: true potential energy evaluated on the learned orbit.
+        - ``"true_energy_on_learned"``: true potential energy evaluated on the
+          learned orbit.
         - ``"distance_true_learned"``: per-timestep separation in ``kpc``.
-        - ``"time_avg_error"``: time-integrated average orbit separation in ``kpc``.
+        - ``"time_avg_error"``: time-integrated average orbit separation in
+          ``kpc``.
         - ``"mod"``: mean orbit separation in ``kpc``.
 
     """
@@ -243,10 +249,10 @@ def get_orbit_metrics_analytic(
     true_potential: gp.AbstractPotential,
     analytic_potential: gp.AbstractPotential,
     ts: u.Quantity,
-    w0s: list[PhaseSpacePosition],
+    w0s: list[gc.PhaseSpacePosition],
     true_orbits: list[gd.Orbit] | None = None,
 ) -> list[dict]:
-    """Compute orbit comparison metrics for a batch of initial conditions using an analytic potential.
+    """Compute orbit comparison metrics for a batch of ICs using an analytic potential.
 
     Parameters
     ----------
@@ -283,7 +289,7 @@ def get_w0s_from_data(
     raw_datadict: dict,
     true_potential: gp.AbstractPotential,
     n_draws: int = 10,
-) -> list[PhaseSpacePosition]:
+) -> list[gc.PhaseSpacePosition]:
     """Sample circular orbit initial conditions from training data positions.
 
     Draws random positions from the dataset and assigns circular velocities
@@ -310,10 +316,10 @@ def get_w0s_from_data(
     w0s = []
     x_test = raw_datadict["x_train"]
     rng = np.random.default_rng()
-    for i in range(n_draws):
+    for _ in range(n_draws):
         idx = rng.integers(0, x_test.shape[0])
         x_random = x_test[idx]
-        w_dummy = PhaseSpaceCoordinate(
+        w_dummy = gc.PhaseSpaceCoordinate(
             q=u.Quantity([x_random], "kpc"),
             p=u.Quantity([0, 0, 0], "kpc/Myr"),
             t=u.Quantity([0], "Myr"),
@@ -321,7 +327,7 @@ def get_w0s_from_data(
         vc = true_potential.local_circular_velocity(w_dummy)
         r = np.linalg.norm(x_random)
         v_vec = vc * np.array([-x_random[1], x_random[0], 0.0]) / r
-        w0 = PhaseSpacePosition(q=u.Quantity(x_random, "kpc"), p=v_vec)
+        w0 = gc.PhaseSpacePosition(q=u.Quantity(x_random, "kpc"), p=v_vec)
         w0s.append(w0)
     return w0s
 
@@ -330,10 +336,10 @@ def get_orbit_metrics(
     true_potential: gp.AbstractPotential,
     learned_galax_pot: gp.AbstractPotential,
     ts: u.Quantity,
-    w0s: list[PhaseSpacePosition],
+    w0s: list[gc.PhaseSpacePosition],
     true_orbits: list[gd.Orbit] | None = None,
 ) -> list[dict]:
-    """Compute orbit comparison metrics for a batch of initial conditions using a learned potential.
+    """Compute orbit comparison metrics for a batch of ICs using a learned potential.
 
     Parameters
     ----------
@@ -463,9 +469,11 @@ def compose_velocity_bound_safe(
     e_t = jnp.cos(ang) * e_t1 + jnp.sin(ang) * e_t2
 
     qQ = u.Quantity(q_phys, "kpc")
-    v_circ = gp.local_circular_velocity(
-        pot_for_vcirc, qQ, t=u.Quantity(0.0, "Gyr")
-    ).to_value("kpc/Myr").reshape(N, 1)
+    v_circ = (
+        gp.local_circular_velocity(pot_for_vcirc, qQ, t=u.Quantity(0.0, "Gyr"))
+        .to_value("kpc/Myr")
+        .reshape(N, 1)
+    )
 
     key, k_ft = jr.split(key)
     ft = 1.0 + tangential_scatter * jr.normal(k_ft, shape=(N, 1))
@@ -478,12 +486,16 @@ def compose_velocity_bound_safe(
     speed = jnp.linalg.norm(v, axis=1, keepdims=True)
     v = v * jnp.minimum(1.0, cap_vs_vcirc * v_circ / (speed + 1e-12))
 
-    phi = pot_for_escape.potential(
-        qQ, t=u.Quantity(0.0, "Gyr")
-    ).to_value("kpc2/Myr2").reshape(N, 1)
+    phi = (
+        pot_for_escape.potential(qQ, t=u.Quantity(0.0, "Gyr"))
+        .to_value("kpc2/Myr2")
+        .reshape(N, 1)
+    )
 
     v_esc = jnp.sqrt(jnp.maximum(0.0, -2.0 * phi))
-    scale = jnp.minimum(1.0, 0.98 * v_esc / (jnp.linalg.norm(v, axis=1, keepdims=True) + 1e-12))
+    scale = jnp.minimum(
+        1.0, 0.98 * v_esc / (jnp.linalg.norm(v, axis=1, keepdims=True) + 1e-12)
+    )
     v = v * scale
 
     return jnp.asarray(v)
@@ -494,9 +506,10 @@ def sample_outside_shell_bound(
     r_min: float = 200.0,
     r_max: float = 600.0,
     n_orbits: int = 24,
+    *,
     log_r: bool = True,
     seed: int = 456,
-    **vel_kwargs,
+    **vel_kwargs: Any,
 ) -> tuple[Array, Array]:
     """Sample bound initial conditions from a spherical shell.
 
@@ -618,7 +631,7 @@ def integrate_orbit_batch(
     ts_Q = u.Quantity(jnp.asarray(ts_myr), "Myr")
     q_list, p_list = [], []
     for b in range(B):
-        w0 = PhaseSpacePosition(
+        w0 = gc.PhaseSpacePosition(
             q=u.Quantity(q0_phys[b][None, :], "kpc"),
             p=u.Quantity(v0_phys[b][None, :], "kpc/Myr"),
         )

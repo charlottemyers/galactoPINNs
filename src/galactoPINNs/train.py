@@ -13,9 +13,11 @@ __all__ = (
 
 import logging
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, Literal, Protocol
+from typing import Any, Literal
+
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from flax import nnx
 from jaxtyping import Array
@@ -69,7 +71,7 @@ def get_model_params(model: nnx.Module) -> dict[str, Any]:
 
 
 @nnx.jit(static_argnames=("target", "ramp_kind", "balance_grads"))
-def train_step_static(
+def train_step_static(  # noqa: C901
     model: nnx.Module,
     optimizer: nnx.Optimizer,
     x: Array,
@@ -90,7 +92,7 @@ def train_step_static(
     step: int = 0,
     total_steps: int = 1,
     ramp_kind: Literal["linear", "cosine", "sigmoid"] = "cosine",
-    ramp_sharp: float = 10.0,       # only used when ramp_kind="sigmoid"
+    ramp_sharp: float = 10.0,  # only used when ramp_kind="sigmoid"
     balance_grads: bool = True,
 ) -> Array:
     """Perform one optimizer step for a static potential model.
@@ -178,6 +180,7 @@ def train_step_static(
     ValueError
         If ``target`` requires orbit inputs but ``orbit_q`` or ``orbit_p``
         is ``None``.
+
     """
     if target != "acceleration" and (orbit_q is None or orbit_p is None):
         raise ValueError(f"target='{target}' requires orbit_q and orbit_p (got None).")
@@ -189,15 +192,15 @@ def train_step_static(
         p = jnp.clip(progress, 0.0, 1.0)
         if ramp_kind == "linear":
             return p
-        elif ramp_kind == "cosine":
+        if ramp_kind == "cosine":
             return 0.5 * (1.0 - jnp.cos(jnp.pi * p))
-        else:  # "sigmoid"
-            return jax.nn.sigmoid(ramp_sharp * (p - 0.5))
+        # "sigmoid"
+        return jax.nn.sigmoid(ramp_sharp * (p - 0.5))
 
     progress = jnp.asarray(step, dtype=jnp.float32) / jnp.maximum(
         1.0, jnp.asarray(total_steps - 1, dtype=jnp.float32)
     )
-    wE = lambda_E * _ramp(progress)   # effective energy weight this step
+    wE = lambda_E * _ramp(progress)  # effective energy weight this step
 
     # ------------------------------------------------------------------
     # Split model into trainable vs frozen state (NNX pattern)
@@ -209,10 +212,10 @@ def train_step_static(
     # ------------------------------------------------------------------
     def _acc_loss(ts: nnx.State) -> Array:
         m = nnx.merge(graphdef, ts, frozen_state)
-        a_pred = m(x)["acceleration"]          # (N, 3)
-        diff      = a_pred - a_true
-        diff_norm = jnp.linalg.norm(diff,   axis=1)   # (N,)
-        true_norm = jnp.linalg.norm(a_true, axis=1)   # (N,)
+        a_pred = m(x)["acceleration"]  # (N, 3)
+        diff = a_pred - a_true
+        diff_norm = jnp.linalg.norm(diff, axis=1)  # (N,)
+        true_norm = jnp.linalg.norm(a_true, axis=1)  # (N,)
         eps = 1e-10
         per_point = diff_norm + lambda_rel * (diff_norm / (true_norm + eps))
         if importance_weight is not None:
@@ -223,23 +226,25 @@ def train_step_static(
         """Return total specific energy E(t), shape ``(B, T)``."""
         m = nnx.merge(graphdef, ts, frozen_state)
         B, T, _ = oq.shape
-        T_ke    = 0.5 * jnp.sum(op ** 2, axis=-1)          # (B, T)
-        q_flat  = oq.reshape(B * T, 3)
-        Phi     = m(q_flat, mode="potential")["potential"].reshape(B, T)
+        T_ke = 0.5 * jnp.sum(op**2, axis=-1)  # (B, T)
+        q_flat = oq.reshape(B * T, 3)
+        Phi = m(q_flat, mode="potential")["potential"].reshape(B, T)
         return T_ke + Phi
 
     def _E_loss_std(ts: nnx.State) -> Array:
         """Std-only energy-conservation loss (Linen `orbit_E_loss`)."""
-        assert orbit_q is not None and orbit_p is not None
-        E = _orbit_energy(ts, orbit_q, orbit_p)             # (B, T)
+        assert orbit_q is not None
+        assert orbit_p is not None
+        E = _orbit_energy(ts, orbit_q, orbit_p)  # (B, T)
         std_E = jnp.std(E - jnp.mean(E, axis=1, keepdims=True), axis=1)
-        return jnp.mean(std_E ** 2)
+        return jnp.mean(std_E**2)
 
     def _E_loss_dev_from_initial(ts: nnx.State) -> Array:
         """Fractional energy drift relative to E(t=0)."""
-        assert orbit_q is not None and orbit_p is not None
-        E  = _orbit_energy(ts, orbit_q, orbit_p)            # (B, T)
-        E0 = E[:, 0:1]                                      # (B, 1)
+        assert orbit_q is not None
+        assert orbit_p is not None
+        E = _orbit_energy(ts, orbit_q, orbit_p)  # (B, T)
+        E0 = E[:, 0:1]  # (B, 1)
         return jnp.mean(((E - E0) / (jnp.abs(E0) + 1e-8)) ** 2)
 
     # ------------------------------------------------------------------
@@ -247,7 +252,7 @@ def train_step_static(
     # ------------------------------------------------------------------
     def _tree_l2(tree: nnx.State) -> Array:
         leaves = jax.tree_util.tree_leaves(tree)
-        return jnp.sqrt(sum(jnp.sum(l * l) for l in leaves))
+        return jnp.sqrt(sum(jnp.vdot(leaf, leaf) for leaf in leaves))
 
     # ------------------------------------------------------------------
     # Compute loss + gradients
@@ -270,16 +275,17 @@ def train_step_static(
 
         # Optional gradient-norm balancing
         if balance_grads:
-            na    = _tree_l2(grad_a) + 1e-12
-            ne    = _tree_l2(grad_e) + 1e-12
+            na = _tree_l2(grad_a) + 1e-12
+            ne = _tree_l2(grad_e) + 1e-12
             scale = jax.lax.stop_gradient(na / ne)
         else:
             scale = 1.0
 
-        loss  = loss_a + wE * loss_e
+        loss = loss_a + wE * loss_e
         grads = jax.tree_util.tree_map(
             lambda ga, ge: ga + wE * scale * ge,
-            grad_a, grad_e,
+            grad_a,
+            grad_e,
         )
 
     optimizer.update(model, grads)
@@ -294,7 +300,7 @@ def train_step_node(
     a_true: Array,
     *,
     lambda_rel: float = 1.0,
-    importance_weight : Array | None = None,
+    importance_weight: Array | None = None,
 ) -> Array:
     """Optimization step for NODE with acceleration training objective.
 
@@ -365,10 +371,13 @@ def train_step_node(
         a_true_norm = jnp.linalg.norm(a_true, axis=1)  # (N,)
 
         eps = 1e-10
-        per_point = diff_norm + lambda_rel * (diff_norm / (a_true_norm + eps))  # (N,) — no mean yet
+        per_point = diff_norm + lambda_rel * (
+            diff_norm / (a_true_norm + eps)
+        )  # (N,) — no mean yet
 
         if importance_weight is not None:
-            # importance_weight is shape (N,), large where |a_true - a_analytic| is large
+            # importance_weight is shape (N,), large where |a_true - a_analytic|
+            # is large
             loss = jnp.mean(importance_weight * per_point)
         else:
             loss = jnp.mean(per_point)
@@ -441,7 +450,6 @@ def train_step_node_beta(
     loss, grads = nnx.value_and_grad(loss_fn)(train_state)
     optimizer.update(model, grads)
     return loss
-
 
 
 def train_model_static(
@@ -529,6 +537,7 @@ def train_model_static(
         - ``"optimizer"``: the final optimizer state.
         - ``"epochs"``:    list of final epoch indices completed per stage.
         - ``"losses"``:    list of final loss values per stage (JAX scalars).
+
     """
     epochs: list[int] = []
     losses: list[Array] = []
@@ -623,8 +632,12 @@ def train_model_node(
 
     for epoch in range(num_epochs):
         loss = train_step_node(
-            model, optimizer, x_train, a_train,
-            lambda_rel=lambda_rel, importance_weight=importance_weight,
+            model,
+            optimizer,
+            x_train,
+            a_train,
+            lambda_rel=lambda_rel,
+            importance_weight=importance_weight,
         )
         if epoch % log_every == 0:
             log.info("Epoch %d, Loss: %.6f", epoch, loss)
@@ -684,19 +697,20 @@ def train_model_node_batched(
         and ``"losses"``.
 
     """
-    import numpy as np  # numpy-side RNG only; JAX arrays used for compute
-
     epochs: list[int] = []
     losses: list[float] = []
     n_total = x_train.shape[0]
 
-    probs: "np.ndarray | None" = None
+    probs: np.ndarray | None = None
     if importance_weight is not None:
         w_np = np.array(importance_weight)
         probs = w_np / w_np.sum()
 
+    rng = np.random.default_rng()
     for epoch in range(num_epochs):
-        idx = np.random.choice(n_total, size=min(batch_size, n_total), replace=False, p=probs)
+        idx = rng.choice(
+            np.arange(n_total), size=min(batch_size, n_total), replace=False, p=probs
+        )
         x_batch = x_train[idx]
         a_batch = a_train[idx]
         if importance_weight is not None:
@@ -705,7 +719,14 @@ def train_model_node_batched(
         else:
             w_batch = None
 
-        loss = train_step_node(model, optimizer, x_batch, a_batch, lambda_rel=lambda_rel, importance_weight=w_batch)
+        loss = train_step_node(
+            model,
+            optimizer,
+            x_batch,
+            a_batch,
+            lambda_rel=lambda_rel,
+            importance_weight=w_batch,
+        )
         if epoch % log_every == 0:
             log.info("Epoch %d, Loss: %.6f", epoch, loss)
         epochs.append(epoch)
@@ -807,7 +828,7 @@ def train_model_with_trainable_analytic_layer(
     }
 
 
-def alternate_training(
+def alternate_training(  # noqa: C901
     train_step: TrainStepFn,
     x_train: Array,
     a_train: Array,
@@ -963,7 +984,7 @@ def alternate_training(
         "total_epochs": total_epochs,
         **final_params,
     }
-    #print final learned values for tracked params
+    # print final learned values for tracked params
     for param in param_list:
         val = final_params.get(param)
         if val is not None:

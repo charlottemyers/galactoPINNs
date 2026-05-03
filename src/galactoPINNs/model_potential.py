@@ -7,14 +7,14 @@ __all__ = (
 
 from collections.abc import Callable, Mapping
 from dataclasses import KW_ONLY
-from typing import Any, Protocol, TypeAlias, final
+from typing import Any, TypeAlias, final
 
 import equinox as eqx
+import galax.potential as gp
 import jax.numpy as jnp
 import unxt as u
 from flax import nnx
 from galax.potential._src.base import default_constants
-from galax.potential._src.base_single import AbstractPotential
 from jaxtyping import Array
 from unxt import unitsystems
 from unxt.quantity import AbstractQuantity
@@ -24,17 +24,8 @@ Config: TypeAlias = Mapping[str, Any]
 PositionInput: TypeAlias = Array | AbstractQuantity
 
 
-# --- typing for the analytic potential ---
-try:
-    from galax.potential import AbstractPotential as GalaxPotential
-except Exception:  # noqa: BLE001
-    class GalaxPotential(Protocol):
-        def potential(self,    positions: Any, *, t: Any = ...) -> Any: ...
-        def acceleration(self, positions: Any, *, t: Any = ...) -> Any: ...
-
-
 @final
-class ModelPotential(AbstractPotential):
+class ModelPotential(gp.AbstractPotential):
     """A galax-compatible potential backed by a pure NNX potential function.
 
     This class is a wrapper that makes a trained galactoPINN model, represented
@@ -54,7 +45,6 @@ class ModelPotential(AbstractPotential):
     # Static configuration (transformers, etc.)
     config: dict = eqx.field(static=True)
 
-
     _: KW_ONLY
     units: u.AbstractUnitSystem = eqx.field(converter=u.unitsystem, static=True)
     constants: ImmutableMap[str, AbstractQuantity] = eqx.field(
@@ -71,7 +61,6 @@ class ModelPotential(AbstractPotential):
         )
         return jnp.atleast_2d(x), was_batched
 
-
     def _potential(self, q: PositionInput, _: Any) -> Array:
         """Return physical potential at positions ``q``."""
         x_batched, batched = self._as_batched_xyz(q)
@@ -83,7 +72,6 @@ class ModelPotential(AbstractPotential):
         u_phys = self.config["u_transformer"].inverse_transform(u_scaled)
 
         return jnp.squeeze(u_phys, axis=0) if not batched else jnp.ravel(u_phys)
-
 
     def _acceleration(self, q: PositionInput, _: Any) -> Array:
         """Return physical acceleration at positions ``q``."""
@@ -103,7 +91,7 @@ class ModelPotential(AbstractPotential):
 
 
 def make_galax_potential(
-    model: nnx.Module, units: u.AbstractUnitSystem = unitsystems.galactic  # noqa: E501
+    model: nnx.Module, units: u.AbstractUnitSystem = unitsystems.galactic
 ) -> ModelPotential:
     """Wrap a trained NNX model as a Galax `AbstractPotential`.
 
@@ -134,9 +122,9 @@ def make_galax_potential(
         return out["acceleration"]
 
     return ModelPotential(
-            potential_fn=potential_fn,
-            acceleration_fn=acceleration_fn,
-            params=state0,
-            config=model.config,
-            units=units
-            )
+        potential_fn=potential_fn,
+        acceleration_fn=acceleration_fn,
+        params=state0,
+        config=model.config,
+        units=units,
+    )

@@ -206,6 +206,7 @@ class TestScaleNNPotentialLayer:
         result = apply_scale(layer, x_cart, u_nn)
         assert jnp.isfinite(result).all()
 
+
 # Helper classes for testing
 
 
