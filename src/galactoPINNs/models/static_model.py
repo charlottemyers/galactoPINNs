@@ -1,7 +1,8 @@
 """Static gravitational potential model implementations."""
 
-from collections.abc import Mapping
-from typing import Any
+import functools as ft
+from collections.abc import Callable
+from typing import Any, Final, NotRequired, TypedDict
 
 import galax.potential as gp
 import jax
@@ -11,6 +12,7 @@ from jaxtyping import Array
 
 from galactoPINNs.layers import (
     MLP,
+    CartesianLayer,
     CartesianToModifiedSphericalLayer,
     ExternalPytree,
     FuseandBoundary,
@@ -18,6 +20,72 @@ from galactoPINNs.layers import (
     TrainableGalaxPotential,
     ZeroPotential,
 )
+
+
+class StaticModelConfig(TypedDict):
+    """Configuration dictionary for StaticModel.
+
+    All fields are optional and have sensible defaults.
+    """
+
+    # Analytic potential configuration
+    ab_potential: NotRequired[Any]
+    scale: NotRequired[str | Array | Any]
+
+    # Analytic baseline options
+    include_analytic: NotRequired[bool]
+    trainable: NotRequired[bool]
+
+    # Coordinate and potential transformers
+    x_transformer: NotRequired[Any]
+    u_transformer: NotRequired[Any]
+    a_transformer: NotRequired[Any]
+
+    # MLP hyperparameters
+    depth: NotRequired[int]
+    width: NotRequired[int]
+    activation: NotRequired[Callable[[Array], Array]]
+
+    # Input encoder configuration
+    convert_to_spherical: NotRequired[bool]
+    clip: NotRequired[float]
+
+    # Neural network options
+    nn_off: NotRequired[bool]
+
+    # Boundary blending configuration (FuseandBoundary)
+    enforce_boundary: NotRequired[bool]
+    r_trans: NotRequired[float]
+    k_smooth: NotRequired[float]
+    train_k: NotRequired[bool]
+    min_k: NotRequired[float]
+    radial_power: NotRequired[float | None]
+    r_smooth: NotRequired[float]
+    saturation: NotRequired[float]
+
+    # Scale radius
+    r_s: NotRequired[float]
+
+
+DEFAULT_STATIC_MODEL_CONFIG: Final[StaticModelConfig] = {
+    "scale": "one",
+    "include_analytic": False,
+    "trainable": False,
+    "convert_to_spherical": True,
+    "clip": 1.0,
+    "nn_off": False,
+    "enforce_boundary": False,
+    "depth": 4,
+    "width": 128,
+    "activation": ft.partial(jax.nn.gelu, approximate=False),
+    "r_trans": 200.0,
+    "k_smooth": 0.5,
+    "train_k": False,
+    "min_k": 0.01,
+    "r_smooth": 150.0,
+    "saturation": 1.0,
+    "r_s": 1.0,
+}
 
 
 class StaticModel(nnx.Module):
@@ -30,31 +98,16 @@ class StaticModel(nnx.Module):
 
     Parameters
     ----------
-    config
-        A dictionary containing the configuration for the model's architecture
-        and behavior. Key options include:
-
-        - ``"ab_potential"``: A galax potential object for the analytic baseline.
-        - ``"scale"``: Scaling mode - either a string ("one", "power", "nfw"),
-          a precomputed array, or a galax potential object.
-        - ``"include_analytic"`` (bool): If True, add the analytic baseline
-          potential to the NN potential.
-        - ``"trainable"`` (bool): If True, use a ``TrainableGalaxPotential``
-          layer for the analytic component.
-        - ``"x_transformer"``, ``"u_transformer"``, ``"a_transformer"``: Objects
-          for transforming coordinates and potential between physical and scaled
-          units.
-        - ``"depth"``, ``"width"``, ``"activation"``: Hyperparameters for
-          ``MLP``.
-        - Configuration for sub-layers like ``FuseandBoundary`` (``r_trans``,
-          ``k_smooth``, etc.).
-    in_features
-        The number of input features for the MLP. Typically 5 for modified spherical
-        coordinates or 3 for Cartesian.
-    trainable_analytic_layer
+    config : StaticModelConfig
+        A configuration dictionary (see ``StaticModelConfig`` for all available
+        keys and their meanings).
+    in_features : int, optional
+        The number of input features for the MLP. Typically 5 for modified
+        spherical coordinates or 3 for Cartesian. Default: 5.
+    trainable_analytic_layer : TrainableGalaxPotential | None, optional
         An instance of a trainable analytic potential layer, passed if
         ``config['trainable']`` is True.
-    rngs
+    rngs : nnx.Rngs
         Random number generator state for parameter initialization.
 
     """
@@ -62,7 +115,7 @@ class StaticModel(nnx.Module):
     # --- Configuration ---
     config: dict[str, Any]
     # --- Forward pass (call order) ---
-    cart_to_sph_layer: CartesianToModifiedSphericalLayer
+    input_encoder: nnx.Module
     nn_potential: MLP | ZeroPotential
     ab_potential: ExternalPytree
     trainable_analytic_layer: TrainableGalaxPotential | None
@@ -71,13 +124,16 @@ class StaticModel(nnx.Module):
 
     def __init__(
         self,
-        config: Mapping[str, Any],
+        config: StaticModelConfig,
         in_features: int = 5,
         trainable_analytic_layer: TrainableGalaxPotential | None = None,
         *,
         rngs: nnx.Rngs,
     ) -> None:
         """Initialize the static model layers."""
+        # Merge provided config with defaults
+        config = DEFAULT_STATIC_MODEL_CONFIG | config
+
         # --- Prepare cleaned config dicts ---
         config_without_ab = {k: v for k, v in config.items() if k != "ab_potential"}
         config_without_externals = {
@@ -87,9 +143,10 @@ class StaticModel(nnx.Module):
         self.config = config_without_externals
 
         # --- Initialize coordinate transform layer ---
-        self.cart_to_sph_layer = CartesianToModifiedSphericalLayer(
-            clip=config.get("clip", 1.0)
-        )
+        if config["convert_to_spherical"]:
+            self.input_encoder = CartesianToModifiedSphericalLayer(clip=config["clip"])
+        else:
+            self.input_encoder = CartesianLayer()
 
         # --- Handle analytic baseline potential ---
         ab_pot = config.get("ab_potential", None)
@@ -103,7 +160,7 @@ class StaticModel(nnx.Module):
         self.trainable_analytic_layer = trainable_analytic_layer
 
         # --- Determine external scale potential for ScaleNNPotentialLayer ---
-        raw_scale = config.get("scale", "one")
+        raw_scale = config["scale"]
 
         if isinstance(raw_scale, str):
             # String mode ("one", "power", "nfw") - handled internally by
@@ -121,30 +178,23 @@ class StaticModel(nnx.Module):
             wrapped_scale_potential = ExternalPytree(raw_scale)
 
         self.scale_layer = ScaleNNPotentialLayer(
-            config=config_without_ab,
-            external_scale=wrapped_scale_potential,
+            config=config_without_ab, external_scale=wrapped_scale_potential
         )
 
         # --- Initialize fusion/boundary layer ---
         self.fuse_boundary_layer = FuseandBoundary(config=config_without_externals)
 
         # --- Initialize MLP ---
-        if not config.get("nn_off", False):
-            depth = config.get("depth", 4)
-            width = config.get("width", 128)
-            activation = config.get("activation", None)
-
-            mlp_kwargs: dict[str, Any] = {
-                "in_features": in_features,
-                "width": width,
-                "depth": depth,
-                "rngs": rngs,
-            }
-            if activation is not None:
-                mlp_kwargs["act"] = activation
-            self.nn_potential = MLP(**mlp_kwargs)
-        else:
+        if config["nn_off"]:
             self.nn_potential = ZeroPotential()
+        else:
+            self.nn_potential = MLP(
+                in_features=in_features,
+                width=config["width"],
+                depth=config["depth"],
+                rngs=rngs,
+                act=config["activation"],
+            )
 
     def __call__(
         self,
@@ -176,26 +226,24 @@ class StaticModel(nnx.Module):
             x_cart = x_cart[None, :]  # promote to (1, 3)
 
         # --- Coordinate transformation ---
-        if self.config.get("convert_to_spherical", True):
-            x_in = self.cart_to_sph_layer(x_cart)
-        else:
-            x_in = x_cart
+        x_in = self.input_encoder(x_cart)
 
         # --- Neural network potential ---
         u_nn = self.nn_potential(x_in)
 
         # --- Analytic baseline potential ---
-        analytic_potential_scaled = 0.0
-        r_s_learned = self.config.get("r_s", 1.0)
 
-        if self.config.get("include_analytic", False):
+        analytic_potential_scaled = 0.0
+        r_s_learned = self.config["r_s"]
+
+        if self.config["include_analytic"]:
             # Transform to physical coordinates
             x_phys = self.config["x_transformer"].inverse_transform(x_cart)
             u_phys = 0.0
 
-            if not self.config.get("trainable", False):
+            if not self.config["trainable"]:
                 u_phys = self.ab_potential.value.potential(x_phys, t=0)
-            elif self.config.get("trainable", False):
+            elif self.config["trainable"]:
                 layer = (
                     trainable_analytic_layer
                     if trainable_analytic_layer is not None
@@ -220,16 +268,14 @@ class StaticModel(nnx.Module):
         )
 
         # --- Select final potential based on config ---
-        if self.config.get("enforce_boundary", False):
+        if self.config["enforce_boundary"]:
             potential = boundary_potential
-        elif self.config.get("include_analytic", True):
+        elif self.config["include_analytic"]:
             potential = fused_potential
         else:
             potential = scaled_nn_potential
 
-        if scalar_input:
-            return potential[0]
-        return potential
+        return potential[0] if scalar_input else potential
 
     def compute_potential(
         self,
@@ -278,11 +324,8 @@ class StaticModel(nnx.Module):
 
         """
 
-        def potential_fn(x: Array) -> Array:
-            return self(x[None, :]).squeeze()
-
         def laplacian_single(x: Array) -> Array:
-            hess = jax.hessian(potential_fn)(x)  # (3, 3)
+            hess = jax.hessian(self.compute_potential)(x)  # (3, 3)
             return jnp.trace(hess)
 
         return jax.vmap(laplacian_single)(x_cart)
@@ -343,7 +386,6 @@ class StaticModel(nnx.Module):
             Acceleration vectors, shape ``(N, 3)``.
 
         """
-        potential_vals, grads = jax.vmap(jax.value_and_grad(self), in_axes=(0, None))(
-            x_cart, trainable_analytic_layer
-        )
+        vgfn = jax.vmap(jax.value_and_grad(self), in_axes=(0, None))
+        potential_vals, grads = vgfn(x_cart, trainable_analytic_layer)
         return potential_vals, -grads

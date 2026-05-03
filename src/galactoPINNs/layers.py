@@ -131,6 +131,14 @@ class MLP(nnx.Module):
 # Coordinates
 
 
+class CartesianLayer(nnx.Module):
+    """Identity layer for Cartesian coordinates (pass-through)."""
+
+    def __call__(self, x_cart: Array, /) -> Array:
+        """Return the input Cartesian coordinates unchanged."""
+        return x_cart
+
+
 class CartesianToModifiedSphericalLayer(nnx.Module):
     """Converts Cartesian coordinates to modified spherical coordinates.
 
