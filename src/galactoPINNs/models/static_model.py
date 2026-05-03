@@ -186,6 +186,25 @@ class StaticModel(nnx.Module):
                 act=config["activation"],
             )
 
+    @classmethod
+    def from_config(
+        cls,
+        config: StaticModelConfig,
+        input_encoder: nnx.Module = DEFAULT_INPUT_ENCODER,
+        in_features: int = 5,
+        trainable_analytic_layer: TrainableGalaxPotential | None = None,
+        *,
+        rngs: nnx.Rngs,
+    ) -> "StaticModel":
+        """Construct a StaticModel directly from a config."""
+        return cls(
+            config=config,
+            input_encoder=input_encoder,
+            in_features=in_features,
+            trainable_analytic_layer=trainable_analytic_layer,
+            rngs=rngs,
+        )
+
     def __call__(
         self,
         x_cart: Array,
