@@ -65,7 +65,7 @@ class TestStaticModel:
         # Config is filtered and wrapped, so check contents not identity
         assert model.config is not None
         assert "r_s" in model.config
-        assert model.cart_to_sph_layer is not None
+        assert model.input_encoder is not None
         assert model.scale_layer is not None
         # fuse_layer was removed - now using direct addition
         assert model.fuse_boundary_layer is not None

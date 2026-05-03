@@ -347,7 +347,7 @@ class NODEModel(nnx.Module):
             raise TypeError(msg)
 
         # --- Initialize coordinate transform layer ---
-        self.cart_to_sph_layer = CartesianToModifiedSphericalLayer(
+        self.input_encoder = CartesianToModifiedSphericalLayer(
             clip=config.get("clip", 1.0)
         )
 
@@ -465,7 +465,7 @@ class NODEModel(nnx.Module):
         x_cart = tx_cart[:, 1:4]  # (N, 3)
 
         # --- Coordinate transformation ---
-        x_sph = self.cart_to_sph_layer(x_cart)
+        x_sph = self.input_encoder(x_cart)
 
         # --- Build [t, sph_features...] for delta_phi network ---
         tx_sph = jnp.concatenate([t, x_sph], axis=1)
