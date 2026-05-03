@@ -246,7 +246,7 @@ class StaticModel(nnx.Module):
             (N, 3) for a batch. Assumed to be in the model's scaled space.
         mode
             Controls what is computed/returned:
-            - "full": return potential, acceleration, and auxiliary outputs.
+            - "full": return potential and acceleration.
             - "potential": compute/return only the potential.
             - "acceleration": compute/return acceleration.
             - "density": compute/return potential, acceleration, and Laplacian.
@@ -257,8 +257,6 @@ class StaticModel(nnx.Module):
             A dict-like object containing keys "potential" and "acceleration".
 
         """
-        aux_outputs: dict[str, Any] = {}
-
         # --- Coordinate transformation ---
         if self.config.get("convert_to_spherical", True):
             x_transformed = self.cart_to_sph_layer(cart_x)
@@ -303,8 +301,6 @@ class StaticModel(nnx.Module):
         else:
             potential = scaled_nn_potential
 
-        aux_outputs["final"] = potential
-
         # --- Return early if only potential requested ---
         if mode == "potential":
             return {"potential": potential}
@@ -315,21 +311,8 @@ class StaticModel(nnx.Module):
 
         acceleration = -jax.vmap(jax.grad(pot_single))(cart_x)
 
-        # --- Compute Laplacian if density mode ---
-        if mode == "density":
-            def laplacian_single(x_arg: Array) -> Array:
-                hess = jax.hessian(self.compute_potential)(x_arg)
-                return jnp.trace(hess)
-
-            laplacian = jax.vmap(laplacian_single)(cart_x)
-            return {
-                "potential": potential,
-                "acceleration": acceleration,
-                "laplacian": laplacian,
-            }
 
         return {
             "potential": potential,
             "acceleration": acceleration,
-            "outputs": aux_outputs,
         }

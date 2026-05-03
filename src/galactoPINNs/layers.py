@@ -448,13 +448,16 @@ class TrainableGalaxPotential(nnx.Module):
                 params[name] = val
         return params
 
-    def __call__(self, positions: Array) -> tuple[Array, Array]:
+    def __call__(self, positions: Array, t: Any = 0) -> tuple[Array, Array]:
         """Evaluate the trainable potential at given positions.
 
         Parameters
         ----------
         positions
             Cartesian positions, shape ``(N, 3)``.
+        t
+            Time at which to evaluate. Accepted for interface compatibility with
+            time-dependent subclasses; this static layer always evaluates at t=0.
 
         Returns
         -------

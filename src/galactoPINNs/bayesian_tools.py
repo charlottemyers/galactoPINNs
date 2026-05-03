@@ -12,9 +12,8 @@ from flax import nnx
 from jaxtyping import Array
 from numpyro.contrib.module import random_nnx_module
 from numpyro.infer import SVI, Trace_ELBO, init_to_feasible
-from numpyro.infer.autoguide import AutoNormal
+from numpyro.infer.autoguide import AutoNormal, AutoLowRankMultivariateNormal
 from numpyro.optim import Adam
-
 from galactoPINNs.models.static_model import StaticModel
 
 
@@ -25,10 +24,11 @@ def model_svi(
     config: Mapping[str, Any],
     analytic_param_dists: Mapping[str, Mapping[str, Any]],
     net_template: StaticModel,
+    sigma_alpha: float = 0.05,
     sigma_theta: float = 0.05,
-    sigma_lambda: float = 0.05,
     sigma_a: float = 2e-4,
     lambda_rel: float = 0.1,
+    importance_weight: Array | None = None,
     orbit_q: Array | None = None,
     orbit_p: Array | None = None,
     w_orbit: float = 1.0,
@@ -54,16 +54,18 @@ def model_svi(
     analytic_param_dists
         Nested mapping of parameter name to distribution keyword arguments
         (``loc``, and optionally ``low``/``high``) passed to
-        ``TruncatedNormal``. Expected keys when ``config["trainable"]`` is
+        ``TruncatedNormal``. Required keys when ``config["trainable"]`` is
         ``True``: ``"log_m_halo"``, ``"log_m_disk"``, ``"log_rs"``,
-        ``"log_disk_a"``, ``"log_disk_b"``.
+        ``"log_disk_a"``, ``"log_disk_b"``. Optional bulge keys
+        ``"log_m_bulge"`` and ``"log_bulge_rs"``; their presence triggers
+        bulge parameter sampling.
     net_template
         Instantiated :class:`~galactoPINNs.models.static_model.StaticModel`
         used as the template for :func:`random_nnx_module`.
-    sigma_theta
+    sigma_alpha
         Standard deviation of the ``TruncatedNormal`` prior over log-space
         analytic parameters. Default ``0.05``.
-    sigma_lambda
+    sigma_theta
         Standard deviation of the normal prior over BNN weights. Default
         ``0.05``.
     sigma_a
@@ -72,6 +74,10 @@ def model_svi(
     lambda_rel
         Relative weighting of the normalised acceleration residual term
         alongside the absolute residual. Default ``0.1``.
+    importance_weight
+        Optional per-point weights, shape ``(N,)``. When provided, the
+        acceleration loss becomes ``mean(importance_weight * per_point)``
+        instead of ``mean(per_point)``. Has no effect on the orbit-energy loss.
     orbit_q
         Scaled orbit positions, shape ``(B, T, 3)``. If provided together with
         ``orbit_p``, an energy-conservation loss is added.
@@ -106,23 +112,23 @@ def model_svi(
     if config.get("trainable", False):
         log_m_halo = numpyro.sample(
             "log_m_halo",
-            dist.TruncatedNormal(scale=sigma_theta, **analytic_param_dists["log_m_halo"]),
+            dist.TruncatedNormal(scale=sigma_alpha, **analytic_param_dists["log_m_halo"]),
         )
         log_m_disk = numpyro.sample(
             "log_m_disk",
-            dist.TruncatedNormal(scale=sigma_theta, **analytic_param_dists["log_m_disk"]),
+            dist.TruncatedNormal(scale=sigma_alpha, **analytic_param_dists["log_m_disk"]),
         )
         log_rs = numpyro.sample(
             "log_rs",
-            dist.TruncatedNormal(scale=sigma_theta, **analytic_param_dists["log_rs"]),
+            dist.TruncatedNormal(scale=sigma_alpha, **analytic_param_dists["log_rs"]),
         )
         log_disk_a = numpyro.sample(
             "log_disk_a",
-            dist.TruncatedNormal(scale=sigma_theta, **analytic_param_dists["log_disk_a"]),
+            dist.TruncatedNormal(scale=sigma_alpha, **analytic_param_dists["log_disk_a"]),
         )
         log_disk_b = numpyro.sample(
             "log_disk_b",
-            dist.TruncatedNormal(scale=sigma_theta, **analytic_param_dists["log_disk_b"]),
+            dist.TruncatedNormal(scale=sigma_alpha, **analytic_param_dists["log_disk_b"]),
         )
 
         halo_r_s  = jnp.exp(log_rs)
@@ -131,20 +137,39 @@ def model_svi(
         disk_a    = jnp.exp(log_disk_a)
         disk_b    = jnp.exp(log_disk_b)
 
-        trainable_analytic_layer = composite_form(
-            init_disk_a=disk_a,
-            init_disk_b=disk_b,
-            init_halo_r_s=halo_r_s,
-            init_halo_mass=halo_mass,
-            init_disk_mass=disk_mass,
-        )
+        analytic_kwargs: dict[str, Any] = {
+            "init_disk_a": disk_a,
+            "init_disk_b": disk_b,
+            "init_halo_r_s": halo_r_s,
+            "init_halo_mass": halo_mass,
+            "init_disk_mass": disk_mass,
+        }
+
+        has_bulge = "log_m_bulge" in analytic_param_dists
+        if has_bulge:
+            log_bulge_mass = numpyro.sample(
+                "log_m_bulge",
+                dist.TruncatedNormal(
+                    scale=sigma_alpha, **analytic_param_dists["log_m_bulge"]
+                ),
+            )
+            log_bulge_rs = numpyro.sample(
+                "log_bulge_rs",
+                dist.TruncatedNormal(
+                    scale=sigma_alpha, **analytic_param_dists["log_bulge_rs"]
+                ),
+            )
+            analytic_kwargs["init_bulge_mass"] = jnp.exp(log_bulge_mass)
+            analytic_kwargs["init_bulge_r_s"]  = jnp.exp(log_bulge_rs)
+
+        trainable_analytic_layer = composite_form(**analytic_kwargs)
     else:
         trainable_analytic_layer = None
 
     bnn = random_nnx_module(
         "full_model",
         net_template,
-        prior=dist.Normal(0.0, sigma_lambda),
+        prior=dist.Normal(0.0, sigma_theta),
     )
 
     if config.get("trainable", False):
@@ -164,7 +189,10 @@ def model_svi(
         diff_norm = jnp.linalg.norm(diff, axis=1)
         a_true_norm = jnp.linalg.norm(a_obs, axis=1) + 1e-12
         per_point = diff_norm + lambda_rel * (diff_norm / a_true_norm)
-        loss = jnp.mean(per_point)
+        if importance_weight is not None:
+            loss = jnp.mean(importance_weight * per_point)
+        else:
+            loss = jnp.mean(per_point)
         numpyro.factor("acc_loss", -data_weight * loss)
 
         # --- Orbital energy conservation loss ---
@@ -193,20 +221,15 @@ def model_svi(
             L_orbit = jnp.mean(relative_drift**2)
             numpyro.factor("orbit_E_loss", -w_orbit * L_orbit)
 
-
 def make_guide_for_config(
     config: Mapping[str, Any],
     analytic_param_dists: Mapping[str, Mapping[str, Any]],
     analytic_form: Callable | None,
     net_template: StaticModel,
-) -> AutoNormal:
-    """Construct an :class:`~numpyro.infer.autoguide.AutoNormal` variational guide.
-
-    Wraps :func:`model_svi` in a closure that binds ``config``,
-    ``analytic_param_dists``, and ``analytic_form``, then builds an
-    ``AutoNormal`` guide over the resulting model. The guide is initialised
-    with :func:`~numpyro.infer.init_to_feasible` to avoid invalid starting
-    points.
+    guide_type: str = "auto_normal",
+    rank: int = 20,
+):
+    """Construct a variational guide for the model.
 
     Parameters
     ----------
@@ -221,27 +244,33 @@ def make_guide_for_config(
     net_template
         Instantiated :class:`~galactoPINNs.models.static_model.StaticModel`
         forwarded to :func:`model_svi`.
+    guide_type
+        Type of autoguide to use. Supported options are:
+        ``"auto_normal"`` (default) and ``"low_rank"``.
+    rank
+        Rank for :class:`~numpyro.infer.autoguide.AutoLowRankMultivariateNormal`.
+        Ignored if ``guide_type="auto_normal"``.
 
     Returns
     -------
     guide
-        An ``AutoNormal`` guide with mean-field normal approximations over
-        all latent sites in :func:`model_svi`.
+        A NumPyro autoguide.
 
     Notes
     -----
     The inner ``_guided_model`` strips ``config``, ``analytic_param_dists``,
-    and ``composite_form`` from ``**kw`` before forwarding to
-    :func:`model_svi`, preventing duplicate-keyword errors when the guide is
-    called with those keys present.
-
+    ``composite_form``, and ``net_template`` from ``**kw`` before forwarding
+    to :func:`model_svi`, preventing duplicate-keyword errors when the guide
+    is called with those keys present.
     """
     def _guided_model(x: Array, a_obs: Array | None = None, **kw: Any) -> None:
         kw.pop("config", None)
         kw.pop("analytic_param_dists", None)
         kw.pop("composite_form", None)
+        kw.pop("net_template", None)
         return model_svi(
-            x, a_obs,
+            x,
+            a_obs,
             config=config,
             net_template=net_template,
             analytic_param_dists=analytic_param_dists,
@@ -249,38 +278,55 @@ def make_guide_for_config(
             **kw,
         )
 
-    return AutoNormal(_guided_model, init_loc_fn=init_to_feasible)
+    if guide_type == "auto_normal":
+        return AutoNormal(_guided_model, init_loc_fn=init_to_feasible)
+    elif guide_type == "low_rank":
+        return AutoLowRankMultivariateNormal(
+            _guided_model,
+            rank=rank,
+            init_loc_fn=init_to_feasible,
+        )
+    else:
+        raise ValueError(
+            f"Unknown guide_type '{guide_type}'. "
+            "Supported options are 'auto_normal' and 'low_rank'."
+        )
+
+
+
 
 
 def make_svi(
     *,
     guide: Callable[..., Any],
-    sigma_lambda: float,
     sigma_theta: float,
+    sigma_alpha: float,
     sigma_a: float,
     lambda_rel: float,
     config: Mapping[str, Any],
     analytic_param_dists: Mapping[str, Mapping[str, Any]],
+    importance_weight: Array | None = None,
     orbit_q: Array | None = None,
     orbit_p: Array | None = None,
     w_orbit: float = 1.0,
     lr: float = 5e-3,
+    optimizer: Any = None,
     composite_form: Callable | None = None,
     net_template: StaticModel | None = None,
 ) -> SVI:
     """Construct an :class:`~numpyro.infer.SVI` object with :func:`model_svi` closed over config.
 
     Binds all hyperparameters and data into a ``_model`` closure, then wraps
-    it with the provided guide and an :class:`~numpyro.optim.Adam` optimiser
-    using the :class:`~numpyro.infer.Trace_ELBO` objective.
+    it with the provided guide and optimizer using the
+    :class:`~numpyro.infer.Trace_ELBO` objective.
 
     Parameters
     ----------
     guide
         Variational guide, typically produced by :func:`make_guide_for_config`.
-    sigma_lambda
-        Standard deviation of the normal prior over BNN weights.
     sigma_theta
+        Standard deviation of the normal prior over BNN network weights.
+    sigma_alpha
         Standard deviation of the ``TruncatedNormal`` prior over log-space
         analytic parameters.
     sigma_a
@@ -294,6 +340,9 @@ def make_svi(
     analytic_param_dists
         Nested mapping of parameter name to prior keyword arguments,
         forwarded to :func:`model_svi`.
+    importance_weight
+        Optional per-point weights, shape ``(N,)``, forwarded to
+        :func:`model_svi`. Closed over in the ``_model`` closure.
     orbit_q
         Scaled orbit positions, shape ``(B, T, 3)``, forwarded to
         :func:`model_svi`. If ``None``, the orbit loss is disabled.
@@ -304,8 +353,11 @@ def make_svi(
         Weight applied to the orbital energy conservation loss term. Default
         ``1.0``.
     lr
-        Learning rate for the :class:`~numpyro.optim.Adam` optimiser. Default
-        ``2e-3``.
+        Learning rate for an :class:`~numpyro.optim.Adam` optimiser created
+        internally. Ignored when ``optimizer`` is provided. Default ``5e-3``.
+    optimizer
+        A pre-built NumPyro-compatible optimizer. When provided, ``lr`` is
+        ignored.
     composite_form
         Callable that constructs a trainable analytic layer from sampled
         parameters. May be ``None`` when ``config["trainable"]`` is ``False``.
@@ -320,6 +372,9 @@ def make_svi(
         via ``.run()`` or ``.update()``.
 
     """
+    if optimizer is None:
+        optimizer = Adam(lr)
+
     def _model(
         x: Array,
         a_obs: Array | None = None,
@@ -329,10 +384,11 @@ def make_svi(
             a_obs,
             config=config,
             analytic_param_dists=analytic_param_dists,
-            sigma_lambda=sigma_lambda,
             sigma_theta=sigma_theta,
+            sigma_alpha=sigma_alpha,
             sigma_a=sigma_a,
             lambda_rel=lambda_rel,
+            importance_weight=importance_weight,
             orbit_q=orbit_q,
             orbit_p=orbit_p,
             w_orbit=w_orbit,
@@ -340,7 +396,7 @@ def make_svi(
             net_template=net_template,
         )
 
-    return SVI(_model, guide, Adam(lr), Trace_ELBO())
+    return SVI(_model, guide, optimizer, Trace_ELBO())
 
 def run_window(
     prev_result: Any,
@@ -350,10 +406,12 @@ def run_window(
     a_train: Array,
     steps: int = 1000,
     lr: float = 5e-3,
-    sigma_lambda: float = 0.05,
+    optimizer: Any = None,
     sigma_theta: float = 0.05,
+    sigma_alpha: float = 0.05,
     sigma_a: float = 2e-4,
     lambda_rel: float = 0.1,
+    importance_weight: Array | None = None,
     config: Mapping[str, Any] | None = None,
     analytic_param_dists: Mapping[str, Mapping[str, float]] | None = None,
     composite_form: Callable | None = None,
@@ -387,12 +445,12 @@ def run_window(
     steps
         Number of SVI gradient steps to run. Default ``1000``.
     lr
-        Learning rate for the :class:`~numpyro.optim.Adam` optimiser. Default
-        ``5e-3``.
-    sigma_lambda
+        Learning rate for an :class:`~numpyro.optim.Adam` optimiser created
+        internally. Ignored when ``optimizer`` is provided. Default ``5e-3``.
+    sigma_theta
         Standard deviation of the normal prior over BNN weights. Default
         ``0.05``.
-    sigma_theta
+    sigma_alpha
         Standard deviation of the ``TruncatedNormal`` prior over log-space
         analytic parameters. Default ``0.05``.
     sigma_a
@@ -400,6 +458,12 @@ def run_window(
     lambda_rel
         Relative weighting of the normalised acceleration residual. Default
         ``0.1``.
+    importance_weight
+        Optional per-point weights, shape ``(N,)``, forwarded to
+        :func:`make_svi`. When provided, the acceleration loss uses a weighted
+        mean instead of a plain mean.
+    optimizer
+        NumPyro-compatible optimizer forwarded to :func:`make_svi`.
     config
         Model configuration dictionary forwarded to :func:`make_svi`. Must
         not be ``None``.
@@ -448,10 +512,11 @@ def run_window(
 
     svi = make_svi(
         guide=guide,
-        sigma_lambda=sigma_lambda,
         sigma_theta=sigma_theta,
+        sigma_alpha=sigma_alpha,
         sigma_a=sigma_a,
         lambda_rel=lambda_rel,
+        importance_weight=importance_weight,
         analytic_param_dists=analytic_param_dists,
         config=config,
         orbit_q=orbit_q,
@@ -460,6 +525,7 @@ def run_window(
         composite_form=composite_form,
         net_template=net_template,
         lr=lr,
+        optimizer=optimizer,
     )
 
     if warm_params is not None:
@@ -529,7 +595,6 @@ def theta_from_draw_halo_disk(d: dict[str, Array]) -> dict[str, Array]:
         "disk_a":    jnp.exp(d["log_disk_a"]),
         "disk_b":    jnp.exp(d["log_disk_b"]),
     }
-
 
 
 def normalize_kp(kp: tuple) -> tuple:
