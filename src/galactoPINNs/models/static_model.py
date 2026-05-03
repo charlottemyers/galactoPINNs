@@ -267,34 +267,7 @@ class StaticModel(nnx.Module):
 
         return potential[0] if scalar_input else potential
 
-    def compute_potential(
-        self,
-        x_cart: Array,
-        *,
-        trainable_analytic_layer: TrainableGalaxPotential | None = None,
-    ) -> Array:
-        """Evaluate the model potential at Cartesian position(s).
-
-        Parameters
-        ----------
-        x_cart
-            Input positions, shape ``(N, 3)`` for a batch or ``(3,)`` for a
-            single point. Assumed to be in the model's scaled space.
-        trainable_analytic_layer
-            Optional trainable analytic layer to use in place of
-            ``self.trainable_analytic_layer``. Required when
-            ``config["trainable"]`` is ``True`` and the layer is passed
-            externally (e.g. during SVI).
-
-        Returns
-        -------
-        potential
-            Squeezed potential values, shape ``(N,)`` for batched input.
-
-        """
-        return self(x_cart, trainable_analytic_layer=trainable_analytic_layer).squeeze()
-
-    def compute_laplacian(self, x_cart: Array) -> Array:
+    def laplacian(self, x_cart: Array) -> Array:
         """Compute the Laplacian of the potential.
 
         Parameters
@@ -313,12 +286,7 @@ class StaticModel(nnx.Module):
         trace. This is substantially more expensive than gradients.
 
         """
-
-        def laplacian_single(x: Array) -> Array:
-            hess = jax.hessian(self.compute_potential)(x)  # (3, 3)
-            return jnp.trace(hess)
-
-        return jax.vmap(laplacian_single)(x_cart)
+        return laplacian(self, x_cart)
 
     def acceleration(
         self,
@@ -343,10 +311,7 @@ class StaticModel(nnx.Module):
             Acceleration vectors, shape ``(N, 3)``.
 
         """
-        grads = jax.vmap(jax.grad(self), in_axes=(0, None))(
-            x_cart, trainable_analytic_layer
-        )
-        return -grads
+        return acceleration(self, x_cart, trainable_analytic_layer)
 
     def potential_acceleration(
         self,
@@ -376,6 +341,25 @@ class StaticModel(nnx.Module):
             Acceleration vectors, shape ``(N, 3)``.
 
         """
-        vgfn = jax.vmap(jax.value_and_grad(self), in_axes=(0, None))
-        potential_vals, grads = vgfn(x_cart, trainable_analytic_layer)
+        potential_vals, grads = pot_and_grad(self, x_cart, trainable_analytic_layer)
         return potential_vals, -grads
+
+
+@ft.partial(jax.vmap, in_axes=(None, 0, None))
+def pot_and_grad(
+    model: StaticModel, x: Array, tal: TrainableGalaxPotential | None
+) -> tuple[Array, Array]:
+    return jax.value_and_grad(model)(x, tal)
+
+
+@ft.partial(jax.vmap, in_axes=(None, 0, None))
+def acceleration(
+    model: StaticModel, x: Array, tal: TrainableGalaxPotential | None
+) -> Array:
+    return -jax.grad(model)(x, tal)
+
+
+@ft.partial(jax.vmap, in_axes=(None, 0))
+def laplacian(model: StaticModel, x: Array) -> Array:
+    hess = jax.hessian(model)(x)  # (3, 3)
+    return jnp.trace(hess)

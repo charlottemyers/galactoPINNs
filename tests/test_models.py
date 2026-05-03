@@ -126,13 +126,13 @@ class TestStaticModel:
         assert potential.shape == (2,)
         assert jnp.isfinite(potential).all()
 
-    def test_compute_laplacian(self):
-        """Test compute_laplacian method."""
+    def test_laplacian(self):
+        """Test laplacian method."""
         config = make_minimal_config()
         model = StaticModel(config, in_features=5, rngs=nnx.Rngs(0))
 
         x = jnp.array([[1.0, 2.0, 3.0]])
-        laplacian = model.compute_laplacian(x)
+        laplacian = model.laplacian(x)
 
         assert laplacian.shape == (1,)
         assert jnp.isfinite(laplacian).all()
