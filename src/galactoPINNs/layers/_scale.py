@@ -144,6 +144,15 @@ class ScaleNNPotentialLayer(nnx.Module):
                     reciprocal=bool(config.get("scale_reciprocal", True)),
                 )
 
+    @classmethod
+    def from_config(
+        cls,
+        config: Mapping[str, Any],
+        external_scale: ExternalPytree | None = None,
+    ) -> "ScaleNNPotentialLayer":
+        """Create an instance from a config dict."""
+        return cls(config=config, external_scale=external_scale)
+
     def __call__(
         self, x_cart: Array, u_nn: Array, /, *, r_s: float | None = None, t: Any = 0
     ) -> Array:
