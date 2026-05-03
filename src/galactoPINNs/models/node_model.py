@@ -18,10 +18,10 @@ from flax import nnx
 from jaxtyping import Array
 
 from galactoPINNs.layers import (
+    MLP,
     CartesianToModifiedSphericalLayer,
     FuseandBoundary,
     ScaleNNPotentialLayer,
-    SmoothMLP,
     TrainableGalaxPotential,
 )
 
@@ -381,7 +381,7 @@ class NODEModel(nnx.Module):
             mlp_common["act"] = activation
 
         # delta_phi_net takes [t, sph_features...] so has (in_features + 1) inputs
-        self.delta_phi_net = SmoothMLP(
+        self.delta_phi_net = MLP(
             in_features=in_features + 1,
             depth=config.get("delta_phi_depth", 4),
             width=config.get("delta_phi_width", 128),
@@ -389,7 +389,7 @@ class NODEModel(nnx.Module):
         )
 
         # initial_correction_net takes spatial features only
-        self.initial_correction_net = SmoothMLP(
+        self.initial_correction_net = MLP(
             in_features=in_features,
             depth=config.get("initial_correction_depth", 4),
             width=config.get("initial_correction_width", 128),

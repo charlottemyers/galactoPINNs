@@ -1,11 +1,11 @@
 """Neural network layers for physics-informed models."""
 
 __all__ = (
+    "MLP",
     "CartesianToModifiedSphericalLayer",
     "ExternalPytree",
     "FuseandBoundary",
     "ScaleNNPotentialLayer",
-    "SmoothMLP",
     "TrainableGalaxPotential",
     "ZeroPotential",
 )
@@ -33,8 +33,23 @@ class ActivationFn(Protocol):
     def __call__(self, x: Array, /) -> Array: ...
 
 
-class SmoothMLP(nnx.Module):
-    """Multi-layer perceptron with a smooth activation.
+class MLP(nnx.Module):
+    """Multi-layer perceptron with a smooth activation for physics-informed models.
+
+    This module wraps ``nnx.Sequential`` to provide a convenient constructor for
+    building MLPs with smooth activation functions, which are essential for
+    physics-informed neural networks (PINNs). Since NNX does not package a
+    dedicated MLP class, this wrapper handles the layer construction pattern
+    needed for PINN applications.
+
+    Smooth activations (e.g., GELU, tanh) are critical for PINNs because:
+    - They enable accurate computation of derivatives through the network, which
+      is required for physics-based loss terms involving differential equations.
+    - Piecewise activations (e.g., ReLU) have discontinuous or undefined gradients
+      at specific points, introducing numerical instabilities in derivative
+      calculations.
+    - The default smooth activation (GELU with exact mode) ensures well-behaved
+      gradients throughout the network for better physical accuracy.
 
     This module builds a stack of Linear layers with an activation applied after
     each hidden layer, followed by a final Linear layer that outputs a scalar
@@ -51,7 +66,8 @@ class SmoothMLP(nnx.Module):
     act
         Activation function applied after each hidden layer. Must be a callable
         that maps an array to an array of the same shape. Defaults to
-        ``jax.nn.gelu``.
+        ``jax.nn.gelu`` (exact mode) for optimal derivative flow in physics
+        computations.
     rngs
         Random number generator state for parameter initialization.
 
@@ -60,9 +76,7 @@ class SmoothMLP(nnx.Module):
     >>> import jax
     >>> import jax.numpy as jnp
     >>> from flax import nnx
-    >>> mlp = SmoothMLP(
-    ...     in_features=3, width=16, depth=2, act=jax.nn.tanh, rngs=nnx.Rngs(0)
-    ... )
+    >>> mlp = MLP(in_features=3, width=16, depth=2, act=jax.nn.tanh, rngs=nnx.Rngs(0))
     >>> x = jnp.ones((4, 3))
     >>> y = mlp(x)
     >>> y.shape
@@ -113,17 +127,8 @@ class SmoothMLP(nnx.Module):
         return jnp.squeeze(self.network(x), axis=-1)
 
 
-class ZeroPotential(nnx.Module):
-    """A zero-output potential module used when the NN component is disabled.
-
-    Matches the ``SmoothMLP`` calling convention: takes input ``x`` of shape
-    ``(N, D)`` and returns zeros of shape ``(N,)``.
-
-    """
-
-    def __call__(self, x: Array, /) -> Array:
-        """Return zeros matching the batch size of ``x``."""
-        return jnp.zeros(x.shape[:-1])
+#####################################################################
+# Coordinates
 
 
 class CartesianToModifiedSphericalLayer(nnx.Module):
@@ -177,7 +182,9 @@ class CartesianToModifiedSphericalLayer(nnx.Module):
         return Y2[(0 if X_cart.ndim == 1 else Ellipsis)]
 
 
-# --- Scale function implementations (module-level, bound via ft.partial) ---
+#####################################################################
+# Scale functions
+# implementations module-level, bound via ft.partial
 # Shared final signature after partial application: (x_cart, r, r_s, t) -> Array
 
 
@@ -316,6 +323,19 @@ class ScaleNNPotentialLayer(nnx.Module):
         r = jnp.linalg.norm(x_cart, axis=-1)
         r_s_ = r_s if r_s is not None else self._default_r_s
         return self.scale_fn(x_cart, r, r_s_, t) * u_nn
+
+
+class ZeroPotential(nnx.Module):
+    """A zero-output potential module used when the NN component is disabled.
+
+    Matches the ``MLP`` calling convention: takes input ``x`` of shape
+    ``(N, D)`` and returns zeros of shape ``(N,)``.
+
+    """
+
+    def __call__(self, x: Array, /) -> Array:
+        """Return zeros matching the batch size of ``x``."""
+        return jnp.zeros(x.shape[:-1])
 
 
 class TrainableGalaxPotential(nnx.Module):

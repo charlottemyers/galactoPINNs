@@ -13,7 +13,7 @@ def test_import_package():
 def test_import_layers():
     """Test that layers module can be imported."""
     assert layers is not None
-    assert hasattr(layers, "SmoothMLP")
+    assert hasattr(layers, "MLP")
     assert hasattr(layers, "CartesianToModifiedSphericalLayer")
     assert hasattr(layers, "ScaleNNPotentialLayer")
 
