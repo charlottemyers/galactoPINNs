@@ -4,6 +4,7 @@ __all__ = (
     "alternate_training",
     "create_optimizer",
     "train_model_node",
+    "train_model_node_batched",
     "train_model_static",
     "train_model_with_trainable_analytic_layer",
     "train_step_node",
@@ -75,6 +76,7 @@ def train_step_static(
     a_true: Array,
     *,
     lambda_rel: float = 1.0,
+    importance_weight: Array | None = None,
     orbit_q: Array | None = None,
     orbit_p: Array | None = None,
     lambda_E: float = 5.0,
@@ -136,6 +138,10 @@ def train_step_static(
         True accelerations at ``x``, shape ``(N, 3)`` (scaled accelerations).
     lambda_rel
         Weight for the relative-error term in the acceleration loss.
+    importance_weight
+        Optional per-point weights, shape ``(N,)``. When provided, the
+        acceleration loss becomes ``mean(importance_weight * per_point)``
+        instead of ``mean(per_point)``. Has no effect on the orbit-energy loss.
     orbit_q
         Orbit positions over time, shape ``(B, T, 3)``.
         Required when ``target`` is not ``"acceleration"``.
@@ -208,7 +214,10 @@ def train_step_static(
         diff_norm = jnp.linalg.norm(diff,   axis=1)   # (N,)
         true_norm = jnp.linalg.norm(a_true, axis=1)   # (N,)
         eps = 1e-10
-        return jnp.mean(diff_norm + lambda_rel * (diff_norm / (true_norm + eps)))
+        per_point = diff_norm + lambda_rel * (diff_norm / (true_norm + eps))
+        if importance_weight is not None:
+            return jnp.mean(importance_weight * per_point)
+        return jnp.mean(per_point)
 
     def _orbit_energy(ts: nnx.State, oq: Array, op: Array) -> Array:
         """Return total specific energy E(t), shape ``(B, T)``."""
@@ -285,6 +294,7 @@ def train_step_node(
     a_true: Array,
     *,
     lambda_rel: float = 1.0,
+    importance_weight : Array | None = None,
 ) -> Array:
     """Optimization step for NODE with acceleration training objective.
 
@@ -321,6 +331,10 @@ def train_step_node(
         Weight applied to the relative-error component of the loss. Larger
         values emphasize fractional error in regions where ``||a_true||`` is
         small.
+    importance_weight
+        Optional per-point weights, shape ``(N,)``. When provided, the
+        acceleration loss becomes ``mean(importance_weight * per_point)``
+        instead of ``mean(per_point)``.
 
     Returns
     -------
@@ -351,11 +365,83 @@ def train_step_node(
         a_true_norm = jnp.linalg.norm(a_true, axis=1)  # (N,)
 
         eps = 1e-10
-        return jnp.mean(diff_norm + lambda_rel * (diff_norm / (a_true_norm + eps)))
+        per_point = diff_norm + lambda_rel * (diff_norm / (a_true_norm + eps))  # (N,) — no mean yet
+
+        if importance_weight is not None:
+            # importance_weight is shape (N,), large where |a_true - a_analytic| is large
+            loss = jnp.mean(importance_weight * per_point)
+        else:
+            loss = jnp.mean(per_point)
+        return loss
 
     loss, grads = nnx.value_and_grad(loss_fn)(model)
     optimizer.update(model, grads)
     return loss
+
+
+@nnx.jit
+def train_step_node_beta(
+    model: nnx.Module,
+    optimizer: nnx.Optimizer,
+    tx_cart: Array,
+    a_true: Array,
+    *,
+    lambda_rel: float = 1.0,
+    importance_weight: Array | None = None,
+) -> Array:
+    """Optimization step for NODE with acceleration training objective.
+
+    Identical to :func:`train_step_node` but uses the split-state NNX pattern
+    (matching :func:`train_step_static`) so that gradient and optimizer state
+    trees share the same structure regardless of the ``wrt`` filter.
+
+    Parameters
+    ----------
+    model
+        NNX module implementing the time-dependent potential model.
+    optimizer
+        NNX optimizer wrapping the model parameters.
+    tx_cart
+        Batch of model inputs, shape ``(N, 4)`` with columns ``[t, x, y, z]``.
+    a_true
+        True accelerations, shape ``(N, 3)``.
+    lambda_rel
+        Weight for the relative-error component of the loss. Default ``1.0``.
+    importance_weight
+        Optional per-point weights, shape ``(N,)``. When provided, the loss
+        becomes ``mean(importance_weight * per_point)``.
+
+    Returns
+    -------
+    loss
+        Scalar JAX array (shape ``()``) with the loss value for this step.
+
+    """
+    # Split into trainable (tracked by optimizer) vs frozen — same pattern as
+    # train_step_static. Ensures grads and optimizer state share the same tree
+    # structure regardless of which wrt filter the optimizer uses.
+    graphdef, train_state, frozen_state = nnx.split(model, optimizer.wrt, ...)
+
+    def loss_fn(ts: nnx.State) -> Array:
+        m = nnx.merge(graphdef, ts, frozen_state)
+        outputs: dict[str, Array] = m(tx_cart)
+        a_pred = outputs["acceleration"]  # (N, 3)
+
+        diff = a_pred - a_true
+        diff_norm = jnp.linalg.norm(diff, axis=1)  # (N,)
+        a_true_norm = jnp.linalg.norm(a_true, axis=1)  # (N,)
+
+        eps = 1e-10
+        per_point = diff_norm + lambda_rel * (diff_norm / (a_true_norm + eps))
+
+        if importance_weight is not None:
+            return jnp.mean(importance_weight * per_point)
+        return jnp.mean(per_point)
+
+    loss, grads = nnx.value_and_grad(loss_fn)(train_state)
+    optimizer.update(model, grads)
+    return loss
+
 
 
 def train_model_static(
@@ -499,6 +585,7 @@ def train_model_node(
     *,
     lambda_rel: float = 1.0,
     log_every: int = 1000,
+    importance_weight: Array | None = None,
 ) -> dict[str, Any]:
     """Train a time-dependent model.
 
@@ -521,6 +608,9 @@ def train_model_node(
         Weight for the relative-error term in the loss function.
     log_every
         The interval at which to log training progress.
+    importance_weight
+        Optional per-point weights, shape ``(N,)``, forwarded to
+        :func:`train_step_node`. When provided, the loss uses a weighted mean.
 
     Returns
     -------
@@ -532,11 +622,95 @@ def train_model_node(
     losses = []
 
     for epoch in range(num_epochs):
-        loss = train_step_node(model, optimizer, x_train, a_train, lambda_rel = lambda_rel)
+        loss = train_step_node(
+            model, optimizer, x_train, a_train,
+            lambda_rel=lambda_rel, importance_weight=importance_weight,
+        )
         if epoch % log_every == 0:
             log.info("Epoch %d, Loss: %.6f", epoch, loss)
         epochs.append(epoch)
         losses.append(loss)
+    return {"model": model, "optimizer": optimizer, "epochs": epochs, "losses": losses}
+
+
+def train_model_node_batched(
+    model: nnx.Module,
+    optimizer: nnx.Optimizer,
+    x_train: Array,
+    a_train: Array,
+    num_epochs: int,
+    batch_size: int,
+    *,
+    lambda_rel: float = 1.0,
+    log_every: int = 1000,
+    importance_weight: Array | None = None,
+) -> dict[str, Any]:
+    """Like train_model_node but samples a random mini-batch each epoch.
+
+    When importance_weight is provided it is used as the sampling distribution
+    so LMC-perturbed points remain well-represented in small batches.  The
+    per-step importance weights are re-normalised to the selected subset so the
+    loss scale stays consistent.
+
+    Parameters
+    ----------
+    model
+        NNX module implementing the time-dependent potential model.
+    optimizer
+        NNX optimizer wrapping the model parameters.
+    x_train
+        Training data (concatenated time and position), shape ``(N, 4)``.
+    a_train
+        Training accelerations, shape ``(N, 3)``.
+    num_epochs
+        Number of training epochs.
+    batch_size
+        Number of points sampled per epoch. Capped at ``N`` if larger.
+    lambda_rel
+        Weight for the relative-error term in the loss function. Default
+        ``1.0``.
+    log_every
+        Interval at which to log training progress. Default ``1000``.
+    importance_weight
+        Optional per-point weights, shape ``(N,)``. When provided, used as
+        the sampling probability distribution over training points and as
+        a weighted mean in the per-step loss (renormalised to the batch mean
+        each step for a stable loss scale).
+
+    Returns
+    -------
+    dict
+        Dictionary with keys ``"model"``, ``"optimizer"``, ``"epochs"``,
+        and ``"losses"``.
+
+    """
+    import numpy as np  # numpy-side RNG only; JAX arrays used for compute
+
+    epochs: list[int] = []
+    losses: list[float] = []
+    n_total = x_train.shape[0]
+
+    probs: "np.ndarray | None" = None
+    if importance_weight is not None:
+        w_np = np.array(importance_weight)
+        probs = w_np / w_np.sum()
+
+    for epoch in range(num_epochs):
+        idx = np.random.choice(n_total, size=min(batch_size, n_total), replace=False, p=probs)
+        x_batch = x_train[idx]
+        a_batch = a_train[idx]
+        if importance_weight is not None:
+            w_batch = importance_weight[idx]
+            w_batch = w_batch / w_batch.mean()  # renormalise so loss scale is stable
+        else:
+            w_batch = None
+
+        loss = train_step_node(model, optimizer, x_batch, a_batch, lambda_rel=lambda_rel, importance_weight=w_batch)
+        if epoch % log_every == 0:
+            log.info("Epoch %d, Loss: %.6f", epoch, loss)
+        epochs.append(epoch)
+        losses.append(float(loss))
+
     return {"model": model, "optimizer": optimizer, "epochs": epochs, "losses": losses}
 
 
@@ -789,5 +963,10 @@ def alternate_training(
         "total_epochs": total_epochs,
         **final_params,
     }
+    #print final learned values for tracked params
+    for param in param_list:
+        val = final_params.get(param)
+        if val is not None:
+            log.info("Final learned %s after all cycles: %s", param, val)
 
     return {"model": model, "history": history}

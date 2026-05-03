@@ -83,9 +83,11 @@ def evaluate_performance(
         - "pot_percent_error": percent potential error, shape (num_test,)
           (gauge-corrected if `gauge_correct` is specified)
         - "acc_percent_error": percent acceleration error, shape (num_test,)
-        If analytic baseline is enabled:
+        If analytic baseline is enabled, then the trainable or fixed analytic potential/acceleration
+        (depending on the specified model) is also evaluated:
         - "analytic_baseline": analytic baseline potential at t=0
         - "ab_pot_error", "ab_acc_error": baseline percent errors
+
 
     Raises
     ------
@@ -152,17 +154,32 @@ def evaluate_performance(
 
     # --- Analytic baseline comparison ---
     if analytic_baseline is not None:
-        analytic_baseline_potential = analytic_baseline.potential(x_val, t=0)
-        analytic_baseline_acc = analytic_baseline.acceleration(x_val, t=0)
+        if (config.get("trainable", False)):
+            trainable_analytic = model.trainable_analytic_layer
+            analytic_baseline_potential = trainable_analytic.potential(x_val, t=0)
+            analytic_baseline_acc = trainable_analytic.acceleration(x_val, t=0)
+            ab_pot_error = 100 * jnp.abs(
+                (analytic_baseline_potential - true_pot) / (jnp.abs(true_pot) + eps)
+            )
 
-        ab_pot_error = 100 * jnp.abs(
-            (analytic_baseline_potential - true_pot) / (jnp.abs(true_pot) + eps)
-        )
-        ab_acc_error = (
-            100
-            * jnp.linalg.norm(analytic_baseline_acc - true_acc, axis=1)
-            / (jnp.linalg.norm(true_acc, axis=1) + eps)
-        )
+            ab_acc_error = (
+                100
+                * jnp.linalg.norm(analytic_baseline_acc - true_acc, axis=1)
+                / (jnp.linalg.norm(true_acc, axis=1) + eps)
+            )
+
+        else:
+            analytic_baseline_potential = analytic_baseline.potential(x_val, t=0)
+            analytic_baseline_acc = analytic_baseline.acceleration(x_val, t=0)
+
+            ab_pot_error = 100 * jnp.abs(
+                (analytic_baseline_potential - true_pot) / (jnp.abs(true_pot) + eps)
+            )
+            ab_acc_error = (
+                100
+                * jnp.linalg.norm(analytic_baseline_acc - true_acc, axis=1)
+                / (jnp.linalg.norm(true_acc, axis=1) + eps)
+            )
     else:
         analytic_baseline_potential = None
         ab_pot_error = None
@@ -343,6 +360,7 @@ def evaluate_performance_node(
 
     return {
         "r_eval": r_eval,
+        "x_eval": x_val,
         "true_a": true_acc,
         "predicted_a": predicted_acc,
         "true_a_norm": true_acc_norm,
