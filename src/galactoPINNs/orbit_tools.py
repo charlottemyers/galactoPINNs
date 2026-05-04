@@ -105,7 +105,7 @@ def compare_orbits_analytic(
     true_potential: gp.AbstractPotential,
     analytic_potential: gp.AbstractPotential,
     w0: gc.PhaseSpacePosition,
-    ts: u.Quantity,
+    ts: u.Q,
     true_orbit: gd.Orbit | None = None,
 ) -> dict:
     """Compare an orbit integrated under an analytic potential to a true orbit.
@@ -166,7 +166,7 @@ def compare_orbits(
     true_potential: gp.AbstractPotential,
     learned_galax_pot: gp.AbstractPotential,
     w0: gc.PhaseSpacePosition,
-    ts: u.Quantity,
+    ts: u.Q,
     true_orbit: gd.Orbit | None = None,
 ) -> dict:
     """Compare an orbit integrated under a learned potential to a true orbit.
@@ -230,7 +230,7 @@ def compare_orbits(
 def get_orbit_metrics_analytic(
     true_potential: gp.AbstractPotential,
     analytic_potential: gp.AbstractPotential,
-    ts: u.Quantity,
+    ts: u.Q,
     w0s: list[gc.PhaseSpacePosition],
     true_orbits: list[gd.Orbit] | None = None,
 ) -> list[dict]:
@@ -319,7 +319,7 @@ def get_w0s_from_data(
 def get_orbit_metrics(
     true_potential: gp.AbstractPotential,
     learned_galax_pot: gp.AbstractPotential,
-    ts: u.Quantity,
+    ts: u.Q,
     w0s: list[gc.PhaseSpacePosition],
     true_orbits: list[gd.Orbit] | None = None,
 ) -> list[dict]:

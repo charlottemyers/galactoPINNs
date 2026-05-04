@@ -109,6 +109,16 @@ class TrainableGalaxPotential(nnx.Module):
         """Convenience property to access the current r_s value."""
         return self._build_kwargs()["r_s"]
 
+    def potential(self, positions: Array, t: ScalarLike = 0) -> Array:
+        """Alias for __call__, matching the Galax potential API."""
+        return self(positions, t=t)
+
+    def acceleration(self, positions: Array, t: ScalarLike = 0) -> Array:
+        """Compute acceleration by finite differencing the potential."""
+        kwargs = self._build_kwargs()
+        pot = self.pot_cls(**kwargs, units="galactic")
+        return pot.acceleration(positions, t=t)
+
 
 class FuseandBoundaryConfig(TypedDict):
     """Configuration dictionary for FuseandBoundary.
