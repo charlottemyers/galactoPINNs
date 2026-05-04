@@ -18,10 +18,10 @@ from flax import nnx
 from jaxtyping import Array
 
 from galactoPINNs.layers import (
+    MLP,
     CartesianToModifiedSphericalLayer,
     FuseandBoundary,
     ScaleNNPotentialLayer,
-    SmoothMLP,
     TrainableGalaxPotential,
 )
 
@@ -347,7 +347,7 @@ class NODEModel(nnx.Module):
             raise TypeError(msg)
 
         # --- Initialize coordinate transform layer ---
-        self.cart_to_sph_layer = CartesianToModifiedSphericalLayer(
+        self.input_encoder = CartesianToModifiedSphericalLayer(
             clip=config.get("clip", 1.0)
         )
 
@@ -381,7 +381,7 @@ class NODEModel(nnx.Module):
             mlp_common["act"] = activation
 
         # delta_phi_net takes [t, sph_features...] so has (in_features + 1) inputs
-        self.delta_phi_net = SmoothMLP(
+        self.delta_phi_net = MLP(
             in_features=in_features + 1,
             depth=config.get("delta_phi_depth", 4),
             width=config.get("delta_phi_width", 128),
@@ -389,7 +389,7 @@ class NODEModel(nnx.Module):
         )
 
         # initial_correction_net takes spatial features only
-        self.initial_correction_net = SmoothMLP(
+        self.initial_correction_net = MLP(
             in_features=in_features,
             depth=config.get("initial_correction_depth", 4),
             width=config.get("initial_correction_width", 128),
@@ -465,7 +465,7 @@ class NODEModel(nnx.Module):
         x_cart = tx_cart[:, 1:4]  # (N, 3)
 
         # --- Coordinate transformation ---
-        x_sph = self.cart_to_sph_layer(x_cart)
+        x_sph = self.input_encoder(x_cart)
 
         # --- Build [t, sph_features...] for delta_phi network ---
         tx_sph = jnp.concatenate([t, x_sph], axis=1)

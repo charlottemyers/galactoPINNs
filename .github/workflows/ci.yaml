@@ -137,7 +137,7 @@ jobs:
 
           # Try individual modules
           modules = [
-              ('galactoPINNs.layers', 'SmoothMLP'),
+              ('galactoPINNs.layers', 'MLP'),
               ('galactoPINNs.data', 'UniformScaler'),
               ('galactoPINNs.train', 'create_optimizer'),
               ('galactoPINNs.inference', 'apply_model'),
