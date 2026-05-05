@@ -3,25 +3,16 @@
 __all__ = ("apply_model",)
 
 from collections.abc import Callable, Mapping
-from typing import Any, Protocol
+from typing import Any, TypeAlias
 
 from jaxtyping import Array
 
-Params = Any
-ApplyFn = Callable[..., Mapping[str, Any]]
-
-##### Protocols and types #####
-
-
-class _NNXModelLike(Protocol):
-    """Protocol for NNX modules that can be called directly."""
-
-    def __call__(self, *args: Any, **kwargs: Any) -> Mapping[str, Any]: ...
+Params: TypeAlias = Any
 
 
 def apply_model(
-    model_or_params: _NNXModelLike | Params,
-    x_or_apply_fn: Array | ApplyFn,
+    model_or_params: Callable[..., Mapping[str, Any]] | Params,
+    x_or_apply_fn: Array | Callable[..., Mapping[str, Any]],
     x_scaled: Array | None = None,
 ) -> dict[str, Any]:
     """Apply a model to scaled inputs and return standardized outputs.
@@ -58,19 +49,21 @@ def apply_model(
                 "In functional mode, `x_scaled` must be provided as the third argument."
             )
         predictions = apply_fn(params, x)
+        return {
+            "u_pred": predictions["potential"],
+            "a_pred": predictions["acceleration"],
+            "outputs": predictions.get("outputs", None),
+        }
 
-    else:  # Object Mode
-        model = model_or_params
-        x = x_or_apply_fn
-        if x_scaled is not None:
-            raise ValueError(
-                "In object mode, do not provide the third "
-                "positional argument `x_scaled`."
-            )
-        predictions = model(x)
-
+    # Object Mode
+    model = model_or_params
+    x = x_or_apply_fn
+    if x_scaled is not None:
+        msg = "In object mode, do not provide the third positional argument `x_scaled`."
+        raise ValueError(msg)
+    u_pred, a_pred = model.potential_acceleration(x)
     return {
-        "u_pred": predictions["potential"],
-        "a_pred": predictions["acceleration"],
-        "outputs": predictions.get("outputs", None),
+        "u_pred": u_pred,
+        "a_pred": a_pred,
+        "outputs": None,
     }

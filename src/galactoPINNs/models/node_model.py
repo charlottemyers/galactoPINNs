@@ -8,6 +8,7 @@ __all__ = (
     "compute_delta_phi_per_point_gl3panels",
 )
 
+import functools as ft
 from collections.abc import Callable, Mapping
 from typing import Any, Literal, TypedDict
 
@@ -18,10 +19,10 @@ from flax import nnx
 from jaxtyping import Array
 
 from galactoPINNs.layers import (
+    MLP,
     CartesianToModifiedSphericalLayer,
     FuseandBoundary,
     ScaleNNPotentialLayer,
-    SmoothMLP,
     TrainableGalaxPotential,
 )
 
@@ -347,7 +348,7 @@ class NODEModel(nnx.Module):
             raise TypeError(msg)
 
         # --- Initialize coordinate transform layer ---
-        self.cart_to_sph_layer = CartesianToModifiedSphericalLayer(
+        self.input_encoder = CartesianToModifiedSphericalLayer(
             clip=config.get("clip", 1.0)
         )
 
@@ -381,7 +382,7 @@ class NODEModel(nnx.Module):
             mlp_common["act"] = activation
 
         # delta_phi_net takes [t, sph_features...] so has (in_features + 1) inputs
-        self.delta_phi_net = SmoothMLP(
+        self.delta_phi_net = MLP(
             in_features=in_features + 1,
             depth=config.get("delta_phi_depth", 4),
             width=config.get("delta_phi_width", 128),
@@ -389,7 +390,7 @@ class NODEModel(nnx.Module):
         )
 
         # initial_correction_net takes spatial features only
-        self.initial_correction_net = SmoothMLP(
+        self.initial_correction_net = MLP(
             in_features=in_features,
             depth=config.get("initial_correction_depth", 4),
             width=config.get("initial_correction_width", 128),
@@ -465,7 +466,7 @@ class NODEModel(nnx.Module):
         x_cart = tx_cart[:, 1:4]  # (N, 3)
 
         # --- Coordinate transformation ---
-        x_sph = self.cart_to_sph_layer(x_cart)
+        x_sph = self.input_encoder(x_cart)
 
         # --- Build [t, sph_features...] for delta_phi network ---
         tx_sph = jnp.concatenate([t, x_sph], axis=1)
@@ -549,7 +550,7 @@ class NODEModel(nnx.Module):
 
         # --- Neural network potential (scaled) ---
         scaled_nn_potential = self.scale_layer(
-            x_cart, total_correction, r_s_learned=r_s_learned
+            x_cart, total_correction, r_s=r_s_learned
         )
 
         # --- Combine potentials ---
@@ -596,3 +597,42 @@ class NODEModel(nnx.Module):
             "acceleration": acceleration,
             "analytic_acceleration_scaled": analytic_acceleration_scaled,
         }
+
+    def potential_acceleration(
+        self,
+        tx_cart: Array,
+        /,
+        trainable_analytic_layer: TrainableGalaxPotential | None = None,
+    ) -> tuple[Array, Array]:
+        """Compute potential and acceleration jointly via ``value_and_grad``.
+
+        Parameters
+        ----------
+        tx_cart
+            Time+position inputs, shape ``(N, 4)``.
+        trainable_analytic_layer
+            Optional trainable analytic layer forwarded to
+            :meth:`compute_potential`.
+
+        Returns
+        -------
+        potential
+            Potential values, shape ``(N,)``.
+        acceleration
+            Acceleration vectors, shape ``(N, 3)``.
+
+        """
+        return _node_pot_and_grad(self, tx_cart, trainable_analytic_layer)
+
+
+@ft.partial(jax.vmap, in_axes=(None, 0, None))
+def _node_pot_and_grad(
+    model: NODEModel, tx: Array, tal: TrainableGalaxPotential | None
+) -> tuple[Array, Array]:
+    """Vmapped value+grad of :meth:`NODEModel.compute_potential` w.r.t. x,y,z."""
+
+    def _pot_wrt_x(x3: Array) -> Array:
+        return model.compute_potential(tx.at[1:4].set(x3), trainable_analytic_layer=tal)
+
+    phi, grad_x = jax.value_and_grad(_pot_wrt_x)(tx[1:4])
+    return phi, -grad_x

@@ -5,27 +5,24 @@ import jax.numpy as jnp
 from flax import nnx
 
 from galactoPINNs.layers import (
+    MLP,
     CartesianToModifiedSphericalLayer,
     ScaleNNPotentialLayer,
-    SmoothMLP,
 )
 
 
-class TestSmoothMLP:
-    """Tests for SmoothMLP layer."""
+class TestMLP:
+    """Tests for MLP layer."""
 
     def test_init_creates_correct_layers(self):
-        """Test that SmoothMLP initializes with the correct number of layers."""
-        mlp = SmoothMLP(in_features=3, width=16, depth=2, rngs=nnx.Rngs(0))
+        """Test that MLP initializes with the correct number of layers."""
+        mlp = MLP(in_features=3, width=16, depth=2, rngs=nnx.Rngs(0))
 
-        assert len(mlp.hidden_layers) == 2
-        assert mlp.output_layer is not None
-        assert mlp.width == 16
-        assert mlp.depth == 2
+        assert len(mlp.network.layers) == 5
 
     def test_forward_single_sample(self):
         """Test forward pass with a single sample."""
-        mlp = SmoothMLP(in_features=3, width=16, depth=2, rngs=nnx.Rngs(0))
+        mlp = MLP(in_features=3, width=16, depth=2, rngs=nnx.Rngs(0))
         x = jnp.ones((1, 3))
         y = mlp(x)
 
@@ -34,7 +31,7 @@ class TestSmoothMLP:
 
     def test_forward_batch(self):
         """Test forward pass with a batch of samples."""
-        mlp = SmoothMLP(in_features=3, width=32, depth=3, rngs=nnx.Rngs(42))
+        mlp = MLP(in_features=3, width=32, depth=3, rngs=nnx.Rngs(42))
         x = jnp.ones((10, 3))
         y = mlp(x)
 
@@ -44,7 +41,7 @@ class TestSmoothMLP:
     def test_different_activations(self):
         """Test that different activation functions work."""
         for act in [jax.nn.tanh, jax.nn.relu, jax.nn.silu]:
-            mlp = SmoothMLP(in_features=3, width=8, depth=1, act=act, rngs=nnx.Rngs(0))
+            mlp = MLP(in_features=3, width=8, depth=1, act=act, rngs=nnx.Rngs(0))
             x = jnp.ones((5, 3))
             y = mlp(x)
 
@@ -52,8 +49,8 @@ class TestSmoothMLP:
             assert jnp.isfinite(y).all()
 
     def test_jit_compatible(self):
-        """Test that SmoothMLP works with JAX JIT compilation."""
-        mlp = SmoothMLP(in_features=3, width=16, depth=2, rngs=nnx.Rngs(0))
+        """Test that MLP works with JAX JIT compilation."""
+        mlp = MLP(in_features=3, width=16, depth=2, rngs=nnx.Rngs(0))
 
         @jax.jit
         def forward(model, x):
@@ -66,8 +63,8 @@ class TestSmoothMLP:
         assert jnp.isfinite(y).all()
 
     def test_vmap_compatible(self):
-        """Test that SmoothMLP works with JAX vmap."""
-        mlp = SmoothMLP(in_features=3, width=16, depth=2, rngs=nnx.Rngs(0))
+        """Test that MLP works with JAX vmap."""
+        mlp = MLP(in_features=3, width=16, depth=2, rngs=nnx.Rngs(0))
 
         # vmap over a batch dimension
         x_batch = jnp.ones((4, 1, 3))  # (batch, 1, features)
@@ -80,8 +77,8 @@ class TestSmoothMLP:
         assert y.shape == (4, 1)
 
     def test_grad_compatible(self):
-        """Test that gradients can be computed through SmoothMLP."""
-        mlp = SmoothMLP(in_features=3, width=16, depth=2, rngs=nnx.Rngs(0))
+        """Test that gradients can be computed through MLP."""
+        mlp = MLP(in_features=3, width=16, depth=2, rngs=nnx.Rngs(0))
 
         def loss_fn(model):
             x = jnp.ones((5, 3))
