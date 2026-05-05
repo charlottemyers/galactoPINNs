@@ -50,14 +50,14 @@ def get_raw_orbit_coords(orbit: gd.Orbit, c: str = "q") -> Array:
 
     """
     if c == "q":
-        coords = plum.convert(orbit.q, u.Q).ustrip(usys["length"])
+        coords = plum.convert(orbit.q, u.Quantity).ustrip(usys["length"])
     if c == "p":
-        coords = plum.convert(orbit.p, u.Q).ustrip(usys["speed"])
+        coords = plum.convert(orbit.p, u.Quantity).ustrip(usys["speed"])
     return coords
 
 
 @jax.jit
-def orbit_energy(pot: gp.AbstractPotential, w: Array, ts: Array) -> Array:
+def orbit_energy(pot: gp.AbstractPotential, w: gd.Orbit | Array, ts: Array) -> Array:
     """Compute total orbital energy (kinetic + potential) along an orbit.
 
     Parameters
@@ -76,9 +76,13 @@ def orbit_energy(pot: gp.AbstractPotential, w: Array, ts: Array) -> Array:
         ``kpc^2/Myr^2``.
 
     """
-    x, v = w[..., :3], w[..., 3:]
+    if isinstance(w, gd.Orbit):
+        x = plum.convert(w.q, u.Quantity).ustrip(usys["length"])
+        v = plum.convert(w.p, u.Quantity).ustrip(usys["speed"])
+    else:
+        x, v = w[..., :3], w[..., 3:]
     T = 0.5 * (v**2).sum(axis=-1)
-    Phi = u.ustrip(usys, pot.potential(u.Q(x, usys["length"]), t=ts))
+    Phi = u.ustrip(usys, pot.potential(u.Quantity(x, usys["length"]), t=ts))
     return T + Phi
 
 
@@ -105,7 +109,7 @@ def compare_orbits_analytic(
     true_potential: gp.AbstractPotential,
     analytic_potential: gp.AbstractPotential,
     w0: gc.PhaseSpacePosition,
-    ts: u.Q,
+    ts: u.Quantity,
     true_orbit: gd.Orbit | None = None,
 ) -> dict:
     """Compare an orbit integrated under an analytic potential to a true orbit.
@@ -166,7 +170,7 @@ def compare_orbits(
     true_potential: gp.AbstractPotential,
     learned_galax_pot: gp.AbstractPotential,
     w0: gc.PhaseSpacePosition,
-    ts: u.Q,
+    ts: u.Quantity,
     true_orbit: gd.Orbit | None = None,
 ) -> dict:
     """Compare an orbit integrated under a learned potential to a true orbit.
@@ -230,7 +234,7 @@ def compare_orbits(
 def get_orbit_metrics_analytic(
     true_potential: gp.AbstractPotential,
     analytic_potential: gp.AbstractPotential,
-    ts: u.Q,
+    ts: u.Quantity,
     w0s: list[gc.PhaseSpacePosition],
     true_orbits: list[gd.Orbit] | None = None,
 ) -> list[dict]:
@@ -302,15 +306,15 @@ def get_w0s_from_data(
         idx = rng.integers(0, x_test.shape[0])
         x_random = x_test[idx]
         w_dummy = gc.PhaseSpaceCoordinate(
-            q=u.Q([x_random], usys["length"]),
-            p=u.Q([0, 0, 0], usys["velocity"]),
-            t=u.Q([0], usys["time"]),
+            q=u.Quantity([x_random], usys["length"]),
+            p=u.Quantity([0, 0, 0], usys["velocity"]),
+            t=u.Quantity([0], usys["time"]),
         )
         vc = true_potential.local_circular_velocity(w_dummy)
         r = np.linalg.norm(x_random)
         v_vec = vc * np.array([-x_random[1], x_random[0], 0.0]) / r
         w0 = gc.PhaseSpacePosition(
-            q=u.Q(x_random, usys["length"]), p=u.Q(v_vec, usys["velocity"])
+            q=u.Quantity(x_random, usys["length"]), p=u.Quantity(v_vec, usys["velocity"])
         )
         w0s.append(w0)
     return w0s
@@ -319,7 +323,7 @@ def get_w0s_from_data(
 def get_orbit_metrics(
     true_potential: gp.AbstractPotential,
     learned_galax_pot: gp.AbstractPotential,
-    ts: u.Q,
+    ts: u.Quantity,
     w0s: list[gc.PhaseSpacePosition],
     true_orbits: list[gd.Orbit] | None = None,
 ) -> list[dict]:
@@ -452,9 +456,9 @@ def compose_velocity_bound_safe(
     ang = jr.uniform(subkey, shape=(N, 1), minval=0.0, maxval=2.0 * jnp.pi)
     e_t = jnp.cos(ang) * e_t1 + jnp.sin(ang) * e_t2
 
-    qQ = u.Q(q_phys, usys["length"])
+    qQ = u.Quantity(q_phys, usys["length"])
     v_circ = (
-        gp.local_circular_velocity(pot_for_vcirc, qQ, t=u.Q(0.0, usys["time"]))
+        gp.local_circular_velocity(pot_for_vcirc, qQ, t=u.Quantity(0.0, usys["time"]))
         .ustrip(usys["velocity"])
         .reshape(N, 1)
     )
@@ -471,7 +475,7 @@ def compose_velocity_bound_safe(
     v = v * jnp.minimum(1.0, cap_vs_vcirc * v_circ / (speed + 1e-12))
 
     phi = (
-        pot_for_escape.potential(qQ, t=u.Q(0.0, usys["time"]))
+        pot_for_escape.potential(qQ, t=u.Quantity(0.0, usys["time"]))
         .ustrip(usys)
         .reshape(N, 1)
     )
@@ -586,13 +590,13 @@ def scale_orbit_batch(
 
 @jax.jit
 def integrate_one(
-    true_pot: gp.AbstractPotential, q0_i: Array, v0_i: Array, ts: u.Q
+    true_pot: gp.AbstractPotential, q0_i: Array, v0_i: Array, ts: u.Quantity
 ) -> tuple[Array, Array]:
     w0_i = gc.PhaseSpacePosition(
-        q=u.Q(q0_i[None, :], usys["length"]),
-        p=u.Q(v0_i[None, :], usys["velocity"]),
+        q=u.Quantity(q0_i[None, :], usys["length"]),
+        p=u.Quantity(v0_i[None, :], usys["velocity"]),
     )
-    orbit_i = gd.evaluate_orbit(true_pot, w0_i, u.Q(ts, usys["time"]))
+    orbit_i = gd.evaluate_orbit(true_pot, w0_i, u.Quantity(ts, usys["time"]))
     return get_raw_orbit_coords(orbit_i, "q")[0], get_raw_orbit_coords(orbit_i, "p")[0]
 
 

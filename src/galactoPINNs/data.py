@@ -195,9 +195,9 @@ def _estimate_density_upper_bound(
     @jnp.vectorize
     def get_density(x: Scalar, y: Scalar, z: Scalar) -> Scalar:
         pos_grid = cx.CartesianPos3D(
-            x=u.Q(x, usys["length"]),
-            y=u.Q(y, usys["length"]),
-            z=u.Q(z, usys["length"]),
+            x=u.Quantity(x, usys["length"]),
+            y=u.Quantity(y, usys["length"]),
+            z=u.Quantity(z, usys["length"]),
         )
         return gp.density(pot, pos_grid, t=t).ustrip(usys)
 
@@ -272,11 +272,11 @@ def rejection_sample_sphere(
     def density_fn(xyz: Array) -> Array:
         """Evaluate density at positions xyz (N, 3) in kpc."""
         pos = cx.CartesianPos3D(
-            x=u.Q(xyz[:, 0], usys["length"]),
-            y=u.Q(xyz[:, 1], usys["length"]),
-            z=u.Q(xyz[:, 2], usys["length"]),
+            x=u.Quantity(xyz[:, 0], usys["length"]),
+            y=u.Quantity(xyz[:, 1], usys["length"]),
+            z=u.Quantity(xyz[:, 2], usys["length"]),
         )
-        t_q = u.Q(t, usys["time"])
+        t_q = u.Quantity(t, usys["time"])
         return gp.density(pot, pos, t=t_q).ustrip(usys)
 
     # Pre-allocate buffer for samples (oversize to avoid reallocation) We
@@ -459,11 +459,11 @@ def generate_static_data(
     @jax.jit
     def _evaluate(samples: Array) -> tuple[Array, Array, Array]:
         pos = cx.CartesianPos3D(
-            x=u.Q(samples[:, 0], usys["length"]),
-            y=u.Q(samples[:, 1], usys["length"]),
-            z=u.Q(samples[:, 2], usys["length"]),
+            x=u.Quantity(samples[:, 0], usys["length"]),
+            y=u.Quantity(samples[:, 1], usys["length"]),
+            z=u.Quantity(samples[:, 2], usys["length"]),
         )
-        a = plum.convert(potential.acceleration(pos, t=0), u.Q).ustrip(usys)
+        a = plum.convert(potential.acceleration(pos, t=0), u.Quantity).ustrip(usys)
         pot = potential.potential(pos, t=0).ustrip(usys)
         return samples, a, pot
 
@@ -581,14 +581,14 @@ def generate_time_dep_data(
         potential: Any, t_myr: float
     ) -> Callable[[Array], tuple[Array, Array, Array]]:
         """Create a JIT-compiled evaluation function for a specific time."""
-        t_q = u.Q(t_myr, usys["time"])
+        t_q = u.Quantity(t_myr, usys["time"])
 
         def _evaluate_raw(samples: Array) -> tuple[Array, Array, Array]:
             x, y, z = samples.T
             pos = cx.CartesianPos3D(
-                x=u.Q(x, usys["length"]),
-                y=u.Q(y, usys["length"]),
-                z=u.Q(z, usys["length"]),
+                x=u.Quantity(x, usys["length"]),
+                y=u.Quantity(y, usys["length"]),
+                z=u.Quantity(z, usys["length"]),
             )
             acc = potential.acceleration(pos, t=t_q)
             pot = potential.potential(pos, t=t_q).ustrip("kpc2/Myr2")
@@ -1044,9 +1044,9 @@ def scale_data(
     if config.get("include_analytic", False):
         lf_potential = config["ab_potential"]
         pos = cx.CartesianPos3D(
-            x=u.Q(data_dict["x_train"][:, 0], usys["length"]),
-            y=u.Q(data_dict["x_train"][:, 1], usys["length"]),
-            z=u.Q(data_dict["x_train"][:, 2], usys["length"]),
+            x=u.Quantity(data_dict["x_train"][:, 0], usys["length"]),
+            y=u.Quantity(data_dict["x_train"][:, 1], usys["length"]),
+            z=u.Quantity(data_dict["x_train"][:, 2], usys["length"]),
         )
         u_analytic = lf_potential.potential(pos, 0).ustrip("kpc2/Myr2")
         u_residual = data_dict["u_train"] - u_analytic
@@ -1152,11 +1152,11 @@ def scale_data_time(
     if config.get("include_analytic", False):
         analytic_baseline = config["ab_potential"]
         pos = cx.CartesianPos3D(
-            x=u.Q(x_concat[:, 0], usys["length"]),
-            y=u.Q(x_concat[:, 1], usys["length"]),
-            z=u.Q(x_concat[:, 2], usys["length"]),
+            x=u.Quantity(x_concat[:, 0], usys["length"]),
+            y=u.Quantity(x_concat[:, 1], usys["length"]),
+            z=u.Quantity(x_concat[:, 2], usys["length"]),
         )
-        t_quant = u.Q(t_concat, usys["time"])
+        t_quant = u.Quantity(t_concat, usys["time"])
         u_analytic = analytic_baseline.potential(pos, t_quant).ustrip("kpc2/Myr2")
         u_resid = u_concat - u_analytic
         u_star = float(jnp.max(jnp.abs(u_resid)))
