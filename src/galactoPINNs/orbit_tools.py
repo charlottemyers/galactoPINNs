@@ -76,6 +76,7 @@ def orbit_energy(pot: gp.AbstractPotential, w: gd.Orbit | Array, ts: Array) -> A
         ``kpc^2/Myr^2``.
 
     """
+<<<<<<< HEAD
     if isinstance(w, gd.Orbit):
         x = plum.convert(w.q, u.Quantity).ustrip(usys["length"])
         v = plum.convert(w.p, u.Quantity).ustrip(usys["speed"])
@@ -83,6 +84,28 @@ def orbit_energy(pot: gp.AbstractPotential, w: gd.Orbit | Array, ts: Array) -> A
         x, v = w[..., :3], w[..., 3:]
     T = 0.5 * (v**2).sum(axis=-1)
     Phi = u.ustrip(usys, pot.potential(u.Quantity(x, usys["length"]), t=ts))
+=======
+    unit_x = orbit.q.x.unit
+    qx = orbit.q.x.to_value(unit_x)
+    qy = orbit.q.y.to_value(unit_x)
+    qz = orbit.q.z.to_value(unit_x)
+
+    coords = jnp.stack([qx, qy, qz], axis=-1)
+    if coords.ndim == 3:
+        coords = coords.squeeze(0)
+    x = u.Quantity(coords, unit_x)
+
+    unit_v = orbit.p.x.unit
+    vx = orbit.p.x.to_value(unit_v)
+    vy = orbit.p.y.to_value(unit_v)
+    vz = orbit.p.z.to_value(unit_v)
+
+    vels = jnp.stack([vx, vy, vz], axis=-1)
+    if vels.ndim == 3:
+        vels = vels.squeeze(0)
+    T = 0.5 * (vels**2).sum(axis=-1)
+    Phi = u.ustrip("kpc2/Myr2", pot.potential(x, t=ts))
+>>>>>>> origin/main
     return T + Phi
 
 
@@ -306,16 +329,26 @@ def get_w0s_from_data(
         idx = rng.integers(0, x_test.shape[0])
         x_random = x_test[idx]
         w_dummy = gc.PhaseSpaceCoordinate(
+<<<<<<< HEAD
             q=u.Quantity([x_random], usys["length"]),
             p=u.Quantity([0, 0, 0], usys["velocity"]),
             t=u.Quantity([0], usys["time"]),
+=======
+            q=u.Quantity([x_random], "kpc"),
+            p=u.Quantity([0, 0, 0], "kpc/Myr"),
+            t=u.Quantity([0], "Myr"),
+>>>>>>> origin/main
         )
         vc = true_potential.local_circular_velocity(w_dummy)
         r = np.linalg.norm(x_random)
         v_vec = vc * np.array([-x_random[1], x_random[0], 0.0]) / r
+<<<<<<< HEAD
         w0 = gc.PhaseSpacePosition(
             q=u.Quantity(x_random, usys["length"]), p=u.Quantity(v_vec, usys["velocity"])
         )
+=======
+        w0 = gc.PhaseSpacePosition(q=u.Quantity(x_random, "kpc"), p=v_vec)
+>>>>>>> origin/main
         w0s.append(w0)
     return w0s
 
@@ -456,10 +489,17 @@ def compose_velocity_bound_safe(
     ang = jr.uniform(subkey, shape=(N, 1), minval=0.0, maxval=2.0 * jnp.pi)
     e_t = jnp.cos(ang) * e_t1 + jnp.sin(ang) * e_t2
 
+<<<<<<< HEAD
     qQ = u.Quantity(q_phys, usys["length"])
     v_circ = (
         gp.local_circular_velocity(pot_for_vcirc, qQ, t=u.Quantity(0.0, usys["time"]))
         .ustrip(usys["velocity"])
+=======
+    qQ = u.Quantity(q_phys, "kpc")
+    v_circ = (
+        gp.local_circular_velocity(pot_for_vcirc, qQ, t=u.Quantity(0.0, "Gyr"))
+        .to_value("kpc/Myr")
+>>>>>>> origin/main
         .reshape(N, 1)
     )
 
@@ -475,8 +515,13 @@ def compose_velocity_bound_safe(
     v = v * jnp.minimum(1.0, cap_vs_vcirc * v_circ / (speed + 1e-12))
 
     phi = (
+<<<<<<< HEAD
         pot_for_escape.potential(qQ, t=u.Quantity(0.0, usys["time"]))
         .ustrip(usys)
+=======
+        pot_for_escape.potential(qQ, t=u.Quantity(0.0, "Gyr"))
+        .to_value("kpc2/Myr2")
+>>>>>>> origin/main
         .reshape(N, 1)
     )
 
@@ -627,6 +672,23 @@ def integrate_orbit_batch(
         Integrated velocities, shape ``(B, T, 3)`` in ``kpc/Myr``.
 
     """
+<<<<<<< HEAD
     return jax.vmap(integrate_one, in_axes=(None, 0, 0, None))(
         true_pot, q0_phys, v0_phys, ts_myr
     )
+=======
+    B = q0_phys.shape[0]
+    ts_Q = u.Quantity(jnp.asarray(ts_myr), "Myr")
+    q_list, p_list = [], []
+    for b in range(B):
+        w0 = gc.PhaseSpacePosition(
+            q=u.Quantity(q0_phys[b][None, :], "kpc"),
+            p=u.Quantity(v0_phys[b][None, :], "kpc/Myr"),
+        )
+        orb = gd.evaluate_orbit(true_pot, w0, ts_Q)
+        q_list.append(get_raw_orbit_coords(orb, c="q")[0])
+        p_list.append(get_raw_orbit_coords(orb, c="p")[0])
+    q_seq_phys = jnp.array(jnp.stack(q_list, axis=0))
+    p_seq_phys = jnp.array(jnp.stack(p_list, axis=0))
+    return q_seq_phys, p_seq_phys
+>>>>>>> origin/main

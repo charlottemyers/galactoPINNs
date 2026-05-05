@@ -189,6 +189,7 @@ def _estimate_density_upper_bound(
     X, Y, Z = jnp.meshgrid(side, side, side, indexing="ij")
     mask = r_max >= jnp.sqrt(X**2 + Y**2 + Z**2)  # shape (grid_n, grid_n, grid_n)
 
+<<<<<<< HEAD
     # jnp.vectorize + jax.jit: traces the scalar fn once, vectorizes in XLA
     # over the full meshgrid shape — no ravel needed.
     @jax.jit
@@ -203,11 +204,43 @@ def _estimate_density_upper_bound(
 
     rho_grid = get_density(X, Y, Z)
     rho_max = jnp.max(jnp.where(mask, rho_grid, -jnp.inf))
+=======
+    pos_grid = cx.CartesianPos3D(
+        x=u.Quantity(X[mask].ravel(), "kpc"),
+        y=u.Quantity(Y[mask].ravel(), "kpc"),
+        z=u.Quantity(Z[mask].ravel(), "kpc"),
+    )
+    rho_grid = gp.density(galax_pot, pos_grid, t=t).value
+    rho_max = float(jnp.max(rho_grid))
+>>>>>>> origin/main
 
     # Inflate; prevents acceptance probability > 1 when grid misses maxima.
     return safety_factor * rho_max
 
 
+<<<<<<< HEAD
+=======
+def _make_density_fn(galax_pot: Any, t: float) -> Callable[[Array], Array]:
+    """Create a JIT-compiled density evaluation function.
+
+    Returns a function that takes raw (N, 3) position arrays (in kpc)
+    and returns density values, bypassing coordinax overhead in the hot path.
+    """
+    t_q = u.Quantity(t, "Myr")
+
+    def _density_raw(xyz: Array) -> Array:
+        """Evaluate density at positions xyz (N, 3) in kpc."""
+        pos = cx.CartesianPos3D(
+            x=u.Quantity(xyz[:, 0], "kpc"),
+            y=u.Quantity(xyz[:, 1], "kpc"),
+            z=u.Quantity(xyz[:, 2], "kpc"),
+        )
+        return gp.density(galax_pot, pos, t=t_q).value
+
+    return jax.jit(_density_raw)
+
+
+>>>>>>> origin/main
 def rejection_sample_sphere(
     pot: Any,
     n_samples: int,
@@ -445,6 +478,33 @@ def generate_static_data(
 
     """
 
+<<<<<<< HEAD
+=======
+    def _make_evaluate_fn(
+        potential: Any, t: float
+    ) -> Callable[[Array], tuple[Array, Array, Array]]:
+        """Create a JIT-compiled evaluation function for positions.
+
+        Returns a function that takes raw (N, 3) position arrays (in kpc)
+        and returns (positions, accelerations, potentials).
+        """
+        t_q = u.Quantity(t, "Myr")
+
+        def _evaluate_raw(samples: Array) -> tuple[Array, Array, Array]:
+            x, y, z = samples.T
+            pos = cx.CartesianPos3D(
+                x=u.Quantity(x, "kpc"),
+                y=u.Quantity(y, "kpc"),
+                z=u.Quantity(z, "kpc"),
+            )
+            acc = potential.acceleration(pos, t=t_q)
+            pot = potential.potential(pos, t=t_q).value
+            a = jnp.stack([acc.x.value, acc.y.value, acc.z.value], axis=1)
+            return samples, a, pot
+
+        return jax.jit(_evaluate_raw)
+
+>>>>>>> origin/main
     def _append_points(base: Array, extra: ArrayLike | None) -> Array:
         if extra is None:
             return base
@@ -581,14 +641,24 @@ def generate_time_dep_data(
         potential: Any, t_myr: float
     ) -> Callable[[Array], tuple[Array, Array, Array]]:
         """Create a JIT-compiled evaluation function for a specific time."""
+<<<<<<< HEAD
         t_q = u.Quantity(t_myr, usys["time"])
+=======
+        t_q = u.Quantity(t_myr, "Myr")
+>>>>>>> origin/main
 
         def _evaluate_raw(samples: Array) -> tuple[Array, Array, Array]:
             x, y, z = samples.T
             pos = cx.CartesianPos3D(
+<<<<<<< HEAD
                 x=u.Quantity(x, usys["length"]),
                 y=u.Quantity(y, usys["length"]),
                 z=u.Quantity(z, usys["length"]),
+=======
+                x=u.Quantity(x, "kpc"),
+                y=u.Quantity(y, "kpc"),
+                z=u.Quantity(z, "kpc"),
+>>>>>>> origin/main
             )
             acc = potential.acceleration(pos, t=t_q)
             pot = potential.potential(pos, t=t_q).ustrip("kpc2/Myr2")
@@ -1044,9 +1114,15 @@ def scale_data(
     if config.get("include_analytic", False):
         lf_potential = config["ab_potential"]
         pos = cx.CartesianPos3D(
+<<<<<<< HEAD
             x=u.Quantity(data_dict["x_train"][:, 0], usys["length"]),
             y=u.Quantity(data_dict["x_train"][:, 1], usys["length"]),
             z=u.Quantity(data_dict["x_train"][:, 2], usys["length"]),
+=======
+            x=u.Quantity(data_dict["x_train"][:, 0], "kpc"),
+            y=u.Quantity(data_dict["x_train"][:, 1], "kpc"),
+            z=u.Quantity(data_dict["x_train"][:, 2], "kpc"),
+>>>>>>> origin/main
         )
         u_analytic = lf_potential.potential(pos, 0).ustrip("kpc2/Myr2")
         u_residual = data_dict["u_train"] - u_analytic
@@ -1152,11 +1228,19 @@ def scale_data_time(
     if config.get("include_analytic", False):
         analytic_baseline = config["ab_potential"]
         pos = cx.CartesianPos3D(
+<<<<<<< HEAD
             x=u.Quantity(x_concat[:, 0], usys["length"]),
             y=u.Quantity(x_concat[:, 1], usys["length"]),
             z=u.Quantity(x_concat[:, 2], usys["length"]),
         )
         t_quant = u.Quantity(t_concat, usys["time"])
+=======
+            x=u.Quantity(x_concat[:, 0], "kpc"),
+            y=u.Quantity(x_concat[:, 1], "kpc"),
+            z=u.Quantity(x_concat[:, 2], "kpc"),
+        )
+        t_quant = u.Quantity(t_concat, "Myr")
+>>>>>>> origin/main
         u_analytic = analytic_baseline.potential(pos, t_quant).ustrip("kpc2/Myr2")
         u_resid = u_concat - u_analytic
         u_star = float(jnp.max(jnp.abs(u_resid)))
