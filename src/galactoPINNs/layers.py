@@ -448,6 +448,18 @@ class TrainableGalaxPotential(nnx.Module):
                 params[name] = val
         return params
 
+    def potential(self, positions: Array, t: Any = 0) -> Array:
+        """Evaluate the potential energy of the trainable potential."""
+        built_params = self._get_built_params()
+        pot = self.PotClass(**built_params, units="galactic")
+        return pot.potential(positions, t=t)
+
+    def acceleration(self, positions: Array, t: Any = 0) -> Array:
+        """Evaluate the acceleration of the trainable potential."""
+        built_params = self._get_built_params()
+        pot = self.PotClass(**built_params, units="galactic")
+        return pot.acceleration(positions, t=t)
+
     def __call__(self, positions: Array, t: Any = 0) -> tuple[Array, Array]:
         """Evaluate the trainable potential at given positions.
 
