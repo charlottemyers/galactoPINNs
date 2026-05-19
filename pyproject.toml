@@ -9,7 +9,7 @@ classifiers = [
 dependencies = [
   "galax",
   "numpy>=2.3.5",
-  "unxt>=1.7.0,<1.8.0",
+  "unxt>=1.11",
   "xmmutablemap>=0.2.1",
   "jaxtyping>=0.3.6",
   "equinox>=0.13.3",
@@ -23,7 +23,7 @@ dynamic = ["version"]
 license.file = "LICENSE"
 name = "galactoPINNs"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 
 [project.urls]
 Homepage = "https://github.com/charlottemyers/galactoPINNs"
@@ -43,6 +43,8 @@ dev = [
   "ipykernel>=7.1.0",
   "matplotlib>=3.10.8",
   "cz-conventional-gitmoji>=0.6.1",
+  "scikit-learn>=1.8.0",
+  "seaborn>=0.13.2",
 ]
 
 
@@ -75,7 +77,7 @@ addopts = [
   "-p no:doctest",    # using sybil
   "-ra",
 ]
-filterwarnings = ["error",   "ignore::DeprecationWarning"]
+filterwarnings = ["error", "ignore::DeprecationWarning"]
 log_level = "INFO"
 minversion = "8.3"
 testpaths = ["README.md", "src/", "tests/"]
@@ -83,7 +85,7 @@ xfail_strict = true
 
 
 [tool.repo-review]
-ignore = ["MY100", "PC140", "PY004"]
+ignore = ["MY100", "PC140", "PP004", "PY004"]
 
 
 [tool.ruff]
@@ -101,6 +103,7 @@ ignore = [
   "D213",    # Multi-line docstring summary should start at the second line
   "E731",    # Do not assign a lambda expression, use a def
   "EM101",   # Exception must not use a string literal
+  "EM102",   # Exception must not use an f-string literal
   "ERA001",  # Commented out code
   "F722",    # Syntax error in forward annotation <- jaxtyping
   "F821",    # undefined name '...'  <- jaxtyping
@@ -120,6 +123,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+"*.ipynb" = ["T201"]
 "**tests/**" = [
   "ANN",
   "ARG002",
@@ -142,4 +146,4 @@ docstring-code-format = true
 
 [tool.uv.sources.galax]
 git = "https://github.com/GalacticDynamics/galax"
-rev = "86ae1747faeab729f5bc42239d61e59217cd780d"
+rev = "98ac49740b17621360d813447223e702770503ac"

@@ -8,8 +8,9 @@ __all__ = (
     "compute_delta_phi_per_point_gl3panels",
 )
 
+import functools as ft
 from collections.abc import Callable, Mapping
-from typing import Any, Literal, Protocol, TypedDict
+from typing import Any, Literal, TypedDict
 
 import diffrax as dfx
 import jax
@@ -18,35 +19,29 @@ from flax import nnx
 from jaxtyping import Array
 
 from galactoPINNs.layers import (
+    MLP,
     CartesianToModifiedSphericalLayer,
     FuseandBoundary,
     ScaleNNPotentialLayer,
-    SmoothMLP,
     TrainableGalaxPotential,
 )
 
 Mode = Literal["full", "potential", "acceleration", "density"]
+
+
 class ExternalPytree(nnx.Variable):
     """Variable wrapper for external pytrees (like equinox modules).
 
-    This allows galax potentials (which are equinox modules containing JAX arrays)
-    to be stored as attributes in NNX modules without triggering pytree inspection errors.
-    Access the wrapped object via the `.value` attribute.
+    This allows galax potentials (which are equinox modules containing JAX
+    arrays) to be stored as attributes in NNX modules without triggering pytree
+    inspection errors.  Access the wrapped object via the `.value` attribute.
     """
 
-
-
-# --- Typing for the analytic potential ---
-try:
-    from galax.potential import AbstractPotential as GalaxPotential
-except Exception:  # noqa: BLE001
-    class GalaxPotential(Protocol):
-        def potential(self,    positions: Any, *, t: Any = ...) -> Any: ...
-        def acceleration(self, positions: Any, *, t: Any = ...) -> Any: ...
 
 # ----------------------------
 # Delta-phi integration helpers
 # ----------------------------
+
 
 class NODEOutputs(TypedDict, total=False):
     """Standardized outputs returned by NODEModel.__call__."""
@@ -292,18 +287,20 @@ class NODEModel(nnx.Module):
     Parameters
     ----------
     config
-        Configuration dict used by layers and integration routing.
-        Expected keys include:
+        Configuration dict used by layers and integration routing.  Expected
+        keys include:
           - "activation" (callable, i.e. jax.nn.tanh): activation for MLPs
           - "delta_phi_depth", "delta_phi_width" (optional)
           - "initial_correction_depth", "initial_correction_width" (optional)
-          - "integration_mode" (optional): {"gl3", "diffrax_batch", "diffrax_per_point", "gl3panels"}
+          - "integration_mode" (optional): {"gl3", "diffrax_batch",
+            "diffrax_per_point", "gl3panels"}
           - "include_analytic" (bool)
-          - plus transformer and analytic-function keys used by ScaleNNPotentialLayer
-            and AnalyticModelLayer.
+          - plus transformer and analytic-function keys used by
+            ScaleNNPotentialLayer and AnalyticModelLayer.
     in_features
-        The number of spatial input features. Typically 5 for modified spherical coordinates.
-        The delta_phi network takes (in_features + 1) features for [t, sph_features...].
+        The number of spatial input features. Typically 5 for modified spherical
+        coordinates.  The delta_phi network takes (in_features + 1) features for
+        [t, sph_features...].
     rngs
         Random number generator state for parameter initialization.
 
@@ -334,13 +331,9 @@ class NODEModel(nnx.Module):
         self.trainable_analytic_layer = trainable_analytic_layer
 
         # --- Prepare cleaned config dicts ---
-        config_without_ab = {
-            k: v for k, v in config.items()
-            if k != "ab_potential"
-        }
+        config_without_ab = {k: v for k, v in config.items() if k != "ab_potential"}
         config_without_externals = {
-            k: v for k, v in config.items()
-            if k not in ("ab_potential", "scale")
+            k: v for k, v in config.items() if k not in ("ab_potential", "scale")
         }
 
         self.config = config_without_externals
@@ -355,7 +348,7 @@ class NODEModel(nnx.Module):
             raise TypeError(msg)
 
         # --- Initialize coordinate transform layer ---
-        self.cart_to_sph_layer = CartesianToModifiedSphericalLayer(
+        self.input_encoder = CartesianToModifiedSphericalLayer(
             clip=config.get("clip", 1.0)
         )
 
@@ -364,7 +357,8 @@ class NODEModel(nnx.Module):
         raw_scale = config.get("scale", "one")
 
         if isinstance(raw_scale, str):
-            # String mode ("one", "power", "nfw") - handled internally by ScaleNNPotentialLayer
+            # String mode ("one", "power", "nfw") - handled internally by
+            # ScaleNNPotentialLayer
             wrapped_scale_potential = None
         elif isinstance(raw_scale, (jnp.ndarray, jax.Array)):
             wrapped_scale_potential = None
@@ -388,7 +382,7 @@ class NODEModel(nnx.Module):
             mlp_common["act"] = activation
 
         # delta_phi_net takes [t, sph_features...] so has (in_features + 1) inputs
-        self.delta_phi_net = SmoothMLP(
+        self.delta_phi_net = MLP(
             in_features=in_features + 1,
             depth=config.get("delta_phi_depth", 4),
             width=config.get("delta_phi_width", 128),
@@ -396,7 +390,7 @@ class NODEModel(nnx.Module):
         )
 
         # initial_correction_net takes spatial features only
-        self.initial_correction_net = SmoothMLP(
+        self.initial_correction_net = MLP(
             in_features=in_features,
             depth=config.get("initial_correction_depth", 4),
             width=config.get("initial_correction_width", 128),
@@ -428,9 +422,11 @@ class NODEModel(nnx.Module):
             Potential values with ``.squeeze()`` applied.
 
         """
-        return self(tx_cart, mode="potential", trainable_analytic_layer=trainable_analytic_layer)["potential"].squeeze()
+        return self(
+            tx_cart, mode="potential", trainable_analytic_layer=trainable_analytic_layer
+        )["potential"].squeeze()
 
-    def __call__(
+    def __call__(  # noqa: C901
         self,
         tx_cart: Array,
         mode: Mode = "full",
@@ -449,6 +445,11 @@ class NODEModel(nnx.Module):
             - "potential": compute/return only the potential.
             - "acceleration": compute/return acceleration.
             - "density": compute/return potential, acceleration, and Laplacian.
+        trainable_analytic_layer
+            Optional trainable analytic layer to use in place of
+            ``self.trainable_analytic_layer``. Required when
+            ``config["trainable"]`` is ``True`` and the layer is passed
+            externally (e.g. during SVI).
 
         Returns
         -------
@@ -461,11 +462,11 @@ class NODEModel(nnx.Module):
         tx_cart = jnp.atleast_2d(tx_cart)
 
         # --- Split time and space ---
-        t = tx_cart[:, :1]        # (N, 1)
+        t = tx_cart[:, :1]  # (N, 1)
         x_cart = tx_cart[:, 1:4]  # (N, 3)
 
         # --- Coordinate transformation ---
-        x_sph = self.cart_to_sph_layer(x_cart)
+        x_sph = self.input_encoder(x_cart)
 
         # --- Build [t, sph_features...] for delta_phi network ---
         tx_sph = jnp.concatenate([t, x_sph], axis=1)
@@ -508,29 +509,49 @@ class NODEModel(nnx.Module):
             t_phys = self.config["t_transformer"].inverse_transform(tx_cart[:, 0])
 
             if self.config.get("trainable", False):
-                layer = trainable_analytic_layer if trainable_analytic_layer is not None else self.trainable_analytic_layer
+                layer = (
+                    trainable_analytic_layer
+                    if trainable_analytic_layer is not None
+                    else self.trainable_analytic_layer
+                )
                 if layer is None:
-                    raise ValueError("config['trainable']=True but no trainable_analytic_layer was provided.")
-                def _layer_at(pos, t):
+                    raise ValueError(
+                        "config['trainable']=True but no "
+                        "trainable_analytic_layer was provided."
+                    )
+
+                def _layer_at(pos: Array, t: Array) -> tuple[Array, Array]:
                     phi, r_s = layer(pos[None], t)
                     return jnp.squeeze(phi), r_s
+
                 u_phys, r_s_arr = jax.vmap(_layer_at)(x_phys, t_phys)
                 r_s_learned = r_s_arr[0]
-                analytic_potential_scaled = self.config["u_transformer"].transform(u_phys)
+                analytic_potential_scaled = self.config["u_transformer"].transform(
+                    u_phys
+                )
             elif self.ab_potential is not None:
-                def potential_fn(pos, t):
+
+                def potential_fn(pos: Array, t: Array) -> Array:
                     return self.ab_potential.value.potential(pos, t)
+
                 u_phys = jax.vmap(potential_fn)(x_phys, t_phys)
 
-                def acceleration_fn(pos, t):
+                def acceleration_fn(pos: Array, t: Array) -> Array:
                     return self.ab_potential.value.acceleration(pos, t)
+
                 a_phys = jax.vmap(acceleration_fn)(x_phys, t_phys)
 
-                analytic_potential_scaled = self.config["u_transformer"].transform(u_phys)
-                analytic_acceleration_scaled = self.config["a_transformer"].transform(a_phys)
+                analytic_potential_scaled = self.config["u_transformer"].transform(
+                    u_phys
+                )
+                analytic_acceleration_scaled = self.config["a_transformer"].transform(
+                    a_phys
+                )
 
         # --- Neural network potential (scaled) ---
-        scaled_nn_potential = self.scale_layer(x_cart, total_correction, r_s_learned=r_s_learned)
+        scaled_nn_potential = self.scale_layer(
+            x_cart, total_correction, r_s=r_s_learned
+        )
 
         # --- Combine potentials ---
         fused_potential = scaled_nn_potential + analytic_potential_scaled
@@ -558,11 +579,14 @@ class NODEModel(nnx.Module):
         # derivatives can be NaN and poison the second-order backward pass used
         # by the training loop.
         def _pot_fn(tx: Array) -> Array:
-            return self.compute_potential(tx, trainable_analytic_layer=trainable_analytic_layer).squeeze()
+            return self.compute_potential(
+                tx, trainable_analytic_layer=trainable_analytic_layer
+            ).squeeze()
 
         def _accel_single(tx_single: Array) -> Array:
             def _pot_wrt_x(x3: Array) -> Array:
                 return _pot_fn(tx_single.at[1:4].set(x3))
+
             return -jax.grad(_pot_wrt_x)(tx_single[1:4])
 
         acceleration = jax.vmap(_accel_single)(tx_cart)
@@ -573,3 +597,42 @@ class NODEModel(nnx.Module):
             "acceleration": acceleration,
             "analytic_acceleration_scaled": analytic_acceleration_scaled,
         }
+
+    def potential_acceleration(
+        self,
+        tx_cart: Array,
+        /,
+        trainable_analytic_layer: TrainableGalaxPotential | None = None,
+    ) -> tuple[Array, Array]:
+        """Compute potential and acceleration jointly via ``value_and_grad``.
+
+        Parameters
+        ----------
+        tx_cart
+            Time+position inputs, shape ``(N, 4)``.
+        trainable_analytic_layer
+            Optional trainable analytic layer forwarded to
+            :meth:`compute_potential`.
+
+        Returns
+        -------
+        potential
+            Potential values, shape ``(N,)``.
+        acceleration
+            Acceleration vectors, shape ``(N, 3)``.
+
+        """
+        return _node_pot_and_grad(self, tx_cart, trainable_analytic_layer)
+
+
+@ft.partial(jax.vmap, in_axes=(None, 0, None))
+def _node_pot_and_grad(
+    model: NODEModel, tx: Array, tal: TrainableGalaxPotential | None
+) -> tuple[Array, Array]:
+    """Vmapped value+grad of :meth:`NODEModel.compute_potential` w.r.t. x,y,z."""
+
+    def _pot_wrt_x(x3: Array) -> Array:
+        return model.compute_potential(tx.at[1:4].set(x3), trainable_analytic_layer=tal)
+
+    phi, grad_x = jax.value_and_grad(_pot_wrt_x)(tx[1:4])
+    return phi, -grad_x

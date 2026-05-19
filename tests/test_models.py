@@ -4,9 +4,11 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from galactoPINNs.layers import MLP, ZeroPotential
 from galactoPINNs.models.static_model import StaticModel
 
 
+@jax.tree_util.register_static
 class MockTransformer:
     """Mock transformer for testing."""
 
@@ -17,6 +19,7 @@ class MockTransformer:
         return x
 
 
+@jax.tree_util.register_static
 class MockAnalyticPotential:
     """Mock analytic potential for testing."""
 
@@ -30,18 +33,6 @@ class MockAnalyticPotential:
         r = jnp.linalg.norm(x, axis=-1, keepdims=True)
         return -x / (r**3 + 0.01)
 
-# Register mock classes as JAX pytrees for JIT compatibility
-jax.tree_util.register_pytree_node(
-    MockTransformer,
-    lambda obj: ((), None),
-    lambda aux, children: MockTransformer(),
-)
-
-jax.tree_util.register_pytree_node(
-    MockAnalyticPotential,
-    lambda obj: ((), None),
-    lambda aux, children: MockAnalyticPotential(),
-)
 
 def make_minimal_config(*, include_analytic: bool = False) -> dict:
     """Create a minimal configuration for testing."""
@@ -50,11 +41,9 @@ def make_minimal_config(*, include_analytic: bool = False) -> dict:
         "u_transformer": MockTransformer(),
         "a_transformer": MockTransformer(),
         "r_s": 1.0,
-        "clip": 1.0,
         "scale": "one",
         "include_analytic": include_analytic,
         "ab_potential": MockAnalyticPotential(),
-        "convert_to_spherical": True,
         "trainable": False,
         "enforce_boundary": False,
         "depth": 2,
@@ -74,11 +63,11 @@ class TestStaticModel:
         # Config is filtered and wrapped, so check contents not identity
         assert model.config is not None
         assert "r_s" in model.config
-        assert model.cart_to_sph_layer is not None
+        assert model.input_encoder is not None
         assert model.scale_layer is not None
         # fuse_layer was removed - now using direct addition
         assert model.fuse_boundary_layer is not None
-        assert model.mlp is not None
+        assert isinstance(model.nn_potential, MLP)
 
     def test_init_nn_off(self):
         """Test initialization with NN disabled."""
@@ -86,35 +75,32 @@ class TestStaticModel:
         config["nn_off"] = True
         model = StaticModel(config, in_features=5, rngs=nnx.Rngs(0))
 
-        assert model.mlp is None
-        assert model.nn_off is True
+        assert isinstance(model.nn_potential, ZeroPotential)
 
     def test_forward_potential_mode(self):
-        """Test forward pass in potential-only mode."""
+        """Test forward pass returns potential."""
         config = make_minimal_config()
         model = StaticModel(config, in_features=5, rngs=nnx.Rngs(0))
 
         x = jnp.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
-        outputs = model(x, mode="potential")
+        potential = model(x)
 
-        assert "potential" in outputs
-        assert outputs["potential"].shape == (2,)
-        assert jnp.isfinite(outputs["potential"]).all()
+        assert potential.shape == (2,)
+        assert jnp.isfinite(potential).all()
 
     def test_forward_full_mode(self):
-        """Test forward pass in full mode (potential + acceleration)."""
+        """Test forward pass for potential and acceleration."""
         config = make_minimal_config()
         model = StaticModel(config, in_features=5, rngs=nnx.Rngs(0))
 
         x = jnp.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
-        outputs = model(x, mode="full")
+        potential = model(x)
+        acceleration = model.acceleration(x)
 
-        assert "potential" in outputs
-        assert "acceleration" in outputs
-        assert outputs["potential"].shape == (2,)
-        assert outputs["acceleration"].shape == (2, 3)
-        assert jnp.isfinite(outputs["potential"]).all()
-        assert jnp.isfinite(outputs["acceleration"]).all()
+        assert potential.shape == (2,)
+        assert acceleration.shape == (2, 3)
+        assert jnp.isfinite(potential).all()
+        assert jnp.isfinite(acceleration).all()
 
     def test_compute_potential(self):
         """Test compute_potential method."""
@@ -140,13 +126,13 @@ class TestStaticModel:
         assert potential.shape == (2,)
         assert jnp.isfinite(potential).all()
 
-    def test_compute_laplacian(self):
-        """Test compute_laplacian method."""
+    def test_laplacian(self):
+        """Test laplacian method."""
         config = make_minimal_config()
         model = StaticModel(config, in_features=5, rngs=nnx.Rngs(0))
 
         x = jnp.array([[1.0, 2.0, 3.0]])
-        laplacian = model.compute_laplacian(x)
+        laplacian = model.laplacian(x)
 
         assert laplacian.shape == (1,)
         assert jnp.isfinite(laplacian).all()
@@ -158,13 +144,12 @@ class TestStaticModel:
 
         @nnx.jit
         def forward(model, x):
-            return model(x, mode="potential")
+            return model(x)
 
         x = jnp.array([[1.0, 0.0, 0.0]])
-        outputs = forward(model, x)
+        potential = forward(model, x)
 
-        assert "potential" in outputs
-        assert jnp.isfinite(outputs["potential"]).all()
+        assert jnp.isfinite(potential).all()
 
     def test_grad_compatible(self):
         """Test that gradients can be computed through the model."""
@@ -173,8 +158,7 @@ class TestStaticModel:
 
         def loss_fn(model):
             x = jnp.array([[1.0, 2.0, 3.0]])
-            outputs = model(x, mode="potential")
-            return jnp.sum(outputs["potential"] ** 2)
+            return jnp.sum(model(x) ** 2)
 
         grads = nnx.grad(loss_fn)(model)
         assert grads is not None
@@ -185,12 +169,11 @@ class TestStaticModel:
         model = StaticModel(config, in_features=5, rngs=nnx.Rngs(0))
 
         x = jnp.array([[1.0, 0.0, 0.0]])
-        outputs = model(x, mode="full")
+        potential = model(x)
+        acceleration = model.acceleration(x)
 
-        assert "potential" in outputs
-        assert "acceleration" in outputs
-        assert jnp.isfinite(outputs["potential"]).all()
-        assert jnp.isfinite(outputs["acceleration"]).all()
+        assert jnp.isfinite(potential).all()
+        assert jnp.isfinite(acceleration).all()
 
     def test_reproducible_with_same_seed(self):
         """Test that same seed produces same model outputs."""
@@ -202,8 +185,8 @@ class TestStaticModel:
 
         x = jnp.array([[1.0, 2.0, 3.0]])
 
-        out1 = model1(x, mode="potential")["potential"]
-        out2 = model2(x, mode="potential")["potential"]
+        out1 = model1(x)
+        out2 = model2(x)
 
         assert jnp.allclose(out1, out2)
 
@@ -217,8 +200,8 @@ class TestStaticModel:
 
         x = jnp.array([[1.0, 2.0, 3.0]])
 
-        out1 = model1(x, mode="potential")["potential"]
-        out2 = model2(x, mode="potential")["potential"]
+        out1 = model1(x)
+        out2 = model2(x)
 
         assert not jnp.allclose(out1, out2)
 
@@ -235,7 +218,7 @@ class TestStaticModelIntegration:
 
         @nnx.vmap(in_axes=(0,))
         def forward_single(x):
-            return model(x, mode="potential")["potential"]
+            return model(x)
 
         potentials = forward_single(x_batch)
         assert potentials.shape == (3, 1)
@@ -248,7 +231,7 @@ class TestStaticModelIntegration:
         @nnx.jit
         def compute_loss_and_grad(model, x):
             def loss_fn(m):
-                return jnp.mean(m(x, mode="potential")["potential"] ** 2)
+                return jnp.mean(m(x) ** 2)
 
             loss, grads = nnx.value_and_grad(loss_fn)(model)
             return loss, grads

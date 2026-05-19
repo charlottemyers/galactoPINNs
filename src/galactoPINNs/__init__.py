@@ -1,10 +1,7 @@
 """Physics-informed neural networks for modeling galactic gravitational potentials."""
 
-__all__ = ["__version__"]
+__all__ = ("__version__",)
 
-from importlib.metadata import version, PackageNotFoundError
+from importlib.metadata import version
 
-try:
-    __version__ = version("galactoPINNs")
-except PackageNotFoundError:
-    __version__ = "0+unknown"
+__version__ = version("galactoPINNs")

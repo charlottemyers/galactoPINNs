@@ -8,6 +8,7 @@ from galactoPINNs.inference import apply_model
 from galactoPINNs.models.static_model import StaticModel
 
 
+@jax.tree_util.register_static
 class MockTransformer:
     """Mock transformer for testing."""
 
@@ -18,6 +19,7 @@ class MockTransformer:
         return x
 
 
+@jax.tree_util.register_static
 class MockAnalyticPotential:
     """Mock analytic potential for testing."""
 
@@ -29,19 +31,6 @@ class MockAnalyticPotential:
         r = jnp.linalg.norm(x, axis=-1, keepdims=True)
         return -x / (r**3 + 0.01)
 
-# Register mock classes as JAX pytrees for JIT compatibility
-jax.tree_util.register_pytree_node(
-    MockTransformer,
-    lambda obj: ((), None),
-    lambda aux, children: MockTransformer(),
-)
-
-jax.tree_util.register_pytree_node(
-    MockAnalyticPotential,
-    lambda obj: ((), None),
-    lambda aux, children: MockAnalyticPotential(),
-)
-
 
 def make_minimal_config() -> dict:
     """Create a minimal configuration for testing."""
@@ -50,11 +39,9 @@ def make_minimal_config() -> dict:
         "u_transformer": MockTransformer(),
         "a_transformer": MockTransformer(),
         "r_s": 1.0,
-        "clip": 1.0,
         "scale": "one",
         "include_analytic": False,
         "ab_potential": MockAnalyticPotential(),
-        "convert_to_spherical": True,
         "trainable": False,
         "enforce_boundary": False,
         "depth": 2,
@@ -137,10 +124,11 @@ class TestNNXModelProtocol:
         assert callable(model)
 
         x = jnp.array([[1.0, 2.0, 3.0]])
-        result = model(x, mode="full")
+        potential = model(x)
+        acceleration = model.acceleration(x)
 
-        assert "potential" in result
-        assert "acceleration" in result
+        assert jnp.isfinite(potential).all()
+        assert jnp.isfinite(acceleration).all()
 
     def test_model_has_config(self):
         """Test that model has config attribute with expected keys."""
@@ -156,7 +144,6 @@ class TestNNXModelProtocol:
         assert "u_transformer" in model.config
         assert "a_transformer" in model.config
         assert "include_analytic" in model.config
-        assert "convert_to_spherical" in model.config
 
     def test_model_has_ab_potential(self):
         """Test that model stores ab_potential separately."""

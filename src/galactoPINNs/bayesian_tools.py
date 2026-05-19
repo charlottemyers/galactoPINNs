@@ -4,6 +4,7 @@ import copy
 from collections.abc import Callable, Mapping
 from typing import Any
 
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpyro
@@ -12,8 +13,9 @@ from flax import nnx
 from jaxtyping import Array
 from numpyro.contrib.module import random_nnx_module
 from numpyro.infer import SVI, Trace_ELBO, init_to_feasible
-from numpyro.infer.autoguide import AutoNormal, AutoLowRankMultivariateNormal
+from numpyro.infer.autoguide import AutoLowRankMultivariateNormal, AutoNormal
 from numpyro.optim import Adam
+
 from galactoPINNs.models.static_model import StaticModel
 
 
@@ -96,27 +98,31 @@ def model_svi(
 
     .. math::
 
-        \\mathcal{L}_{\\mathrm{acc}} = \\frac{1}{2\\sigma_a^2}
-        \\operatorname{E}\\left[\\|\\Delta a\\| +
-        \\lambda_{\\mathrm{rel}} \\frac{\\|\\Delta a\\|}{\\|a_{\\mathrm{obs}}\\|}\\right]
+        \mathcal{L}_{\mathrm{acc}} = \frac{1}{2\sigma_a^2}
+        \operatorname{E}\left[\|\Delta a\| +
+        \lambda_{\mathrm{rel}} \frac{\|\Delta a\|}{\|a_{\mathrm{obs}}\|}\right]
 
     The orbital energy loss penalises relative drift from the initial energy
     along each trajectory:
 
     .. math::
 
-        \\mathcal{L}_{\\mathrm{orbit}} = \\operatorname{E}\\left[
-        \\left(\\frac{E_t - E_0}{|E_0|}\\right)^2\\right]
+        \mathcal{L}_{\mathrm{orbit}} = \operatorname{E}\left[
+        \left(\frac{E_t - E_0}{|E_0|}\right)^2\right]
 
     """
     if config.get("trainable", False):
         log_m_halo = numpyro.sample(
             "log_m_halo",
-            dist.TruncatedNormal(scale=sigma_alpha, **analytic_param_dists["log_m_halo"]),
+            dist.TruncatedNormal(
+                scale=sigma_alpha, **analytic_param_dists["log_m_halo"]
+            ),
         )
         log_m_disk = numpyro.sample(
             "log_m_disk",
-            dist.TruncatedNormal(scale=sigma_alpha, **analytic_param_dists["log_m_disk"]),
+            dist.TruncatedNormal(
+                scale=sigma_alpha, **analytic_param_dists["log_m_disk"]
+            ),
         )
         log_rs = numpyro.sample(
             "log_rs",
@@ -124,18 +130,22 @@ def model_svi(
         )
         log_disk_a = numpyro.sample(
             "log_disk_a",
-            dist.TruncatedNormal(scale=sigma_alpha, **analytic_param_dists["log_disk_a"]),
+            dist.TruncatedNormal(
+                scale=sigma_alpha, **analytic_param_dists["log_disk_a"]
+            ),
         )
         log_disk_b = numpyro.sample(
             "log_disk_b",
-            dist.TruncatedNormal(scale=sigma_alpha, **analytic_param_dists["log_disk_b"]),
+            dist.TruncatedNormal(
+                scale=sigma_alpha, **analytic_param_dists["log_disk_b"]
+            ),
         )
 
-        halo_r_s  = jnp.exp(log_rs)
+        halo_r_s = jnp.exp(log_rs)
         halo_mass = jnp.exp(log_m_halo)
         disk_mass = jnp.exp(log_m_disk)
-        disk_a    = jnp.exp(log_disk_a)
-        disk_b    = jnp.exp(log_disk_b)
+        disk_a = jnp.exp(log_disk_a)
+        disk_b = jnp.exp(log_disk_b)
 
         analytic_kwargs: dict[str, Any] = {
             "init_disk_a": disk_a,
@@ -160,7 +170,7 @@ def model_svi(
                 ),
             )
             analytic_kwargs["init_bulge_mass"] = jnp.exp(log_bulge_mass)
-            analytic_kwargs["init_bulge_r_s"]  = jnp.exp(log_bulge_rs)
+            analytic_kwargs["init_bulge_r_s"] = jnp.exp(log_bulge_rs)
 
         trainable_analytic_layer = composite_form(**analytic_kwargs)
     else:
@@ -173,12 +183,18 @@ def model_svi(
     )
 
     if config.get("trainable", False):
-        out = bnn(x, trainable_analytic_layer=trainable_analytic_layer)
-    else:
-        out = bnn(x)
 
-    a_pred = out["acceleration"]
-    u_pred = out["potential"]
+        def _pot_fn(xi: Array, /) -> Array:
+            return bnn(
+                xi[None, :], trainable_analytic_layer=trainable_analytic_layer
+            ).squeeze()
+    else:
+
+        def _pot_fn(xi: Array, /) -> Array:
+            return bnn(xi[None, :]).squeeze()
+
+    u_pred, grads = jax.vmap(jax.value_and_grad(_pot_fn))(x)
+    a_pred = -grads
     numpyro.deterministic("acceleration", a_pred)
     numpyro.deterministic("potential", u_pred)
 
@@ -204,15 +220,15 @@ def model_svi(
             orbit_v_sub = orbit_p[idx]  # (n_sub, T, 3)
 
             B, T, _ = orbit_q_sub.shape
-            T_ke  = 0.5 * jnp.sum(orbit_v_sub**2, axis=-1)  # (B, T)
+            T_ke = 0.5 * jnp.sum(orbit_v_sub**2, axis=-1)  # (B, T)
             q_flat = orbit_q_sub.reshape(B * T, 3)
 
             if config.get("trainable", False):
                 phi = bnn(
                     q_flat, trainable_analytic_layer=trainable_analytic_layer
-                )["potential"].reshape(B, T)
+                ).reshape(B, T)
             else:
-                phi = bnn(q_flat)["potential"].reshape(B, T)
+                phi = bnn(q_flat).reshape(B, T)
 
             E = T_ke + phi  # (B, T)
 
@@ -221,6 +237,7 @@ def model_svi(
             L_orbit = jnp.mean(relative_drift**2)
             numpyro.factor("orbit_E_loss", -w_orbit * L_orbit)
 
+
 def make_guide_for_config(
     config: Mapping[str, Any],
     analytic_param_dists: Mapping[str, Mapping[str, Any]],
@@ -228,7 +245,7 @@ def make_guide_for_config(
     net_template: StaticModel,
     guide_type: str = "auto_normal",
     rank: int = 20,
-):
+) -> numpyro.infer.autoguide.AutoGuide:
     """Construct a variational guide for the model.
 
     Parameters
@@ -262,7 +279,9 @@ def make_guide_for_config(
     ``composite_form``, and ``net_template`` from ``**kw`` before forwarding
     to :func:`model_svi`, preventing duplicate-keyword errors when the guide
     is called with those keys present.
+
     """
+
     def _guided_model(x: Array, a_obs: Array | None = None, **kw: Any) -> None:
         kw.pop("config", None)
         kw.pop("analytic_param_dists", None)
@@ -280,20 +299,16 @@ def make_guide_for_config(
 
     if guide_type == "auto_normal":
         return AutoNormal(_guided_model, init_loc_fn=init_to_feasible)
-    elif guide_type == "low_rank":
+    if guide_type == "low_rank":
         return AutoLowRankMultivariateNormal(
             _guided_model,
             rank=rank,
             init_loc_fn=init_to_feasible,
         )
-    else:
-        raise ValueError(
-            f"Unknown guide_type '{guide_type}'. "
-            "Supported options are 'auto_normal' and 'low_rank'."
-        )
-
-
-
+    raise ValueError(
+        f"Unknown guide_type '{guide_type}'. "
+        "Supported options are 'auto_normal' and 'low_rank'."
+    )
 
 
 def make_svi(
@@ -314,7 +329,7 @@ def make_svi(
     composite_form: Callable | None = None,
     net_template: StaticModel | None = None,
 ) -> SVI:
-    """Construct an :class:`~numpyro.infer.SVI` object with :func:`model_svi` closed over config.
+    """Construct an ``SVI`` object with ``model_svi`` closed over config.
 
     Binds all hyperparameters and data into a ``_model`` closure, then wraps
     it with the provided guide and optimizer using the
@@ -397,6 +412,7 @@ def make_svi(
         )
 
     return SVI(_model, guide, optimizer, Trace_ELBO())
+
 
 def run_window(
     prev_result: Any,
@@ -530,10 +546,9 @@ def run_window(
 
     if warm_params is not None:
         return svi.run(rng_key, steps, x_train, a_train, init_params=warm_params)
-    elif prev_result is None:
+    if prev_result is None:
         return svi.run(rng_key, steps, x_train, a_train)
-    else:
-        return svi.run(rng_key, steps, x_train, a_train, init_params=prev_result.params)
+    return svi.run(rng_key, steps, x_train, a_train, init_params=prev_result.params)
 
 
 def draw_i(draws: dict[str, Array], i: int) -> dict[str, Array]:
@@ -561,9 +576,9 @@ def draw_i(draws: dict[str, Array], i: int) -> dict[str, Array]:
     """
     out = {}
     for k, v in draws.items():
-        if not (k.startswith("log_") or k.startswith("full_model/")):
+        if not k.startswith(("log_", "full_model/")):
             continue
-        v = jnp.asarray(v)
+        v = jnp.asarray(v)  # noqa: PLW2901
         out[k] = v if v.ndim == 0 else v[i]
     return out
 
@@ -589,11 +604,11 @@ def theta_from_draw_halo_disk(d: dict[str, Array]) -> dict[str, Array]:
 
     """
     return {
-        "r_s":       jnp.exp(d["log_rs"]),
+        "r_s": jnp.exp(d["log_rs"]),
         "halo_mass": jnp.exp(d["log_m_halo"]),
         "disk_mass": jnp.exp(d["log_m_disk"]),
-        "disk_a":    jnp.exp(d["log_disk_a"]),
-        "disk_b":    jnp.exp(d["log_disk_b"]),
+        "disk_a": jnp.exp(d["log_disk_a"]),
+        "disk_b": jnp.exp(d["log_disk_b"]),
     }
 
 
@@ -637,10 +652,8 @@ def parse_site_to_kp(site: str) -> tuple:
         ``("mlp", "layers", 0, "weight")``.
 
     """
-    s = site[len("full_model/"):]
-    parts = []
-    for part in s.split("."):
-        parts.append(int(part) if part.isdigit() else part)
+    s = site[len("full_model/") :]
+    parts = [int(part) if part.isdigit() else part for part in s.split(".")]
     return tuple(parts)
 
 
@@ -663,7 +676,7 @@ def _flatten_nested_dict(d: dict, prefix: tuple = ()) -> dict[tuple, Any]:
     """
     out = {}
     for k, v in d.items():
-        path = prefix + (k,)
+        path = (*prefix, k)
         if isinstance(v, dict):
             out.update(_flatten_nested_dict(v, path))
         else:
@@ -693,7 +706,6 @@ def _nested_from_flat(flat: dict[tuple, Any]) -> dict:
             d = d.setdefault(k, {})
         d[keys[-1]] = val
     return nested
-
 
 
 def make_net_for_draw(net_template: nnx.Module, draw: dict[str, Array]) -> nnx.Module:
@@ -726,7 +738,7 @@ def make_net_for_draw(net_template: nnx.Module, draw: dict[str, Array]) -> nnx.M
 
     pure = nnx.to_pure_dict(param_state)
     flat_pure = _flatten_nested_dict(pure)
-    valid = {normalize_kp(k) for k in flat_pure.keys()}
+    valid = {normalize_kp(k) for k in flat_pure}
 
     updates_flat = {}
     for name, val in draw.items():
@@ -747,7 +759,7 @@ def make_net_for_draw_with_analytic(
     config: Mapping[str, Any],
     composite_form: Callable,
 ) -> tuple[StaticModel, dict[str, Array]]:
-    """Instantiate a full model with both BNN weights and analytic parameters from a posterior draw.
+    """Instantiate a model with BNN weights and analytic params from a posterior draw.
 
     Converts log-space samples to physical parameters via
     :func:`theta_from_draw_halo_disk`, constructs a trainable analytic layer,
@@ -794,3 +806,166 @@ def make_net_for_draw_with_analytic(
     )
     net_i = make_net_for_draw(net_i, d)
     return net_i, theta
+
+
+def make_nets_batch(
+    net_template: nnx.Module,
+    draws: dict[str, Array],
+    n: int,
+) -> list[nnx.Module]:
+    """Build ``n`` model instances efficiently by pre-computing the draw→state mapping.
+
+    Compared with calling :func:`make_net_for_draw` in a loop, this function:
+
+    * Computes the ``site_name → key-path`` mapping **once** instead of ``n``
+      times.
+    * Deep-copies only the (smaller) :class:`~flax.nnx.Param` sub-state per
+      draw, rather than the full module.
+    * Reuses the non-param sub-state across all draws via
+      :func:`~flax.nnx.merge`, avoiding redundant copies of buffers and other
+      non-trainable variables.
+
+    Parameters
+    ----------
+    net_template
+        The base :class:`~flax.nnx.Module` whose architecture is used for all
+        draws.
+    draws
+        Batched posterior samples as returned by ``guide.sample_posterior``
+        vmapped over ``n`` keys.  Each value has a leading draw dimension of
+        size ``n``.
+    n
+        Number of draws to materialise.
+
+    Returns
+    -------
+    nets
+        List of ``n`` :class:`~flax.nnx.Module` instances, one per draw, each
+        with :class:`~flax.nnx.Param` values populated from ``draws``.
+
+    """
+    # Split template ONCE: graphdef (static), Param state, everything else.
+    # other_state_t is shared (read-only) across all merged nets.
+    graphdef, param_state_t, other_state_t = nnx.split(net_template, nnx.Param, ...)
+
+    # Compute site→keypath mapping ONCE.
+    pure_t = nnx.to_pure_dict(param_state_t)
+    flat_t = _flatten_nested_dict(pure_t)
+    valid_kps = {normalize_kp(k) for k in flat_t}
+    site_to_kp = {
+        name: normalize_kp(parse_site_to_kp(name))
+        for name in draws
+        if name.startswith("full_model/")
+        and normalize_kp(parse_site_to_kp(name)) in valid_kps
+    }
+
+    nets = []
+    for i in range(n):
+        flat_i = {kp: jnp.asarray(draws[name][i]) for name, kp in site_to_kp.items()}
+        # Deep-copy only the Param sub-state (much cheaper than a full module copy).
+        param_state_i = copy.deepcopy(param_state_t)
+        nnx.replace_by_pure_dict(param_state_i, _nested_from_flat(flat_i))
+        # Reconstruct module: new Param state + shared non-param state.
+        nets.append(nnx.merge(graphdef, param_state_i, other_state_t))
+
+    return nets
+
+
+def make_nets_with_analytic_batch(
+    draws: dict[str, Array],
+    n: int,
+    *,
+    config: Mapping[str, Any],
+    composite_form: Callable,
+) -> tuple[list[nnx.Module], list[dict[str, Array]]]:
+    """Build ``n`` model+analytic instances, pre-computing the BNN mapping once.
+
+    The analytic layer carries different physical parameters for each draw, so
+    a fresh :class:`~galactoPINNs.models.static_model.StaticModel` must be
+    constructed per draw.  This function amortises the cost of computing the
+    ``site_name → key-path`` mapping and the log→physical theta conversion by
+    doing both **once** outside the loop.
+
+    Parameters
+    ----------
+    draws
+        Batched posterior samples with a leading draw dimension of size ``n``.
+    n
+        Number of draws to materialise.
+    config
+        Model configuration dictionary forwarded to
+        :class:`~galactoPINNs.models.static_model.StaticModel`.
+    composite_form
+        Callable that constructs a trainable analytic layer from physical
+        parameter keyword arguments.
+
+    Returns
+    -------
+    nets
+        List of ``n`` :class:`~galactoPINNs.models.static_model.StaticModel`
+        instances with both analytic and BNN parameters set from ``draws``.
+    thetas
+        List of ``n`` physical-space parameter dicts as returned by
+        :func:`theta_from_draw_halo_disk`.
+
+    """
+    _log_keys = ("log_rs", "log_m_halo", "log_m_disk", "log_disk_a", "log_disk_b")
+
+    # Batch-vectorize the log→physical conversion (pure JAX, no Python loop).
+    thetas_batched: dict[str, Array] = jax.vmap(theta_from_draw_halo_disk)(
+        {k: draws[k] for k in _log_keys}
+    )
+    # Materialise as a list of scalar dicts for use in module constructors.
+    thetas = [{k: thetas_batched[k][i] for k in thetas_batched} for i in range(n)]
+
+    # Build ONE reference net (draw 0) to pre-compute the BNN site→keypath mapping.
+    theta0 = thetas[0]
+    ref_layer = composite_form(
+        init_halo_r_s=theta0["r_s"],
+        init_disk_a=theta0["disk_a"],
+        init_disk_b=theta0["disk_b"],
+        init_halo_mass=theta0["halo_mass"],
+        init_disk_mass=theta0["disk_mass"],
+    )
+    ref_net = StaticModel(
+        config=config, trainable_analytic_layer=ref_layer, rngs=nnx.Rngs(0)
+    )
+    param_state_ref = nnx.state(ref_net, nnx.Param)
+    pure_ref = nnx.to_pure_dict(param_state_ref)
+    flat_ref = _flatten_nested_dict(pure_ref)
+    valid_kps = {normalize_kp(k) for k in flat_ref}
+    # Only patch BNN weight sites; analytic params are set at construction time.
+    site_to_kp = {
+        name: normalize_kp(parse_site_to_kp(name))
+        for name in draws
+        if name.startswith("full_model/")
+        and normalize_kp(parse_site_to_kp(name)) in valid_kps
+    }
+
+    nets: list[nnx.Module] = [ref_net]
+    for i in range(1, n):
+        theta = thetas[i]
+        train_layer = composite_form(
+            init_halo_r_s=theta["r_s"],
+            init_disk_a=theta["disk_a"],
+            init_disk_b=theta["disk_b"],
+            init_halo_mass=theta["halo_mass"],
+            init_disk_mass=theta["disk_mass"],
+        )
+        net_i = StaticModel(
+            config=config, trainable_analytic_layer=train_layer, rngs=nnx.Rngs(0)
+        )
+        flat_i = {kp: jnp.asarray(draws[name][i]) for name, kp in site_to_kp.items()}
+        param_state_i = nnx.state(net_i, nnx.Param)
+        nnx.replace_by_pure_dict(param_state_i, _nested_from_flat(flat_i))
+        nnx.update(net_i, param_state_i)
+        nets.append(net_i)
+
+    # Also patch BNN weights for draw 0 (ref_net was built with draw 0 theta,
+    # but its BNN weights are still the random initialisation).
+    flat_0 = {kp: jnp.asarray(draws[name][0]) for name, kp in site_to_kp.items()}
+    param_state_0 = nnx.state(ref_net, nnx.Param)
+    nnx.replace_by_pure_dict(param_state_0, _nested_from_flat(flat_0))
+    nnx.update(ref_net, param_state_0)
+
+    return nets, thetas

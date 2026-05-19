@@ -8,11 +8,12 @@ __all__ = (
 
 from collections.abc import Callable, Mapping
 from typing import Any, Literal
-from galactoPINNs.models.static_model import StaticModel
 
 import jax.numpy as jnp
 import jax.random as jr
 from jaxtyping import Array
+
+from galactoPINNs.models.static_model import StaticModel
 
 from .inference import apply_model
 
@@ -74,8 +75,8 @@ def evaluate_performance(
     Returns
     -------
     results : dict
-        Keys are designed for downstream plotting/analysis. Entries include:
-        - "r_eval": np.ndarray, shape (num_test,), radius of each evaluation
+        Keys are designed for downstream plotting/analysis. Entries include: -
+        "r_eval": np.ndarray, shape (num_test,), radius of each evaluation
           point in physical space
         - "x_val": physical positions used, shape (num_test, 3)
         - "true_u", "predicted_u": physical potentials, shape (num_test,)
@@ -83,10 +84,10 @@ def evaluate_performance(
         - "pot_percent_error": percent potential error, shape (num_test,)
           (gauge-corrected if `gauge_correct` is specified)
         - "acc_percent_error": percent acceleration error, shape (num_test,)
-        If analytic baseline is enabled, then the trainable or fixed analytic potential/acceleration
-        (depending on the specified model) is also evaluated:
-        - "analytic_baseline": analytic baseline potential at t=0
-        - "ab_pot_error", "ab_acc_error": baseline percent errors
+        If analytic baseline is enabled, then the trainable or fixed analytic
+        potential/acceleration (depending on the specified model) is also
+        evaluated: - "analytic_baseline": analytic baseline potential at t=0 -
+        "ab_pot_error", "ab_acc_error": baseline percent errors
 
 
     Raises
@@ -130,8 +131,8 @@ def evaluate_performance(
     # --- Potential error (with optional gauge correction) ---
     if gauge_correct is None:
         # No correction
-        pot_percent_error = (
-            100 * jnp.abs((true_pot - predicted_pot) / (jnp.abs(true_pot) + eps))
+        pot_percent_error = 100 * jnp.abs(
+            (true_pot - predicted_pot) / (jnp.abs(true_pot) + eps)
         )
 
     elif gauge_correct == "reference":
@@ -139,22 +140,25 @@ def evaluate_performance(
         i_ref = int(jnp.argmin(jnp.abs(r_eval - r_ref)))
         du_true = true_pot - true_pot[i_ref]
         du_pred = predicted_pot - predicted_pot[i_ref]
-        pot_percent_error = 100.0 * jnp.abs((du_true - du_pred) / (jnp.abs(du_true) + eps))
+        pot_percent_error = 100.0 * jnp.abs(
+            (du_true - du_pred) / (jnp.abs(du_true) + eps)
+        )
 
     elif gauge_correct == "median":
         # Median offset correction
         offset = jnp.median(predicted_pot - true_pot)
         predicted_pot_corrected = predicted_pot - offset
-        pot_percent_error = (
-            100 * jnp.abs((true_pot - predicted_pot_corrected) / (jnp.abs(true_pot) + eps))
+        pot_percent_error = 100 * jnp.abs(
+            (true_pot - predicted_pot_corrected) / (jnp.abs(true_pot) + eps)
         )
 
     else:
-        raise ValueError(f"Unknown gauge_correct='{gauge_correct}'")
+        msg = f"Unknown gauge_correct='{gauge_correct}'"
+        raise ValueError(msg)
 
     # --- Analytic baseline comparison ---
     if analytic_baseline is not None:
-        if (config.get("trainable", False)):
+        if config.get("trainable", False):
             trainable_analytic = model.trainable_analytic_layer
             analytic_baseline_potential = trainable_analytic.potential(x_val, t=0)
             analytic_baseline_acc = trainable_analytic.acceleration(x_val, t=0)
@@ -301,8 +305,8 @@ def evaluate_performance_node(
     # --- Potential error (with optional gauge correction) ---
     if gauge_correct is None:
         # No correction
-        pot_percent_error = (
-            100 * jnp.abs((true_pot - predicted_pot) / (jnp.abs(true_pot) + eps))
+        pot_percent_error = 100 * jnp.abs(
+            (true_pot - predicted_pot) / (jnp.abs(true_pot) + eps)
         )
 
     elif gauge_correct == "reference":
@@ -310,18 +314,21 @@ def evaluate_performance_node(
         i_ref = int(jnp.argmin(jnp.abs(r_eval - r_ref)))
         du_true = true_pot - true_pot[i_ref]
         du_pred = predicted_pot - predicted_pot[i_ref]
-        pot_percent_error = 100.0 * jnp.abs((du_true - du_pred) / (jnp.abs(du_true) + eps))
+        pot_percent_error = 100.0 * jnp.abs(
+            (du_true - du_pred) / (jnp.abs(du_true) + eps)
+        )
 
     elif gauge_correct == "median":
         # Median offset correction
         offset = jnp.median(predicted_pot - true_pot)
         predicted_pot_corrected = predicted_pot - offset
-        pot_percent_error = (
-            100 * jnp.abs((true_pot - predicted_pot_corrected) / (jnp.abs(true_pot) + eps))
+        pot_percent_error = 100 * jnp.abs(
+            (true_pot - predicted_pot_corrected) / (jnp.abs(true_pot) + eps)
         )
 
     else:
-        raise ValueError(f"Unknown gauge_correct='{gauge_correct}'")
+        msg = f"Unknown gauge_correct='{gauge_correct}'"
+        raise ValueError(msg)
 
     # --- Analytic baseline comparison ---
     if analytic_baseline is not None:
@@ -378,6 +385,7 @@ def evaluate_performance_node(
         "ab0_pot_error": ab0_pot_error,
         "analytic_baseline_0": analytic_baseline_0,
     }
+
 
 def bnn_performance(
     predictive: Callable[[Array, Array], Mapping[str, Array]],
@@ -452,8 +460,6 @@ def bnn_performance(
     }
 
 
-
-
 def svi_performance(
     predictive: Callable,
     x_test: Array,
@@ -499,9 +505,12 @@ def svi_performance(
         - ``"u_mean"``: posterior mean potential in physical units, shape ``(N,)``.
         - ``"a_mean"``: posterior mean acceleration in physical units, shape ``(N, 3)``.
         - ``"u_std"``: posterior std of potential in physical units, shape ``(N,)``.
-        - ``"a_std"``: posterior std of acceleration in physical units, shape ``(N, 3)``.
-        - ``"u_samples"``: full posterior potential samples in physical units, shape ``(S, N)``.
-        - ``"a_samples"``: full posterior acceleration samples in physical units, shape ``(S, N, 3)``.
+        - ``"a_std"``: posterior std of acceleration in physical units,
+            shape ``(N, 3)``.
+        - ``"u_samples"``: full posterior potential samples in physical
+            units, shape ``(S, N)``.
+        - ``"a_samples"``: full posterior acceleration samples in physical
+            units, shape ``(S, N, 3)``.
 
     """
     x_test_scaled = config["x_transformer"].transform(x_test)
@@ -547,7 +556,7 @@ def gauge_invariant_rel_resid(
     ref_point: str = "center",
     eps: float = 1e-12,
 ) -> tuple[Array, Array, Array]:
-    """Compute a gauge-invariant relative residual map between true and predicted potentials.
+    """Compute a gauge-invariant relative residual map between potentials.
 
     Gravitational potentials are defined only up to an additive constant, so
     naive relative residuals are gauge-dependent. This function removes the
@@ -629,12 +638,12 @@ def gauge_invariant_rel_resid(
         rel_resid = 100 * (dtrue - dpred) / (jnp.abs(dtrue) + eps)
         return true_u_xy, pred_u_xy, rel_resid
 
-    elif mode in ("median_offset", "median"):
+    if mode in ("median_offset", "median"):
         C = jnp.median(pred_u_xy - true_u_xy)
         pred_gf = pred_u_xy - C
 
         rel_resid = 100 * (true_u_xy - pred_gf) / (jnp.abs(true_u_xy) + eps)
         return true_u_xy, pred_gf, rel_resid
 
-    else:
-        raise ValueError(f"Unknown mode '{mode}'. Use 'delta_ref' or 'median_offset'.")
+    msg = f"Unknown mode '{mode}'. Use 'delta_ref' or 'median_offset'."
+    raise ValueError(msg)
