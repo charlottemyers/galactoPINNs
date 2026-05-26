@@ -473,6 +473,20 @@ class TrainableGalaxPotential(nnx.Module):
         r_s_out = jnp.asarray(built_params["r_s"])
         return phi, r_s_out
 
+    def potential(self, positions: Array, t: Any = 0) -> Array:
+        """Evaluate the potential energy of the trainable potential."""
+        built_params = self._get_built_params()
+        pot = self.PotClass(**built_params, units="galactic")
+        return pot.potential(positions, t=t)
+
+    def acceleration(self, positions: Array, t: Any = 0) -> Array:
+        """Evaluate the acceleration of the trainable potential."""
+        built_params = self._get_built_params()
+        pot = self.PotClass(**built_params, units="galactic")
+        return pot.acceleration(positions, t=t)
+
+
+
 class FuseandBoundary(nnx.Module):
     """Fuse a neural-network potential with an analytic potential.
 

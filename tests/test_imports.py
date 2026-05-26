@@ -1,7 +1,7 @@
 """Tests for package imports."""
 
 import galactoPINNs
-from galactoPINNs import evaluate, inference, layers, train
+from galactoPINNs import evaluate, inference, train, layers
 from galactoPINNs.models import static_model
 
 
